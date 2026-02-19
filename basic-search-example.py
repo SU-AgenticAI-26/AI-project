@@ -6,7 +6,7 @@ query them, and return aggregated results that include URLs.
 """
 
 import requests
-import xml.etree.ElementTree as ET
+from defusedxml import ElementTree as ET
 from typing import List, Dict, Any
 
 
