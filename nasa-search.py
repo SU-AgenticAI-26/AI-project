@@ -1,7 +1,6 @@
 #!/usr/bin/env python 
 # Basic use of NASA API, example queries Astronomy picture of the day
 from nasapy import Nasa
-import os
 
 try:
     with open('nasakey.txt', 'r') as f:
