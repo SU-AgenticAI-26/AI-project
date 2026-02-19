@@ -7,7 +7,7 @@ try:
     with open('nasakey.txt', 'r') as f:
         key = f.read().strip()
 except:
-    print("sskey.txt not found")
+    print("nasakey.txt not found")
 
 
 nasa = Nasa(key)
