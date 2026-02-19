@@ -3,13 +3,22 @@ import os
 import sys
 
 try:
+import sys
+
+api_key = None
+try:
     with open('sskey.txt', 'r') as f:
         api_key = f.read().strip()
-except:
-    print("sskey.txt not found")
-    sys.exit(1)
-    api_key = None
+except FileNotFoundError:
+    print("sskey.txt not found, falling back to SEMANTIC_SCHOLAR_API_KEY environment variable")
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
+except OSError as e:
+    print(f"Error reading sskey.txt: {e}")
+    api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY")
 
+if not api_key:
+    print("No Semantic Scholar API key available. Provide sskey.txt or set SEMANTIC_SCHOLAR_API_KEY.")
+    sys.exit(1)
 url = "http://api.semanticscholar.org/graph/v1/paper/search/bulk"
 params = {
     "query": "\"large language models\"",
