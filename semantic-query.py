@@ -14,7 +14,13 @@ params = {
     "year": "2024-"
 }
 headers = {"x-api-key": api_key}
-response = requests.get(url, params=params, headers=headers).json()
-for paper in response.get("data", [])[:5]:
+try:
+    response = requests.get(url, params=params, headers=headers)
+    response.raise_for_status()
+    data = response.json()
+except requests.exceptions.RequestException as e:
+    print(f"Request failed: {e}")
+    data = {}
+for paper in data.get("data", [])[:5]:
     print(paper["title"], "—", paper["citationCount"], "citations")
 
