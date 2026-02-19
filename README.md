@@ -5,7 +5,9 @@ Arxiv access library: https://github.com/lukasschwab/arxiv.py
 
 ### Basic search example
 
-``````python basic-search-example.py "graph neural networks: a review of methods and applications"``````
+``````python 
+
+basic-search-example.py "graph neural networks: a review of methods and applications"
 
 OPENALEX
 
@@ -57,5 +59,5 @@ ARXIV
 
     GWTC-4.0: Methods for Identifying and Characterizing Gravitational-wave Transients
     → https://arxiv.org/pdf/2508.18081v1
-
+``````
 
