@@ -1,11 +1,13 @@
 import requests
 import os
+import sys
 
 try:
     with open('sskey.txt', 'r') as f:
         api_key = f.read().strip()
-except FileNotFoundError:
+except:
     print("sskey.txt not found")
+    sys.exit(1)
     api_key = None
 
 url = "http://api.semanticscholar.org/graph/v1/paper/search/bulk"
