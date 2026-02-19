@@ -6,7 +6,7 @@ import os
 try:
     with open('nasakey.txt', 'r') as f:
         key = f.read().strip()
-except:
+except FileNotFoundError:
     print("nasakey.txt not found")
 
 
