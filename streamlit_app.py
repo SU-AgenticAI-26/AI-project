@@ -6,6 +6,12 @@ Multi-Agent Streamlit App using LangGraph + OpenAI + Knowledge Maps
 Install dependencies:
     pip install streamlit langgraph langchain-openai langchain-core networkx pyvis
 
+
+Add a Critic agent that reviews the summary and asks the researcher to go deeper
+Add conditional edges in LangGraph to loop back if the knowledge map is too sparse
+Swap the LLM per agent (e.g. GPT-4o for research, GPT-4o-mini for summarizing)
+Persist the graph to a database between sessions
+
 Run:
     streamlit run app.py
 """
@@ -285,3 +291,5 @@ if run_btn:
                 st.chat_message("assistant", avatar="✍️").write(msg.content)
             else:
                 st.chat_message("assistant").write(msg.content)
+
+                #
