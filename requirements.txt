@@ -1,0 +1,7 @@
+streamlit>=1.32.0
+langgraph>=0.1.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
+networkx>=3.2
+pyvis>=0.3.2
+openai>=1.30.0
