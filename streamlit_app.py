@@ -28,6 +28,9 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
+from secrets_manager import get_api_key
+from collaborative_Rag import VectorDBModule
+
 # ─────────────────────────────────────────────
 # 1.  Shared State
 # ─────────────────────────────────────────────
@@ -49,14 +52,29 @@ def make_llm(api_key: str, model: str = "gpt-4o-mini", temperature: float = 0.3)
     return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
 
 
-def researcher_agent(state: AgentState, llm) -> AgentState:
+def researcher_agent(state: AgentState, llm, enable_rag: bool = False, vector_db: VectorDBModule = None) -> AgentState:
     """Researches the query and returns structured notes."""
+    print("[LOG] Researcher agent starting research...")
+    
+    # RAG retrieval if enabled
+    retrieved_docs = ""
+    if enable_rag and vector_db:
+        print("[LOG] Performing RAG retrieval...")
+        docs = vector_db.search(state['query'], k=3)
+        if docs:
+            retrieved_docs = "\n\n".join([f"[Retrieved Document]: {doc.page_content}" for doc in docs])
+            print(f"[LOG] Retrieved {len(docs)} relevant documents")
+        else:
+            print("[LOG] No relevant documents found in vector DB")
+    
     system = SystemMessage(content=(
         "You are a Research Agent. Given a user query, produce detailed research notes. "
         "Cover key concepts, facts, entities, and relationships. Be thorough."
+        + (f"\n\nUse the following retrieved documents as additional context:\n{retrieved_docs}" if retrieved_docs else "")
     ))
     human = HumanMessage(content=f"Research this topic thoroughly:\n\n{state['query']}")
     response = llm.invoke([system, human])
+    print(f"[LOG] Researcher agent completed: {len(response.content)} characters")
     return {
         "messages": [AIMessage(content=f"[Researcher] {response.content}")],
         "research_notes": response.content,
@@ -66,6 +84,7 @@ def researcher_agent(state: AgentState, llm) -> AgentState:
 
 def knowledge_mapper_agent(state: AgentState, llm) -> AgentState:
     """Converts research notes into a knowledge map (nodes + edges as JSON)."""
+    print("[LOG] Knowledge Mapper agent starting mapping...")
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Given research notes, extract a knowledge graph. "
         "Return ONLY valid JSON with this exact schema:\n"
@@ -85,8 +104,10 @@ def knowledge_mapper_agent(state: AgentState, llm) -> AgentState:
             raw = raw[4:]
     try:
         knowledge_map = json.loads(raw)
+        print(f"[LOG] Knowledge Mapper completed: {len(knowledge_map.get('nodes', []))} nodes, {len(knowledge_map.get('edges', []))} edges")
     except json.JSONDecodeError:
         knowledge_map = {"nodes": [], "edges": [], "error": "Parse failed"}
+        print("[LOG] Knowledge Mapper failed to parse JSON")
 
     return {
         "messages": [AIMessage(content=f"[KnowledgeMapper] Built map with "
@@ -98,6 +119,7 @@ def knowledge_mapper_agent(state: AgentState, llm) -> AgentState:
 
 def summarizer_agent(state: AgentState, llm) -> AgentState:
     """Writes a concise answer using research notes + knowledge map."""
+    print("[LOG] Summarizer agent starting summarization...")
     system = SystemMessage(content=(
         "You are a Summarizer Agent. Using the research notes and knowledge map provided, "
         "write a clear, structured, and concise answer to the original query."
@@ -108,6 +130,7 @@ def summarizer_agent(state: AgentState, llm) -> AgentState:
         f"Knowledge map nodes: {[n['label'] for n in state['knowledge_map'].get('nodes', [])]}"
     ))
     response = llm.invoke([system, human])
+    print(f"[LOG] Summarizer agent completed: {len(response.content)} characters")
     return {
         "messages": [AIMessage(content=f"[Summarizer] {response.content}")],
         "summary": response.content,
@@ -119,14 +142,14 @@ def summarizer_agent(state: AgentState, llm) -> AgentState:
 # 3.  Build LangGraph
 # ─────────────────────────────────────────────
 
-def build_graph(api_key: str):
-    llm = make_llm(api_key)
+def build_graph(api_key: str, enable_rag: bool = False, vector_db: VectorDBModule = None):
+    llm_instance = make_llm(api_key)
 
     graph = StateGraph(AgentState)
 
-    graph.add_node("researcher",       lambda s: researcher_agent(s, llm))
-    graph.add_node("knowledge_mapper", lambda s: knowledge_mapper_agent(s, llm))
-    graph.add_node("summarizer",       lambda s: summarizer_agent(s, llm))
+    graph.add_node("researcher",       lambda s: researcher_agent(s, llm_instance, enable_rag, vector_db))
+    graph.add_node("knowledge_mapper", lambda s: knowledge_mapper_agent(s, llm_instance))
+    graph.add_node("summarizer",       lambda s: summarizer_agent(s, llm_instance))
 
     graph.set_entry_point("researcher")
     graph.add_edge("researcher",       "knowledge_mapper")
@@ -167,6 +190,9 @@ def render_knowledge_map(knowledge_map: dict) -> str:
         return f.name
 
 
+from secrets_manager import get_api_key
+from collaborative_Rag import VectorDBModule
+
 # ─────────────────────────────────────────────
 # 5.  Streamlit UI
 # ─────────────────────────────────────────────
@@ -177,14 +203,43 @@ st.set_page_config(page_title="Multi-Agent Knowledge Explorer", layout="wide",
 st.title("🧠 Multi-Agent Knowledge Explorer")
 st.caption("Powered by LangGraph · OpenAI · Knowledge Maps")
 
+# Initialize variables
+vector_db = None
+
 # ── Sidebar ──
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_key = st.text_input("OpenAI API Key", type="password",
-                            placeholder="sk-...")
+    
+    # Get API key from secrets manager
+    api_key = get_api_key('openai')
+    if not api_key:
+        st.error("❌ OpenAI API key not configured")
+        st.info("**To configure API keys:**")
+        st.code("python setup_env.py", language="bash")
+        st.markdown("Or run: `python secrets_manager.py`")
+        st.stop()  # Prevent the app from running without API key
+    else:
+        st.success("✅ OpenAI API key configured")
+        masked_key = api_key[:8] + "..." + api_key[-4:] if len(api_key) > 12 else "***"
+        st.caption(f"Key: {masked_key}")
+    
+    st.divider()
+    
+    # RAG toggle
+    enable_rag = st.checkbox("🔍 Enable RAG (Retrieval-Augmented Generation)", 
+                           help="Retrieve relevant documents from knowledge base before research")
+    
+    if enable_rag:
+        # Initialize vector DB
+        vector_db = VectorDBModule(api_key)
+        doc_count = vector_db.count()
+        st.info(f"📚 Vector DB loaded: {doc_count} documents indexed")
+        if doc_count == 0:
+            st.warning("⚠️ Vector DB is empty. Add documents via the integrated RAG app first.")
+    
     st.divider()
     st.markdown("**Agent Pipeline**")
-    st.markdown("1. 🔍 **Researcher** — deep-dives the topic")
+    st.markdown("1. 🔍 **Researcher** — deep-dives the topic" + (" (with RAG)" if enable_rag else ""))
     st.markdown("2. 🗺️ **Knowledge Mapper** — extracts nodes & edges")
     st.markdown("3. ✍️ **Summarizer** — crafts the final answer")
     st.divider()
@@ -196,15 +251,12 @@ query = st.text_area("Enter your research query", height=100,
                      placeholder="e.g. How does transformer attention work?")
 
 run_btn = st.button("🚀 Run Multi-Agent Pipeline", type="primary",
-                    disabled=not (api_key and query))
+                    disabled=not query)
 
 if run_btn:
-    if not api_key.startswith("sk-"):
-        st.error("Please enter a valid OpenAI API key.")
-        st.stop()
-
     # Build the agent graph
-    app = build_graph(api_key)
+    vector_db_param = vector_db if enable_rag else None
+    app = build_graph(api_key, enable_rag, vector_db_param)
 
     # Stream execution with progress
     progress = st.progress(0, text="Starting pipeline…")
