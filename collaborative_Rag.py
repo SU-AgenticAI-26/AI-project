@@ -390,7 +390,7 @@ class VectorDBModule:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def llm(api_key: str, model: str = "gpt-4o-mini", temperature: float = 0.3) -> ChatOpenAI:
-    return ChatOpenAI(api_key=api_key, model=model, temperature=temperature)
+    return ChatOpenAI(api_key=api_key, model=model, temperature=temperature) #CHANGE IF NEEDED
 
 
 # ══════════════════════════════════════════════════════════════════════════════

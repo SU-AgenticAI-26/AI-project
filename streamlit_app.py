@@ -1,5 +1,3 @@
-#start fo\\
-
 """
 Multi-Agent Streamlit App using LangGraph + OpenAI + Knowledge Maps
 
@@ -29,7 +27,8 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 
 from secrets_manager import get_api_key
-from collaborative_Rag import VectorDBModule
+from collaborative_Rag import VectorDBModule, index_arxiv_documents, index_nasa_documents, map_save, build_graph as collab_build_graph
+from research_apis import ResearchAPIs
 
 # ─────────────────────────────────────────────
 # 1.  Shared State
@@ -190,9 +189,6 @@ def render_knowledge_map(knowledge_map: dict) -> str:
         return f.name
 
 
-from secrets_manager import get_api_key
-from collaborative_Rag import VectorDBModule
-
 # ─────────────────────────────────────────────
 # 5.  Streamlit UI
 # ─────────────────────────────────────────────
@@ -202,6 +198,9 @@ st.set_page_config(page_title="Multi-Agent Knowledge Explorer", layout="wide",
 
 st.title("🧠 Multi-Agent Knowledge Explorer")
 st.caption("Powered by LangGraph · OpenAI · Knowledge Maps")
+
+# Mode selection via tabs
+tab_knowledge, tab_api, tab_collab = st.tabs(["🧠 Knowledge Explorer", "🔬 API Explorer", "🤝 Collaborative RAG"])
 
 # Initialize variables
 vector_db = None
@@ -224,124 +223,373 @@ with st.sidebar:
         st.caption(f"Key: {masked_key}")
     
     st.divider()
+    st.info("Knowledge map nodes are color-coded:\n"
+            "🔵 Concept  🟠 Entity  🟢 Fact  🟣 Other")
+
+# ── Main Content ──
+
+with tab_knowledge:
+    st.header("🧠 Knowledge Explorer")
+    st.markdown("Simple multi-agent pipeline with optional RAG")
     
-    # RAG toggle
+    # RAG toggle for Knowledge Explorer
     enable_rag = st.checkbox("🔍 Enable RAG (Retrieval-Augmented Generation)", 
                            help="Retrieve relevant documents from knowledge base before research")
     
+    # Initialize vector_db if RAG enabled
+    vector_db = None
     if enable_rag:
-        # Initialize vector DB
         vector_db = VectorDBModule(api_key)
         doc_count = vector_db.count()
         st.info(f"📚 Vector DB loaded: {doc_count} documents indexed")
         if doc_count == 0:
-            st.warning("⚠️ Vector DB is empty. Add documents via the integrated RAG app first.")
+            st.warning("⚠️ Vector DB is empty. Index some documents below.")
+        
+        # Document Indexing
+        st.subheader("📚 Index Documents")
+        
+        # ArXiv Indexing
+        with st.expander("🔍 Index ArXiv Papers"):
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                arxiv_query = st.text_input("ArXiv search query", 
+                                           placeholder="e.g. transformer attention OR neural networks")
+            with col2:
+                arxiv_limit = st.number_input("Max docs", min_value=1, max_value=50, value=5, key="arxiv_limit")
+            
+            if st.button("🔍 Index ArXiv", help="Search and index ArXiv papers"):
+                if arxiv_query:
+                    with st.spinner(f"Indexing ArXiv papers for '{arxiv_query}'..."):
+                        try:
+                            indexed = index_arxiv_documents(arxiv_query, vector_db, arxiv_limit)
+                            if indexed > 0:
+                                st.success(f"✅ Indexed {indexed} ArXiv papers!")
+                                st.rerun()  # Refresh to update doc count
+                            else:
+                                st.warning("No papers indexed. Try a different query.")
+                        except Exception as e:
+                            st.error(f"❌ Failed to index: {str(e)}")
+                else:
+                    st.error("Enter an ArXiv query.")
+        
+        # NASA Indexing
+        with st.expander("🚀 Index NASA Data"):
+            if st.button("🌌 Index NASA APOD", help="Fetch and index NASA's Astronomy Picture of the Day"):
+                with st.spinner("Fetching NASA data..."):
+                    try:
+                        indexed = index_nasa_documents(vector_db)
+                        if indexed > 0:
+                            st.success(f"✅ Indexed {indexed} NASA document!")
+                            st.rerun()
+                        else:
+                            st.warning("No NASA data indexed. Check NASA API key.")
+                    except Exception as e:
+                        st.error(f"❌ Failed to index NASA data: {str(e)}")
+        
+        # File Upload
+        with st.expander("📄 Upload Files"):
+            uploaded = st.file_uploader("Upload .txt or .md files", type=["txt", "md"], 
+                                       accept_multiple_files=True, key="file_upload")
+            if uploaded:
+                total_chunks = 0
+                for f in uploaded:
+                    try:
+                        chunks = vector_db.add_file(f)
+                        total_chunks += chunks
+                        st.success(f"✅ Added {f.name} → {chunks} chunks")
+                    except Exception as e:
+                        st.error(f"❌ Failed to add {f.name}: {str(e)}")
+                if total_chunks > 0:
+                    st.info(f"Total chunks added: {total_chunks}")
+                    st.rerun()
     
-    st.divider()
     st.markdown("**Agent Pipeline**")
     st.markdown("1. 🔍 **Researcher** — deep-dives the topic" + (" (with RAG)" if enable_rag else ""))
     st.markdown("2. 🗺️ **Knowledge Mapper** — extracts nodes & edges")
     st.markdown("3. ✍️ **Summarizer** — crafts the final answer")
+    
     st.divider()
-    st.info("Knowledge map nodes are color-coded:\n"
-            "🔵 Concept  🟠 Entity  🟢 Fact  🟣 Other")
+    
+    query = st.text_area("Enter your research query", height=100,
+                         placeholder="e.g. How does transformer attention work?", key="knowledge_query")
 
-# ── Main ──
-query = st.text_area("Enter your research query", height=100,
-                     placeholder="e.g. How does transformer attention work?")
+    run_btn = st.button("🚀 Run Multi-Agent Pipeline", type="primary",
+                        disabled=not query)
 
-run_btn = st.button("🚀 Run Multi-Agent Pipeline", type="primary",
-                    disabled=not query)
+    if run_btn:
+        # Build the agent graph
+        vector_db_param = vector_db if enable_rag else None
+        app = build_graph(api_key, enable_rag, vector_db_param)
 
-if run_btn:
-    # Build the agent graph
-    vector_db_param = vector_db if enable_rag else None
-    app = build_graph(api_key, enable_rag, vector_db_param)
+        # Stream execution with progress
+        progress = st.progress(0, text="Starting pipeline…")
+        status_placeholder = st.empty()
 
-    # Stream execution with progress
-    progress = st.progress(0, text="Starting pipeline…")
-    status_placeholder = st.empty()
+        agent_labels = {
+            "researcher":       ("🔍 Researcher agent working…",       33),
+            "knowledge_mapper": ("🗺️ Knowledge Mapper building graph…", 66),
+            "summarizer":       ("✍️ Summarizer writing answer…",       90),
+        }
 
-    agent_labels = {
-        "researcher":       ("🔍 Researcher agent working…",       33),
-        "knowledge_mapper": ("🗺️ Knowledge Mapper building graph…", 66),
-        "summarizer":       ("✍️ Summarizer writing answer…",       90),
-    }
+        final_state = None
+        for event in app.stream({
+            "messages": [],
+            "query": query,
+            "research_notes": "",
+            "summary": "",
+            "knowledge_map": {},
+            "current_agent": "",
+        }):
+            for node_name, state_update in event.items():
+                label, pct = agent_labels.get(node_name, ("Processing…", 50))
+                progress.progress(pct, text=label)
+                status_placeholder.markdown(f"**Current agent:** `{node_name}`")
+                final_state = state_update   # keep updating; last = summarizer output
 
-    final_state = None
-    for event in app.stream({
-        "messages": [],
-        "query": query,
-        "research_notes": "",
-        "summary": "",
-        "knowledge_map": {},
-        "current_agent": "",
-    }):
-        for node_name, state_update in event.items():
-            label, pct = agent_labels.get(node_name, ("Processing…", 50))
-            progress.progress(pct, text=label)
-            status_placeholder.markdown(f"**Current agent:** `{node_name}`")
-            final_state = state_update   # keep updating; last = summarizer output
+        progress.progress(100, text="✅ Pipeline complete!")
+        status_placeholder.empty()
 
-    progress.progress(100, text="✅ Pipeline complete!")
-    status_placeholder.empty()
+        # Reconstruct full state from stream (LangGraph streams partial updates)
+        # Re-run without streaming to get full final state easily
+        full_state = app.invoke({
+            "messages": [],
+            "query": query,
+            "research_notes": "",
+            "summary": "",
+            "knowledge_map": {},
+            "current_agent": "",
+        })
 
-    # Reconstruct full state from stream (LangGraph streams partial updates)
-    # Re-run without streaming to get full final state easily
-    full_state = app.invoke({
-        "messages": [],
-        "query": query,
-        "research_notes": "",
-        "summary": "",
-        "knowledge_map": {},
-        "current_agent": "",
-    })
-
-    # ── Tabs for results ──
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["💡 Summary", "🗺️ Knowledge Map", "📝 Research Notes", "💬 Agent Messages"])
-
-    with tab1:
-        st.subheader("Final Answer")
-        st.markdown(full_state["summary"])
-
-    with tab2:
-        st.subheader("Knowledge Map")
+        # Save knowledge map
         km = full_state["knowledge_map"]
         if km.get("nodes"):
-            html_path = render_knowledge_map(km)
-            with open(html_path, "r") as f:
-                html_content = f.read()
-            os.unlink(html_path)
-            st.components.v1.html(html_content, height=520, scrolling=False)
+            try:
+                map_filename = map_save(query, km)
+                st.success(f"💾 Knowledge map saved as {map_filename}")
+            except Exception as e:
+                st.warning(f"Failed to save knowledge map: {str(e)}")
 
-            # Raw data expander
-            with st.expander("📊 Raw Graph Data"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown("**Nodes**")
-                    st.dataframe(km["nodes"])
-                with col2:
-                    st.markdown("**Edges**")
-                    st.dataframe(km["edges"])
-        else:
-            st.warning("Knowledge map could not be generated.")
-            st.json(km)
+        # ── Tabs for results ──
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["💡 Summary", "🗺️ Knowledge Map", "📝 Research Notes", "💬 Agent Messages"])
 
-    with tab3:
-        st.subheader("Research Notes")
-        st.markdown(full_state["research_notes"])
+        with tab1:
+            st.subheader("Final Answer")
+            st.markdown(full_state["summary"])
 
-    with tab4:
-        st.subheader("Agent Message Log")
-        for msg in full_state["messages"]:
-            if "[Researcher]" in msg.content:
-                st.chat_message("assistant", avatar="🔍").write(msg.content)
-            elif "[KnowledgeMapper]" in msg.content:
-                st.chat_message("assistant", avatar="🗺️").write(msg.content)
-            elif "[Summarizer]" in msg.content:
-                st.chat_message("assistant", avatar="✍️").write(msg.content)
+        with tab2:
+            st.subheader("Knowledge Map")
+            km = full_state["knowledge_map"]
+            if km.get("nodes"):
+                html_path = render_knowledge_map(km)
+                with open(html_path, "r") as f:
+                    html_content = f.read()
+                os.unlink(html_path)
+                st.components.v1.html(html_content, height=520, scrolling=False)
+
+                # Raw data expander
+                with st.expander("📊 Raw Graph Data"):
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("**Nodes**")
+                        st.dataframe(km["nodes"])
+                    with col2:
+                        st.markdown("**Edges**")
+                        st.dataframe(km["edges"])
             else:
-                st.chat_message("assistant").write(msg.content)
+                st.warning("Knowledge map could not be generated.")
+                st.json(km)
 
-                #
+        with tab3:
+            st.subheader("Research Notes")
+            st.markdown(full_state["research_notes"])
+
+        with tab4:
+            st.subheader("Agent Message Log")
+            for msg in full_state["messages"]:
+                if "[Researcher]" in msg.content:
+                    st.chat_message("assistant", avatar="🔍").write(msg.content)
+                elif "[KnowledgeMapper]" in msg.content:
+                    st.chat_message("assistant", avatar="🗺️").write(msg.content)
+                elif "[Summarizer]" in msg.content:
+                    st.chat_message("assistant", avatar="✍️").write(msg.content)
+                else:
+                    st.chat_message("assistant").write(msg.content)
+
+with tab_api:
+    st.header("🔬 Direct API Testing")
+    st.markdown("Test research APIs directly")
+    apis = ResearchAPIs()
+
+    query = st.text_input("Query for APIs", placeholder="e.g. quantum computing", key="api_query")
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        if st.button("🔍 Search Scholarly (OpenAlex)", help="Search academic works"):
+            if query:
+                results = apis.search_scholarly(query)
+                st.subheader("Scholarly Results")
+                for r in results[:5]:  # limit display
+                    st.write(f"- **{r.get('title', 'No title')}** ({r.get('year', 'N/A')})")
+                    if r.get('url'):
+                        st.markdown(f"[Read more]({r['url']})")
+            else:
+                st.error("Enter a query.")
+    
+    with col2:
+        if st.button("📄 Search ArXiv", help="Search arXiv papers"):
+            if query:
+                results = apis.search_arxiv(query)
+                st.subheader("ArXiv Results")
+                for r in results[:5]:
+                    st.write(f"- {r.get('title', 'No title')}")
+                    if r.get('pdf_url'):
+                        st.markdown(f"[PDF]({r['pdf_url']})")
+            else:
+                st.error("Enter a query.")
+    
+    with col3:
+        if st.button("🌌 NASA APOD", help="Get Astronomy Picture of the Day"):
+            apod = apis.get_nasa_apod()
+            if apod and 'error' not in apod:
+                st.image(apod['url'], caption=apod.get('title', 'NASA APOD'))
+                st.write(apod.get('explanation', ''))
+            else:
+                st.error(apod.get('error', 'Failed to get APOD'))
+
+with tab_collab:
+    st.header("🤝 Collaborative RAG")
+    st.markdown("Full collaborative research with multiple data sources")
+    
+    st.markdown("**Agent Pipeline**")
+    st.markdown("1. 🧭 **Router** — selects active agents")
+    st.markdown("2. 🔍 **Vector DB + Web + SQL** — parallel research")
+    st.markdown("3. 🎯 **Orchestrator** — merges findings")
+    st.markdown("4. 🗺️ **Knowledge Mapper** — builds graph")
+    st.markdown("5. ✍️ **Summarizer** — final answer")
+    
+    st.divider()
+    
+    # Initialize VectorDB
+    vector_db = VectorDBModule(api_key)
+    doc_count = vector_db.count()
+    st.info(f"📚 Vector DB loaded: {doc_count} documents indexed")
+
+    # Document Indexing
+    st.subheader("📚 Index Documents")
+    
+    # ArXiv Indexing
+    with st.expander("🔍 Index ArXiv Papers"):
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            arxiv_query = st.text_input("ArXiv search query", 
+                                       placeholder="e.g. transformer attention OR neural networks", key="collab_arxiv_query")
+        with col2:
+            arxiv_limit = st.number_input("Max docs", min_value=1, max_value=50, value=5, key="collab_arxiv_limit")
+        
+        if st.button("🔍 Index ArXiv", help="Search and index ArXiv papers", key="collab_index_arxiv"):
+            if arxiv_query:
+                with st.spinner(f"Indexing ArXiv papers for '{arxiv_query}'..."):
+                    try:
+                        indexed = index_arxiv_documents(arxiv_query, vector_db, arxiv_limit)
+                        if indexed > 0:
+                            st.success(f"✅ Indexed {indexed} ArXiv papers!")
+                            st.rerun()
+                        else:
+                            st.warning("No papers indexed. Try a different query.")
+                    except Exception as e:
+                        st.error(f"❌ Failed to index: {str(e)}")
+            else:
+                st.error("Enter an ArXiv query.")
+    
+    # NASA Indexing
+    with st.expander("🚀 Index NASA Data"):
+        if st.button("🌌 Index NASA APOD", help="Fetch and index NASA's Astronomy Picture of the Day", key="collab_index_nasa"):
+            with st.spinner("Fetching NASA data..."):
+                try:
+                    indexed = index_nasa_documents(vector_db)
+                    if indexed > 0:
+                        st.success(f"✅ Indexed {indexed} NASA document!")
+                        st.rerun()
+                    else:
+                        st.warning("No NASA data indexed. Check NASA API key.")
+                except Exception as e:
+                    st.error(f"❌ Failed to index NASA data: {str(e)}")
+    
+    # File Upload
+    with st.expander("📄 Upload Files"):
+        uploaded = st.file_uploader("Upload .txt or .md files", type=["txt", "md"], 
+                                   accept_multiple_files=True, key="collab_file_upload")
+        if uploaded:
+            total_chunks = 0
+            for f in uploaded:
+                try:
+                    chunks = vector_db.add_file(f)
+                    total_chunks += chunks
+                    st.success(f"✅ Added {f.name} → {chunks} chunks")
+                except Exception as e:
+                    st.error(f"❌ Failed to add {f.name}: {str(e)}")
+            if total_chunks > 0:
+                st.info(f"Total chunks added: {total_chunks}")
+                st.rerun()
+
+    st.divider()
+
+    query = st.text_area("Enter your research query", height=100,
+                        placeholder="e.g. How does transformer attention work?", key="collab_query")
+
+    if st.button("🚀 Run Collaborative Research Pipeline", type="primary"):
+        with st.spinner("Running collaborative research pipeline..."):
+            app = collab_build_graph(api_key, vector_db)
+            # Run the collaborative graph
+            result = app.invoke({
+                "messages": [],
+                "query": query,
+                "active_agents": ["vector_db", "web"],  # default agents
+                "router_reasoning": "",
+                "vector_findings": "",
+                "sql_findings": "",
+                "web_findings": "",
+                "activity_log": [],
+                "merged_context": "",
+                "knowledge_map": {},
+                "critique": "",
+                "loop_count": 0,
+                "summary": "",
+                "current_agent": "",
+            })
+            
+            # Display results
+            tab1, tab2, tab3, tab4 = st.tabs(["💡 Summary", "🗺️ Knowledge Map", "📝 Merged Context", "💬 Activity Log"])
+            
+            with tab1:
+                st.subheader("Final Summary")
+                st.markdown(result["summary"])
+            
+            with tab2:
+                st.subheader("Knowledge Map")
+                km = result["knowledge_map"]
+                if km.get("nodes"):
+                    html_path = render_knowledge_map(km)
+                    with open(html_path, "r") as f:
+                        html_content = f.read()
+                    os.unlink(html_path)
+                    st.components.v1.html(html_content, height=520, scrolling=False)
+                    
+                    # Save map
+                    try:
+                        map_filename = map_save(query, km)
+                        st.success(f"💾 Knowledge map saved as {map_filename}")
+                    except Exception as e:
+                        st.warning(f"Failed to save knowledge map: {str(e)}")
+                else:
+                    st.warning("Knowledge map could not be generated.")
+            
+            with tab3:
+                st.subheader("Merged Research Context")
+                st.markdown(result["merged_context"])
+            
+            with tab4:
+                st.subheader("Agent Activity Log")
+                for activity in result["activity_log"]:
+                    st.write(f"- {activity}")
