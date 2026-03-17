@@ -106,7 +106,9 @@ def _hash(q: str) -> str:
 
 def cache_save(query: str, payload: dict) -> None:
     p = CACHE_DIR / f"{_hash(query)}.json"
-    p.write_text(json.dumps({"query": query, "ts": _stamp(), "payload": payload}, indent=2))
+    # Strip LangChain message objects — they're not needed in cache
+    safe = {k: v for k, v in payload.items() if k != "messages"}
+    p.write_text(json.dumps({"query": query, "ts": _stamp(), "payload": safe}, indent=2))
 
 def cache_load(query: str) -> Optional[dict]:
     p = CACHE_DIR / f"{_hash(query)}.json"
