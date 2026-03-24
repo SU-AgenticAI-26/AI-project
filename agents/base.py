@@ -17,6 +17,14 @@ class BaseAgent:
     name:          str = "base_agent"
     system_prompt: str = "You are a helpful assistant."
 
+    # ── Orchestrator tool registration ────────────────────────────────────────
+    # Subclasses set these three attributes to participate in auto-registration.
+    # The Orchestrator reads them to build TOOL_DEFINITIONS, _make_agents(),
+    # and the route map — no changes to orchestrator.py needed for new agents.
+    tool_name:        str  = ""   # CLI name, e.g. "send_to_my_agent"
+    tool_description: str  = ""   # shown to the Orchestrator LLM
+    tool_schema:      dict = {"type": "object", "properties": {}, "required": []}
+
     def __init__(self, provider: LLMProvider):
         self._provider = provider
 

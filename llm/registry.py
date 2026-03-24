@@ -37,6 +37,7 @@ AGENT_NAMES = [
     "orchestrator",
     "scoping_agent",
     "search_reading_agent",
+    "reading_extraction_agent",    # ← add new agents here in pipeline order
     "synthesis_planning_agent",
     "validation_agent",
 ]

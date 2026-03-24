@@ -154,6 +154,28 @@ class SearchReadingAgent(BaseAgent):
     name          = "search_reading_agent"
     system_prompt = SYSTEM_PROMPT
 
+    tool_name        = "send_to_search_reading_agent"
+    tool_description = (
+        "Send a search + read task to SearchReadingAgent. Without parameters, "
+        "it selects appropriate sources from the 7-source registry, then searches all "
+        "sub-questions and summarises the top papers. To target a specific coverage "
+        "gap, provide targeted_query and targeted_label."
+    )
+    tool_schema      = {
+        "type": "object",
+        "properties": {
+            "targeted_query": {
+                "type":        "string",
+                "description": "Specific query for a coverage gap (optional).",
+            },
+            "targeted_label": {
+                "type":        "string",
+                "description": "Label identifying which sub-question this covers.",
+            },
+        },
+        "required": [],
+    }
+
     def __init__(self, provider):
         super().__init__(provider)
 

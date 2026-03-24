@@ -1,16 +1,28 @@
 """
-agents/orchestrator.py — OrchestratorAgent (5-agent architecture)
+agents/orchestrator.py — OrchestratorAgent
 
-Coordinates four specialist agents through a ReAct loop (max 15 turns).
+Coordinates specialist agents through a ReAct loop (max 15 turns).
 At each turn it receives a structured state summary, produces visible
-reasoning text, then selects one of five tool calls. Routing is decided
-at runtime by the LLM — not by predetermined graph edges.
+reasoning text, then selects a tool call. Routing is decided at runtime
+by the LLM — not by predetermined graph edges.
 
 Supports all providers via the LLMProvider abstraction:
   - Anthropic: native tool_use API
   - OpenAI / Azure / OpenAI-compatible: native function calling
   - Gemini: FunctionDeclaration
   - Ollama / llama.cpp: text-based ReAct fallback (THOUGHT/ACTION/ACTION_INPUT)
+
+Adding a new agent
+──────────────────
+1. Create agents/your_agent.py — set tool_name, tool_description, tool_schema
+   on the class (see agents/base.py for the protocol).
+2. Import it below and add ("your_agent_key", YourAgentClass) to AGENT_REGISTRY
+   at the correct pipeline position.
+3. Add "your_agent_key" to AGENT_NAMES in llm/registry.py.
+4. Add your output field(s) to state.py.
+5. Add one import to agents/__init__.py.
+TOOL_DEFINITIONS, _make_agents(), and the route map are auto-built from
+AGENT_REGISTRY — no further changes to this file are needed.
 """
 
 import json
@@ -19,27 +31,79 @@ from typing import Callable
 from llm.base import LLMProvider, ToolCall
 from llm.registry import AgentConfig, build_config_from_env
 from message_bus import Message, MessageBus
-from agents.scoping           import ScopingAgent
-from agents.search_reading    import SearchReadingAgent
+
+# ── Agent registry ─────────────────────────────────────────────────────────────
+# To add a new agent: import it and append ("state_key", AgentClass) here.
+# The order defines the pipeline sequence shown to the Orchestrator LLM.
+from agents.scoping            import ScopingAgent
+from agents.search_reading     import SearchReadingAgent
+from agents.reading_extraction import ReadingExtractionAgent
 from agents.synthesis_planning import SynthesisPlanningAgent
-from agents.validation        import ValidationAgent
+from agents.validation         import ValidationAgent
+
+AGENT_REGISTRY: list = [
+    ("scoping_agent",            ScopingAgent),
+    ("search_reading_agent",     SearchReadingAgent),
+    ("reading_extraction_agent", ReadingExtractionAgent),
+    ("synthesis_planning_agent", SynthesisPlanningAgent),
+    ("validation_agent",         ValidationAgent),
+]
+
+# ── Auto-built from registry ───────────────────────────────────────────────────
+
+_FINISH_TOOL = {
+    "name": "finish",
+    "description": (
+        "Mark the pipeline complete and return results. Call when "
+        "validation approves, or after 2 validation iterations."
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
+TOOL_DEFINITIONS = [
+    {
+        "name":         agent_cls.tool_name,
+        "description":  agent_cls.tool_description,
+        "input_schema": agent_cls.tool_schema,
+    }
+    for _, agent_cls in AGENT_REGISTRY
+    if agent_cls.tool_name
+] + [_FINISH_TOOL]
+
+# tool_name → state_key (used by _execute_tool)
+_ROUTE_MAP: dict = {
+    agent_cls.tool_name: state_key
+    for state_key, agent_cls in AGENT_REGISTRY
+    if agent_cls.tool_name
+}
+
+
+def _make_agents(agent_config: AgentConfig) -> dict:
+    return {
+        state_key: agent_cls(agent_config[state_key])
+        for state_key, agent_cls in AGENT_REGISTRY
+    }
+
 
 MAX_TURNS = 15
 
 SYSTEM_PROMPT = """\
-You are the Orchestrator of a five-agent academic research system. You coordinate
+You are the Orchestrator of a multi-agent academic research system. You coordinate
 specialist agents by sending them task messages through a shared message bus.
 Each agent is an independent reasoning entity with its own LLM instance.
 
 YOUR AGENTS:
-- ScopingAgent            — decomposes the research query into 3-5 sub-questions
-- SearchReadingAgent      — selects sources from a 7-source registry (domain-aware),
-                            retrieves, scores, deduplicates, and summarises papers
-- SynthesisPlanningAgent  — produces a thematic literature review AND a research
-                            plan; reads its own feedback from ValidationAgent
-- ValidationAgent         — evaluates citation accuracy, coherence, and
-                            completeness; sends directed feedback to
-                            SynthesisPlanningAgent when issues are found
+- ScopingAgent             — decomposes the research query into 3-5 sub-questions
+- SearchReadingAgent       — selects sources from a 7-source registry (domain-aware),
+                             retrieves, scores, deduplicates, and summarises papers
+- ReadingExtractionAgent   — converts retrieved papers into structured 6-field records
+                             (research_problem, methodology, findings, limitations,
+                             future_work, key_claims) with provenance metadata
+- SynthesisPlanningAgent   — produces a thematic literature review AND a research
+                             plan; reads its own feedback from ValidationAgent
+- ValidationAgent          — evaluates citation accuracy, coherence, and
+                             completeness; sends directed feedback to
+                             SynthesisPlanningAgent when issues are found
 
 KEY MULTI-AGENT BEHAVIOUR:
 When you call send_to_validation_agent, ValidationAgent sends a feedback message
@@ -49,79 +113,22 @@ produces an acknowledgement, and revises its outputs. The Orchestrator observes
 both the validation result and the ack in the state summary.
 
 STANDARD WORKFLOW:
-1. send_to_scoping_agent                 — always first
-2. send_to_search_reading_agent          — always second; searches all sub-questions
-3. send_to_synthesis_planning_agent      — once initial corpus is ready
-4. send_to_validation_agent              — evaluate outputs
-5a. If APPROVED → finish
-5b. If NOT APPROVED → ValidationAgent has ALREADY sent feedback to
+1. send_to_scoping_agent                  — always first
+2. send_to_search_reading_agent           — always second; searches all sub-questions
+3. send_to_reading_extraction_agent       — always third; structures the retrieved papers
+4. send_to_synthesis_planning_agent       — once extraction is complete
+5. send_to_validation_agent              — evaluate outputs
+6a. If APPROVED → finish
+6b. If NOT APPROVED → ValidationAgent has ALREADY sent feedback to
     SynthesisPlanningAgent. Call send_to_synthesis_planning_agent (it reads
     its own feedback and revises). Then send_to_validation_agent again.
     After 2 validation iterations → always finish regardless.
-6. If synthesis flagged uncovered sub-questions AND corpus is small (<8 papers):
-   call send_to_search_reading_agent with targeted_query before step 3.
-7. finish — always the final call.
+7. If synthesis flagged uncovered sub-questions AND corpus is small (<8 papers):
+   call send_to_search_reading_agent with targeted_query, then
+   send_to_reading_extraction_agent again before synthesis.
+8. finish — always the final call.
 
 Read the state summary carefully before each decision."""
-
-TOOL_DEFINITIONS = [
-    {
-        "name": "send_to_scoping_agent",
-        "description": (
-            "Send the research query to ScopingAgent to decompose it into "
-            "3-5 focused sub-questions. Call this FIRST."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "send_to_search_reading_agent",
-        "description": (
-            "Send a search + read task to SearchReadingAgent. Without parameters, "
-            "it selects appropriate sources from the 7-source registry, then searches all "
-            "summarises the top papers. To target a specific coverage gap, provide "
-            "targeted_query and targeted_label."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "targeted_query": {
-                    "type": "string",
-                    "description": "Specific query for a coverage gap (optional).",
-                },
-                "targeted_label": {
-                    "type": "string",
-                    "description": "Label identifying which sub-question this covers.",
-                },
-            },
-            "required": [],
-        },
-    },
-    {
-        "name": "send_to_synthesis_planning_agent",
-        "description": (
-            "Ask SynthesisPlanningAgent to produce (or revise) the literature "
-            "review and research plan. The agent automatically reads any pending "
-            "feedback from ValidationAgent and acknowledges it before revising."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "send_to_validation_agent",
-        "description": (
-            "Ask ValidationAgent to evaluate the synthesis and research plan. "
-            "It sends directed feedback to SynthesisPlanningAgent if issues are found."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "finish",
-        "description": (
-            "Mark the pipeline complete and return results. Call when "
-            "validation approves, or after 2 validation iterations."
-        ),
-        "input_schema": {"type": "object", "properties": {}, "required": []},
-    },
-]
 
 
 # ── State summary ─────────────────────────────────────────────────────────────
@@ -158,6 +165,12 @@ def _build_state_summary(state: dict, bus: MessageBus) -> str:
     # Pending feedback
     pending_fb = bus.feedback_for("synthesis_planning_agent")
 
+    extracted     = state.get("extracted_papers", [])
+    n_full_text   = sum(1 for p in extracted
+                        if p.get("provenance", {}).get("text_source") == "full_text")
+    n_abstract    = sum(1 for p in extracted
+                        if p.get("provenance", {}).get("text_source") == "abstract_only")
+
     lines = [
         "══════════════════ STATE ══════════════════",
         f"Query: {state.get('query', '')}",
@@ -165,6 +178,8 @@ def _build_state_summary(state: dict, bus: MessageBus) -> str:
         *[f"  {i}. {q}" for i, q in enumerate(sub_questions, 1)],
         f"Sources selected: {state.get('sources_selected') or '(not yet)'}",
         f"Corpus: {len(all_papers)} papers  |  Summarised: {len(summaries)}",
+        f"Extracted: {len(extracted)} papers"
+        + (f" ({n_full_text} full-text, {n_abstract} abstract-only)" if extracted else " (not yet)"),
         f"By source: {src_counts or '(none yet)'}",
         *coverage,
         f"Synthesis: {'✓' if synthesis else '✗'}  |  Plan: {'✓' if plan else '✗'}  |  Validation iterations: {val_iters}",
@@ -213,14 +228,7 @@ def _execute_tool(name: str, inputs: dict, state: dict, bus: MessageBus,
         callback("tool_result", {"tool": "finish", "agent": "", "result": "Pipeline complete ✓"})
         return json.dumps({"status": "complete"})
 
-    route_map = {
-        "send_to_scoping_agent":            "scoping_agent",
-        "send_to_search_reading_agent":     "search_reading_agent",
-        "send_to_synthesis_planning_agent": "synthesis_planning_agent",
-        "send_to_validation_agent":         "validation_agent",
-    }
-
-    agent_key = route_map.get(name)
+    agent_key = _ROUTE_MAP.get(name)
     if not agent_key:
         return json.dumps({"error": f"Unknown tool: {name}"})
 

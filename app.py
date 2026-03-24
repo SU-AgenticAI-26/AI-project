@@ -56,6 +56,17 @@ st.markdown("""<style>
 .tool-call-block   { font-family: monospace; }
 .msg-feedback      { font-weight: 500; }
 
+/* Provenance badges (ReadingExtractionAgent) */
+.badge-fulltext  { display:inline-block; background:#16a34a; color:#fff;
+                   font-size:.75em; font-weight:600; padding:1px 7px;
+                   border-radius:9px; margin-left:6px; }
+.badge-abstract  { display:inline-block; background:#d97706; color:#fff;
+                   font-size:.75em; font-weight:600; padding:1px 7px;
+                   border-radius:9px; margin-left:6px; }
+.badge-metadata  { display:inline-block; background:#6b7280; color:#fff;
+                   font-size:.75em; font-weight:600; padding:1px 7px;
+                   border-radius:9px; margin-left:6px; }
+
 /* Ensure markdown inside these divs inherits colour */
 .reasoning-block *, .tool-call-block *, .tool-result-block *,
 .msg-task *, .msg-result *, .msg-feedback *, .msg-ack *, .msg-request * {
@@ -522,6 +533,7 @@ if run_btn and query:
         "query": query, "sub_questions": [], "all_papers": [],
         "search_queries_used": [], "paper_summaries": [],
         "sources_selected": [], "source_rationale": {},
+        "extracted_papers": [],                                  # ReadingExtractionAgent
         "synthesis": "", "gaps": "", "research_plan": "",
         "themes": [], "contradictions": [], "uncovered_sub_questions": [],
         "research_steps": [], "risks_and_mitigations": "",
@@ -1026,6 +1038,68 @@ new vis.Network(container, data, options);
                         st.markdown(f"[🔗 View]({p['url']})")
                     if p.get("pdf_url"):
                         st.markdown(f"[📄 PDF]({p['pdf_url']})")
+
+        # ── Structured extraction (ReadingExtractionAgent) ────────────────
+        extracted_papers = final_state.get("extracted_papers", [])
+        if extracted_papers:
+            st.divider()
+            n_full = sum(1 for p in extracted_papers
+                         if p.get("provenance", {}).get("text_source") == "full_text")
+            n_abs  = sum(1 for p in extracted_papers
+                         if p.get("provenance", {}).get("text_source") == "abstract_only")
+            n_meta = sum(1 for p in extracted_papers
+                         if p.get("provenance", {}).get("text_source") == "metadata_only")
+            st.markdown(
+                f"**Structured Extraction** — {len(extracted_papers)} papers  "
+                f"&nbsp;&nbsp;"
+                f'<span class="badge-fulltext">Full Text: {n_full}</span>'
+                f'<span class="badge-abstract">Abstract Only: {n_abs}</span>'
+                f'<span class="badge-metadata">Metadata Only: {n_meta}</span>',
+                unsafe_allow_html=True,
+            )
+            _BADGE = {
+                "full_text":     ('<span class="badge-fulltext">Full Text</span>', "high"),
+                "abstract_only": ('<span class="badge-abstract">Abstract Only</span>', "medium"),
+                "metadata_only": ('<span class="badge-metadata">Metadata Only</span>', "low"),
+            }
+            for i, ep in enumerate(extracted_papers, 1):
+                prov        = ep.get("provenance", {})
+                text_source = prov.get("text_source", "abstract_only")
+                badge_html, _ = _BADGE.get(text_source, _BADGE["abstract_only"])
+                confidence  = prov.get("confidence", "")
+                conf_note   = f" · confidence: {confidence}" if confidence else ""
+                with st.expander(
+                    f"{i}. {ep['title']} ({ep.get('year','?')}) — "
+                    f"{ep.get('citation_count',0)} citations [{ep.get('source','')}]",
+                    expanded=False,
+                ):
+                    st.markdown(
+                        f"**Authors:** {', '.join(ep.get('authors', [])[:4])}  "
+                        + badge_html
+                        + f'<span style="color:#888;font-size:.8em">{conf_note}'
+                        + (f" · {prov.get('text_chars',0):,} chars" if prov.get("text_chars") else "")
+                        + "</span>",
+                        unsafe_allow_html=True,
+                    )
+                    col1, col2 = st.columns([3, 1])
+                    with col1:
+                        st.markdown(f"**Research problem:** {ep.get('research_problem', '—')}")
+                        if ep.get("key_claims"):
+                            st.markdown(
+                                "**Key claims:** "
+                                + " · ".join(f"`{c}`" for c in ep["key_claims"])
+                            )
+                        st.markdown(f"**Methodology:** {ep.get('methodology', '—')}")
+                        st.markdown(f"**Findings:** {ep.get('findings', '—')}")
+                        st.markdown(f"**Limitations:** {ep.get('limitations', 'not stated')}")
+                        st.markdown(f"**Future work:** {ep.get('future_work', 'not stated')}")
+                    with col2:
+                        if ep.get("url"):
+                            st.markdown(f"[🔗 View]({ep['url']})")
+                        if ep.get("pdf_url"):
+                            st.markdown(f"[📄 PDF]({ep['pdf_url']})")
+                        if prov.get("abstract_only_flag"):
+                            st.caption("⚠ Extraction from abstract only")
 
     with tab_comms:
         st.markdown("""Every message exchanged between agents on the bus.

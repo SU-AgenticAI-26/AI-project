@@ -99,18 +99,38 @@ State concisely how you will address each issue. Return only JSON:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _paper_block(summaries: list) -> str:
+def _paper_block(papers: list) -> str:
+    """
+    Build a numbered evidence block for the synthesis prompt.
+    Accepts either extracted_papers format (from ReadingExtractionAgent,
+    preferred) or the legacy paper_summaries format (from SearchReadingAgent).
+    Detected by presence of "research_problem" key.
+    """
     lines = []
-    for i, p in enumerate(summaries, 1):
-        s = p.get("summary", {})
-        lines.append(
-            f"[{i}] {p['title']} ({p.get('year', '?')}) "
-            f"[{p.get('source', '?')}] — {p.get('citation_count', 0)} citations\n"
-            f"    Key claims:  {'; '.join(s.get('key_claims', []))}\n"
-            f"    Methods:     {s.get('methods', '')}\n"
-            f"    Findings:    {s.get('findings', '')}\n"
-            f"    Future work: {s.get('future_work', 'not stated')}"
-        )
+    for i, p in enumerate(papers, 1):
+        if "research_problem" in p:
+            # extracted_papers format — richer schema
+            lines.append(
+                f"[{i}] {p['title']} ({p.get('year', '?')}) "
+                f"[{p.get('source', '?')}] — {p.get('citation_count', 0)} citations\n"
+                f"    Research problem: {p.get('research_problem', '')}\n"
+                f"    Key claims:       {'; '.join(p.get('key_claims', []))}\n"
+                f"    Methods:          {p.get('methodology', '')}\n"
+                f"    Findings:         {p.get('findings', '')}\n"
+                f"    Limitations:      {p.get('limitations', 'not stated')}\n"
+                f"    Future work:      {p.get('future_work', 'not stated')}"
+            )
+        else:
+            # paper_summaries format — legacy fallback
+            s = p.get("summary", {})
+            lines.append(
+                f"[{i}] {p['title']} ({p.get('year', '?')}) "
+                f"[{p.get('source', '?')}] — {p.get('citation_count', 0)} citations\n"
+                f"    Key claims:  {'; '.join(s.get('key_claims', []))}\n"
+                f"    Methods:     {s.get('methods', '')}\n"
+                f"    Findings:    {s.get('findings', '')}\n"
+                f"    Future work: {s.get('future_work', 'not stated')}"
+            )
     return "\n\n".join(lines)
 
 
@@ -118,11 +138,22 @@ class SynthesisPlanningAgent(BaseAgent):
     name          = "synthesis_planning_agent"
     system_prompt = SYSTEM_PROMPT
 
+    tool_name        = "send_to_synthesis_planning_agent"
+    tool_description = (
+        "Ask SynthesisPlanningAgent to produce (or revise) the literature "
+        "review and research plan. The agent automatically reads any pending "
+        "feedback from ValidationAgent and acknowledges it before revising."
+    )
+    tool_schema      = {"type": "object", "properties": {}, "required": []}
+
     def __init__(self, provider):
         super().__init__(provider)
 
     def run(self, message: Message, state: dict, bus: MessageBus) -> Message:
-        summaries = state.get("paper_summaries", [])
+        # Prefer extracted_papers (richer 6-field schema with provenance) when
+        # ReadingExtractionAgent has run; fall back to paper_summaries otherwise.
+        extracted = state.get("extracted_papers", [])
+        summaries = extracted if extracted else state.get("paper_summaries", [])
 
         # ── Check for directed feedback from ValidationAgent ──────────────
         feedback_block = ""

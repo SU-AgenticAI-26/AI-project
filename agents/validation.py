@@ -94,6 +94,13 @@ class ValidationAgent(BaseAgent):
     name          = "validation_agent"
     system_prompt = SYSTEM_PROMPT
 
+    tool_name        = "send_to_validation_agent"
+    tool_description = (
+        "Ask ValidationAgent to evaluate the synthesis and research plan. "
+        "It sends directed feedback to SynthesisPlanningAgent if issues are found."
+    )
+    tool_schema      = {"type": "object", "properties": {}, "required": []}
+
     def __init__(self, provider):
         super().__init__(provider)
 

@@ -17,6 +17,17 @@ class ResearchState(TypedDict):
     sources_selected:   list           # list[str] source IDs chosen by agent
     source_rationale:   dict           # source_id → rationale string
 
+    # Reading/Extraction Agent output
+    # Each record: {title, authors, year, source, doi, url, pdf_url,
+    #   citation_count, research_problem, methodology, findings, limitations,
+    #   future_work, key_claims, provenance: {text_source, abstract_only_flag,
+    #   pdf_attempted, text_chars, confidence}}
+    extracted_papers:   list           # list[ExtractedPaper dict]
+
+    # ── Add new agent output fields below this line ───────────────────────────
+    # Follow the pattern above: one field per agent, with a comment block
+    # explaining the schema. Keep fields grouped by the agent that writes them.
+
     # Synthesis & Planning
     synthesis:          str
     gaps:               str

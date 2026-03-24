@@ -47,6 +47,13 @@ class ScopingAgent(BaseAgent):
     name          = "scoping_agent"
     system_prompt = SYSTEM_PROMPT
 
+    tool_name        = "send_to_scoping_agent"
+    tool_description = (
+        "Send the research query to ScopingAgent to decompose it into "
+        "3-5 focused sub-questions. Call this FIRST."
+    )
+    tool_schema      = {"type": "object", "properties": {}, "required": []}
+
     def __init__(self, provider):
         super().__init__(provider)
 
