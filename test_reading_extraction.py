@@ -527,7 +527,7 @@ class TestEdgeCases(unittest.TestCase):
         result = app.reading_extraction_agent(state, model)
         # Ensure the agent runs and does not call the LLM for whitespace-only input
         self.assertIn("extraction_findings", result)
-        model.assert_not_called()
+        model.invoke.assert_not_called()
 
     def test_very_long_findings_handled(self):
         """Agent should not error on large input content."""
