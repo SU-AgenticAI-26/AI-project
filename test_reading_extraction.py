@@ -17,51 +17,17 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module-level mocking helpers
-# Streamlit calls set_page_config() at import time, and several other
-# top-level statements run SQL setup, so we stub out the heavy dependencies
-# before importing streamlit_app.
+# All Streamlit UI/DB initialisation is gated inside main(), so it never runs
+# during import.  We only need to stub out the heavy third-party packages so
+# that `import streamlit_app` succeeds in environments where they are absent.
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _SessionState(dict):
-    """Dict subclass that also supports attribute-style access, matching Streamlit's SessionState."""
-    def __getattr__(self, key):
-        try:
-            return self[key]
-        except KeyError:
-            raise AttributeError(key)
-
-    def __setattr__(self, key, val):
-        self[key] = val
-
-
-def _make_streamlit_stub():
-    """Return a minimal stub that satisfies every top-level st.* call."""
-    st = MagicMock()
-    st.session_state = _SessionState()
-    st.set_page_config = MagicMock()
-    st.markdown = MagicMock()
-    st.stop = MagicMock()
-    # Buttons and form submits must return False so no UI code paths execute
-    st.button = MagicMock(return_value=False)
-    st.form_submit_button = MagicMock(return_value=False)
-    # text_input / text_area / number_input return empty/safe defaults
-    st.text_input = MagicMock(return_value="")
-    st.text_area = MagicMock(return_value="")
-    st.number_input = MagicMock(return_value=0)
-    st.checkbox = MagicMock(return_value=False)
-    st.file_uploader = MagicMock(return_value=None)
-    # tabs / columns must unpack correctly — return a list of context managers
-    st.tabs = lambda names: [MagicMock() for _ in names]
-    st.columns = lambda spec: [MagicMock() for _ in (range(spec) if isinstance(spec, int) else spec)]
-    return st
-
-
 def _patch_imports():
-    """Patch heavy/UI dependencies before importing streamlit_app."""
+    """Stub out third-party packages that may be absent in the test environment."""
     mocks = {}
 
-    # streamlit
-    mocks["streamlit"] = _make_streamlit_stub()
+    # streamlit — only the module-level attribute access needs to exist
+    mocks["streamlit"] = MagicMock()
 
     # pyvis
     pyvis_mod  = types.ModuleType("pyvis")
@@ -70,6 +36,30 @@ def _patch_imports():
     pyvis_mod.network = pyvis_net
     mocks["pyvis"] = pyvis_mod
     mocks["pyvis.network"] = pyvis_net
+
+    # langchain_core — provide lightweight message/document stubs that preserve
+    # the `content` kwarg so prompt-inspection tests can read it back.
+    class _Msg:
+        def __init__(self, content: str = "", **_kw):
+            self.content = content
+
+    class _Doc:
+        def __init__(self, page_content: str = "", metadata: dict | None = None, **_kw):
+            self.page_content = page_content
+            self.metadata = metadata or {}
+
+    lc_core      = types.ModuleType("langchain_core")
+    lc_core_docs = types.ModuleType("langchain_core.documents")
+    lc_core_msgs = types.ModuleType("langchain_core.messages")
+    lc_core_docs.Document      = _Doc
+    lc_core_msgs.AIMessage     = _Msg
+    lc_core_msgs.HumanMessage  = _Msg
+    lc_core_msgs.SystemMessage = _Msg
+    lc_core.documents = lc_core_docs
+    lc_core.messages  = lc_core_msgs
+    mocks["langchain_core"]          = lc_core
+    mocks["langchain_core.documents"] = lc_core_docs
+    mocks["langchain_core.messages"]  = lc_core_msgs
 
     # langchain / openai stubs
     for mod in [
