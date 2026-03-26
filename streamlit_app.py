@@ -10,7 +10,7 @@
 ║  Install:                                                                    ║
 ║    pip install streamlit langgraph langchain-openai langchain-core           ║
 ║               langchain-community faiss-cpu langchain-text-splitters         ║
-║               networkx pyvis tiktoken arxiv                                  ║
+║               networkx pyvis tiktoken arxiv requests                         ║
 ║                                                                              ║
 ║  Run:   streamlit run streamlit_app.py                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
