@@ -110,7 +110,7 @@ class ProviderConfig:
     provider: str
     api_key:  str
     model:    str
-    base_url: str | None = None
+    base_url: Optional[str] = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
