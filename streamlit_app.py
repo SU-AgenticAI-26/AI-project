@@ -356,17 +356,19 @@ def sql_list_topics() -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VectorDBModule:
-    def __init__(self, embeddings):
+    def __init__(self, embeddings, vector_dir: Path = VECTOR_DIR):
         self.embeddings = embeddings
+        self.vector_dir = vector_dir
+        self.vector_dir.mkdir(parents=True, exist_ok=True)
         self.splitter   = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
         self._store: Optional[FAISS] = None
         self._load()
 
     def _load(self) -> None:
-        if (VECTOR_DIR / "index.faiss").exists():
+        if (self.vector_dir / "index.faiss").exists():
             try:
                 self._store = FAISS.load_local(
-                    str(VECTOR_DIR), self.embeddings,
+                    str(self.vector_dir), self.embeddings,
                     allow_dangerous_deserialization=True,
                 )
             except Exception:
@@ -374,7 +376,7 @@ class VectorDBModule:
 
     def _save(self) -> None:
         if self._store:
-            self._store.save_local(str(VECTOR_DIR))
+            self._store.save_local(str(self.vector_dir))
 
     def add_text(self, text: str, meta: dict | None = None) -> int:
         chunks = self.splitter.create_documents([text], metadatas=[meta or {}])
@@ -508,6 +510,21 @@ def _embeddings(cfg: ProviderConfig):
     else:  # Claude or Local — use a free local model via sentence-transformers
         from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+
+def _embedding_key(cfg: ProviderConfig) -> str:
+    """Return a stable, filesystem-safe identifier for the embedding backend.
+
+    Used to namespace the FAISS vector store directory so that indices built
+    with different embedding models (and therefore different vector dimensions)
+    are stored separately and never mixed up.
+    """
+    if cfg.provider == PROVIDER_OPENAI:
+        return "openai-text-embedding-ada-002"
+    elif cfg.provider == PROVIDER_GEMINI:
+        return "gemini-text-embedding-004"
+    else:  # Claude or Local — HuggingFace sentence-transformers
+        return "huggingface-all-MiniLM-L6-v2"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1087,11 +1104,15 @@ with st.sidebar:
         base_url=base_url,
     )
 
-    # Rebuild VDB when provider/key/model changes (embeddings depend on these)
+    # Rebuild VDB when provider/key/model changes (embeddings depend on these).
+    # Each embedding backend gets its own subdirectory under VECTOR_DIR so that
+    # indices built with different dimensionalities (e.g. OpenAI 1536-d vs
+    # sentence-transformers 384-d) never collide and cause runtime errors.
     _vdb_cache_key = (provider, api_key, llm_model)
     if st.session_state.vdb is None or st.session_state.get("_vdb_cfg") != _vdb_cache_key:
         with st.spinner("Initialising embeddings…"):
-            st.session_state.vdb      = VectorDBModule(_embeddings(cfg))
+            vdb_dir = VECTOR_DIR / _embedding_key(cfg)
+            st.session_state.vdb      = VectorDBModule(_embeddings(cfg), vector_dir=vdb_dir)
             st.session_state._vdb_cfg = _vdb_cache_key
 
         # FIX 1: auto re-index saved docs on startup
