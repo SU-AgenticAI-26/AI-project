@@ -713,7 +713,7 @@ def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
     # Skip if all retrievers returned empty or placeholder content
     if not any(_has_content(f) for f in (vf, sf, wf)):
         return {
-            "extraction_findings": "no content to extract — all retrieval channels were empty or skipped",
+            "extraction_findings": "(none)",
             "messages": [AIMessage(content="[ReadingExtraction] skipped — no retrieval content")],
             "activity_log": [{
                 "agent":  "reading_extraction",
