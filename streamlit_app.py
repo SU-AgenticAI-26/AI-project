@@ -764,7 +764,10 @@ def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
     title_marker = "**Title / Topic:**"
     paper_count = extraction.count(title_marker)
     if paper_count == 0:
-        paper_count = sum(1 for line in extraction.splitlines() if line.strip() == "---")
+        # Each record is expected to have a start and end '---' delimiter, so count
+        # delimiter lines and infer the number of papers from delimiter *pairs*.
+        delimiter_lines = sum(1 for line in extraction.splitlines() if line.strip() == "---")
+        paper_count = max(1, delimiter_lines // 2) if delimiter_lines > 0 else 0
 
     return {
         "extraction_findings": extraction,
