@@ -27,6 +27,8 @@ Architecture
   │   │                │
   └───┴────────────────┘
           │
+  [Reading/Extraction Agent]  ← per-paper structured records + provenance
+          │
     [Orchestrator Agent]  ← merges, deduplicates, weights evidence
           │
     [Knowledge Mapper]  ← builds graph; loops back if sparse
@@ -83,20 +85,21 @@ CACHE_TTL_DAYS = 20
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
-    messages:           Annotated[List, operator.add]
-    query:              str
-    active_agents:      List[str]
-    router_reasoning:   str
-    vector_findings:    str
-    sql_findings:       str
-    web_findings:       str
-    activity_log:       Annotated[List, operator.add]
-    merged_context:     str
-    knowledge_map:      dict
-    critique:           str
-    loop_count:         int
-    summary:            str
-    current_agent:      str
+    messages:              Annotated[List, operator.add]
+    query:                 str
+    active_agents:         List[str]
+    router_reasoning:      str
+    vector_findings:       str
+    sql_findings:          str
+    web_findings:          str
+    extraction_findings:   str
+    activity_log:          Annotated[List, operator.add]
+    merged_context:        str
+    knowledge_map:         dict
+    critique:              str
+    loop_count:            int
+    summary:               str
+    current_agent:         str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -695,27 +698,114 @@ def web_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -> dict
     }
 
 
+# ── 5. Reading / Extraction Agent ────────────────────────────────────────────
+
+_EMPTY_PLACEHOLDER = {"", "(none)", "(not activated)", "(no SQL results)"}
+
+def _has_content(s: str) -> bool:
+    return s.strip() not in _EMPTY_PLACEHOLDER
+
+def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
+    vf = state.get("vector_findings", "")
+    sf = state.get("sql_findings", "")
+    wf = state.get("web_findings", "")
+
+    # Skip if all retrievers returned empty or placeholder content
+    if not any(_has_content(f) for f in (vf, sf, wf)):
+        return {
+            "extraction_findings": "no content to extract — all retrieval channels were empty or skipped",
+            "messages": [AIMessage(content="[ReadingExtraction] skipped — no retrieval content")],
+            "activity_log": [{
+                "agent":  "reading_extraction",
+                "icon":   "📖",
+                "title":  "Reading / Extraction — skipped",
+                "detail": "No content from any retrieval channel.",
+                "ts":     _stamp(),
+            }],
+            "current_agent": "reading_extraction",
+        }
+
+    # Build combined input, filtering out placeholder values
+    sections = []
+    if _has_content(vf):
+        sections.append(f"=== Vector DB findings ===\n{vf}")
+    if _has_content(sf):
+        sections.append(f"=== SQL / DB findings ===\n{sf}")
+    if _has_content(wf):
+        sections.append(f"=== Web / API findings ===\n{wf}")
+    combined = "\n\n".join(sections)
+
+    system = SystemMessage(content=(
+        "You are a Reading and Extraction Agent for academic research.\n"
+        "Given synthesised retrieval findings from multiple sources, extract a structured record "
+        "for every distinct paper, study, or source you can identify.\n\n"
+        "For each paper output a block in this exact format:\n"
+        "---\n"
+        "**Title / Topic:** <title or identifier>\n"
+        "**Provenance:** <abstract-only | full-text | structured-db>\n"
+        "**Research Problem:** <one sentence>\n"
+        "**Methodology:** <one sentence>\n"
+        "**Key Findings:**\n- <bullet points>\n"
+        "**Limitations:** <one sentence>\n"
+        "**Future Work:** <one sentence>\n"
+        "---\n\n"
+        "Provenance rules:\n"
+        "- 'structured-db' if the source is from the SQL/DB findings section\n"
+        "- 'full-text' if large paragraphs of text were available (VectorDB)\n"
+        "- 'abstract-only' if only title/abstract/year was available (Web API results)\n\n"
+        "If no distinct papers can be identified, output exactly: NO_PAPERS_EXTRACTED\n\n"
+        "Be precise. Do not hallucinate citations."
+    ))
+    resp = model.invoke([system, HumanMessage(
+        content=f"Query: {state['query']}\n\nRetrieval findings:\n{combined}"
+    )])
+
+    extraction = resp.content.strip()
+    # Count records by pairs of "---" delimiters (each record is wrapped in --- ... ---)
+    paper_count = extraction.count("---") // 2
+
+    return {
+        "extraction_findings": extraction,
+        "messages": [AIMessage(content=f"[ReadingExtraction] {paper_count} paper(s) structured")],
+        "activity_log": [{
+            "agent":  "reading_extraction",
+            "icon":   "📖",
+            "title":  "Reading / Extraction agent",
+            "detail": (
+                f"{paper_count} paper(s) extracted — fields: research problem, methodology, "
+                f"findings, limitations, future work. Provenance tagged per source."
+            ),
+            "ts":     _stamp(),
+        }],
+        "current_agent": "reading_extraction",
+    }
+
+
 def orchestrator_agent(state: AgentState, model: ChatOpenAI) -> dict:
     block = "\n\n".join([
         f"=== Vector DB ===\n{state.get('vector_findings','')}",
         f"=== SQL / DB ===\n{state.get('sql_findings','')}",
         f"=== Web / APIs ===\n{state.get('web_findings','')}",
+        f"=== Structured Extraction ===\n{state.get('extraction_findings','')}",
     ])
     system = SystemMessage(content=(
-        "You are an Orchestrator Agent. Merge findings from three specialised agents:\n"
+        "You are an Orchestrator Agent. Merge findings from four specialised agents "
+        "(VectorDB, SQL/DB, Web, and Extraction):\n"
         "1. Deduplicate overlapping information\n"
         "2. Resolve contradictions, preferring higher-confidence structured sources\n"
-        "3. Label each claim: [VectorDB] / [SQL] / [Web]\n"
+        "3. Label each claim: [VectorDB] / [SQL] / [Web] / [Extraction]\n"
         "4. Produce one coherent merged context for downstream agents."
     ))
     resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\n{block}")])
     active = [
         src for src, key in [
-            ("Vector DB", "vector_findings"),
-            ("SQL DB",    "sql_findings"),
-            ("Web",       "web_findings"),
+            ("Vector DB",  "vector_findings"),
+            ("SQL DB",     "sql_findings"),
+            ("Web",        "web_findings"),
+            ("Extraction", "extraction_findings"),
         ]
-        if "not activated" not in state.get(key, "not activated")
+        if state.get(key, "") not in ("", "(none)", "NO_PAPERS_EXTRACTED", "(not activated)")
+        and "not activated" not in state.get(key, "")
     ]
     return {
         "merged_context": resp.content,
@@ -828,28 +918,31 @@ def _route_critic(state: AgentState) -> str:
 def build_graph(api_key: str, vdb: VectorDBModule):
     lm_r = _llm(api_key, 0.0)
     lm_s = _llm(api_key, 0.3)
+    lm_e = _llm(api_key, 0.1)
     lm_o = _llm(api_key, 0.2)
     lm_m = _llm(api_key, 0.1)
     lm_c = _llm(api_key, 0.0)
     lm_z = _llm(api_key, 0.5)
 
     g = StateGraph(AgentState)
-    g.add_node("router",           lambda s: router_agent(s, lm_r))
-    g.add_node("vector_db",        lambda s: vector_db_agent(s, lm_s, vdb))
-    g.add_node("sql_db",           lambda s: sql_db_agent(s, lm_s))
-    g.add_node("web",              lambda s: web_agent(s, lm_s, vdb))
-    g.add_node("orchestrator",     lambda s: orchestrator_agent(s, lm_o))
-    g.add_node("knowledge_mapper", lambda s: knowledge_mapper_agent(s, lm_m))
-    g.add_node("critic",           lambda s: critic_agent(s, lm_c))
-    g.add_node("summarizer",       lambda s: summarizer_agent(s, lm_z))
+    g.add_node("router",              lambda s: router_agent(s, lm_r))
+    g.add_node("vector_db",           lambda s: vector_db_agent(s, lm_s, vdb))
+    g.add_node("sql_db",              lambda s: sql_db_agent(s, lm_s))
+    g.add_node("web",                 lambda s: web_agent(s, lm_s, vdb))
+    g.add_node("reading_extraction",  lambda s: reading_extraction_agent(s, lm_e))
+    g.add_node("orchestrator",        lambda s: orchestrator_agent(s, lm_o))
+    g.add_node("knowledge_mapper",    lambda s: knowledge_mapper_agent(s, lm_m))
+    g.add_node("critic",              lambda s: critic_agent(s, lm_c))
+    g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
 
     g.set_entry_point("router")
-    g.add_edge("router",           "vector_db")
-    g.add_edge("vector_db",        "sql_db")
-    g.add_edge("sql_db",           "web")
-    g.add_edge("web",              "orchestrator")
-    g.add_edge("orchestrator",     "knowledge_mapper")
-    g.add_edge("knowledge_mapper", "critic")
+    g.add_edge("router",              "vector_db")
+    g.add_edge("vector_db",           "sql_db")
+    g.add_edge("sql_db",              "web")
+    g.add_edge("web",                 "reading_extraction")
+    g.add_edge("reading_extraction",  "orchestrator")
+    g.add_edge("orchestrator",        "knowledge_mapper")
+    g.add_edge("knowledge_mapper",    "critic")
     g.add_conditional_edges(
         "critic", _route_critic,
         {"orchestrator": "orchestrator", "summarizer": "summarizer"},
@@ -942,6 +1035,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .agent-card.vector_db{border-color:#4A90D9}
 .agent-card.sql_db{border-color:#E67E22}
 .agent-card.web{border-color:#2ECC71}
+.agent-card.reading_extraction{border-color:#27AE60}
 .agent-card.orchestrator{border-color:#E74C3C}
 .agent-card.knowledge_mapper{border-color:#1ABC9C}
 .agent-card.critic{border-color:#F39C12}
@@ -952,6 +1046,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .bv{background:#1a3a5c;color:#4A90D9}
 .bs{background:#4a2010;color:#E67E22}
 .bw{background:#0f3d20;color:#2ECC71}
+.be{background:#0d2e1a;color:#27AE60}
 .bm{background:#2d1a4a;color:#9B59B6}
 </style>
 """, unsafe_allow_html=True)
@@ -1060,8 +1155,9 @@ with tab_research:
             app      = build_graph(api_key, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
-                "router": 10, "vector_db": 25, "sql_db": 40, "web": 55,
-                "orchestrator": 68, "knowledge_mapper": 80, "critic": 90, "summarizer": 97,
+                "router": 10, "vector_db": 25, "sql_db": 40, "web": 53,
+                "reading_extraction": 63, "orchestrator": 72,
+                "knowledge_mapper": 82, "critic": 91, "summarizer": 97,
             }
 
             # Accumulate state across ALL agents properly
@@ -1070,6 +1166,7 @@ with tab_research:
                 "messages":[], "query": query,
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
+                "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
                 "summary":"", "current_agent":"",
@@ -1114,10 +1211,11 @@ with tab_research:
         with r_act:
             st.subheader("What each agent did")
             badge = {
-                "vector_db":    '<span class="src-badge bv">Vector DB</span>',
-                "sql_db":       '<span class="src-badge bs">SQL DB</span>',
-                "web":          '<span class="src-badge bw">Web</span>',
-                "orchestrator": '<span class="src-badge bm">Orchestrator</span>',
+                "vector_db":          '<span class="src-badge bv">Vector DB</span>',
+                "sql_db":             '<span class="src-badge bs">SQL DB</span>',
+                "web":                '<span class="src-badge bw">Web</span>',
+                "reading_extraction": '<span class="src-badge be">Extraction</span>',
+                "orchestrator":       '<span class="src-badge bm">Orchestrator</span>',
             }
             for entry in full_state.get("activity_log", []):
                 cls    = entry.get("agent", "")
@@ -1170,9 +1268,10 @@ with tab_research:
 
         with r_find:
             for label, key, bcls in [
-                ("🗂️ Vector DB", "vector_findings", "bv"),
-                ("🗄️ SQL / DB",  "sql_findings",    "bs"),
-                ("🌐 Web",       "web_findings",     "bw"),
+                ("🗂️ Vector DB",            "vector_findings",     "bv"),
+                ("🗄️ SQL / DB",             "sql_findings",        "bs"),
+                ("🌐 Web",                  "web_findings",        "bw"),
+                ("📖 Reading / Extraction", "extraction_findings", "be"),
             ]:
                 with st.expander(f"{label} findings"):
                     st.markdown(full_state.get(key, ""))
@@ -1180,6 +1279,7 @@ with tab_research:
         with r_log:
             av = {
                 "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
+                "[ReadingExtraction]":"📖",
                 "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
                 "[Critic]":"🧐","[Summarizer]":"✍️",
             }
