@@ -530,13 +530,14 @@ class TestEdgeCases(unittest.TestCase):
 
     def test_only_whitespace_findings_treated_as_empty(self):
         """Whitespace-only content should not trigger LLM invocation."""
-        # The current implementation checks for empty string, not whitespace.
-        # This test documents current behaviour (whitespace goes to LLM).
+        # The current implementation strips the findings string, so
+        # whitespace-only content is treated as empty and should skip the LLM.
         model = _mock_llm(_SINGLE_RECORD_RESPONSE)
         state = _make_state(vector_findings="   ")
         result = app.reading_extraction_agent(state, model)
-        # Either path is acceptable; we just verify no exception is raised
+        # Ensure the agent runs and does not call the LLM for whitespace-only input
         self.assertIn("extraction_findings", result)
+        model.assert_not_called()
 
     def test_very_long_findings_handled(self):
         """Agent should not error on large input content."""
