@@ -7,10 +7,16 @@
 ║  2. VectorDB persistence — reindex_saved_docs() rebuilds index on startup    ║
 ║  3. Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv     ║
 ║                                                                              ║
-║  Install:                                                                    ║
+║  Install (core):                                                             ║
 ║    pip install streamlit langgraph langchain-openai langchain-core           ║
 ║               langchain-community faiss-cpu langchain-text-splitters         ║
 ║               networkx pyvis tiktoken arxiv requests                         ║
+║                                                                              ║
+║  Optional providers:                                                         ║
+║    Gemini:  pip install langchain-google-genai                               ║
+║    Claude:  pip install langchain-anthropic                                  ║
+║    Local embeddings (Claude/Local provider):                                 ║
+║             pip install sentence-transformers                                ║
 ║                                                                              ║
 ║  Run:   streamlit run streamlit_app.py                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -48,6 +54,7 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, List, Optional, TypedDict
@@ -57,6 +64,7 @@ import streamlit as st
 from pyvis.network import Network
 
 from langchain_core.documents import Document
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -79,6 +87,33 @@ for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 CACHE_TTL_DAYS = 20
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROVIDER CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROVIDER_OPENAI = "OpenAI"
+PROVIDER_GEMINI = "Google Gemini"
+PROVIDER_CLAUDE = "Anthropic Claude"
+PROVIDER_LOCAL  = "Local (llama.cpp / Ollama / LMStudio)"
+
+_DEFAULT_MODELS = {
+    PROVIDER_OPENAI: "gpt-4o-mini",
+    PROVIDER_GEMINI: "gemini-2.0-flash",
+    PROVIDER_CLAUDE: "claude-haiku-4-5-20251001",
+    PROVIDER_LOCAL:  "",
+}
+
+_DEFAULT_BASE_URL = "http://localhost:8080/v1"  # llama.cpp server default
+
+
+@dataclass
+class ProviderConfig:
+    provider: str
+    api_key:  str
+    model:    str
+    base_url: str | None = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENT STATE
@@ -324,9 +359,8 @@ def sql_list_topics() -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VectorDBModule:
-    def __init__(self, api_key: str):
-        self.api_key    = api_key
-        self.embeddings = OpenAIEmbeddings(api_key=api_key)
+    def __init__(self, embeddings):
+        self.embeddings = embeddings
         self.splitter   = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
         self._store: Optional[FAISS] = None
         self._load()
@@ -441,18 +475,49 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM FACTORY
+# LLM + EMBEDDINGS FACTORIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _llm(api_key: str, temperature: float = 0.3) -> ChatOpenAI:
-    return ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=temperature)
+def _llm(cfg: ProviderConfig, temperature: float = 0.3) -> BaseChatModel:
+    """Return a LangChain chat model for the configured provider."""
+    if cfg.provider == PROVIDER_OPENAI:
+        return ChatOpenAI(api_key=cfg.api_key, model=cfg.model, temperature=temperature)
+    elif cfg.provider == PROVIDER_GEMINI:
+        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+        return ChatGoogleGenerativeAI(
+            google_api_key=cfg.api_key, model=cfg.model, temperature=temperature
+        )
+    elif cfg.provider == PROVIDER_CLAUDE:
+        from langchain_anthropic import ChatAnthropic  # type: ignore
+        return ChatAnthropic(api_key=cfg.api_key, model=cfg.model, temperature=temperature)
+    else:  # PROVIDER_LOCAL — llama.cpp / Ollama / LMStudio all expose OpenAI-compatible API
+        return ChatOpenAI(
+            base_url=cfg.base_url or _DEFAULT_BASE_URL,
+            api_key=cfg.api_key or "no-key",
+            model=cfg.model or "local-model",
+            temperature=temperature,
+        )
+
+
+def _embeddings(cfg: ProviderConfig):
+    """Return a LangChain embeddings object for the configured provider."""
+    if cfg.provider == PROVIDER_OPENAI:
+        return OpenAIEmbeddings(api_key=cfg.api_key)
+    elif cfg.provider == PROVIDER_GEMINI:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings  # type: ignore
+        return GoogleGenerativeAIEmbeddings(
+            google_api_key=cfg.api_key, model="models/text-embedding-004"
+        )
+    else:  # Claude or Local — use a free local model via sentence-transformers
+        from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def router_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def router_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Router Agent. Given a user query, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
@@ -484,7 +549,7 @@ def router_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 # ── 2. Vector DB Agent ────────────────────────────────────────────────────────
-def vector_db_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -> dict:
+def vector_db_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
     if "vector_db" not in state.get("active_agents", []):
         return {
             "vector_findings": "(not activated)",
@@ -528,7 +593,7 @@ def vector_db_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -
     }
 
 
-def sql_db_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def sql_db_agent(state: AgentState, model: BaseChatModel) -> dict:
     if "sql_db" not in state.get("active_agents", []):
         return {
             "sql_findings": "(not activated)",
@@ -562,7 +627,7 @@ def sql_db_agent(state: AgentState, model: ChatOpenAI) -> dict:
 
 # ── 4. Web / arXiv Agent ──────────────────────────────────────────────────────
 # FIX 3: Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv
-def web_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -> dict:
+def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
     if "web" not in state.get("active_agents", []):
         return {
             "web_findings": "(not activated)",
@@ -705,7 +770,7 @@ _EMPTY_PLACEHOLDER = {"", "(none)", "(not activated)", "(no SQL results)"}
 def _has_content(s: str) -> bool:
     return s.strip() not in _EMPTY_PLACEHOLDER
 
-def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def reading_extraction_agent(state: AgentState, model: BaseChatModel) -> dict:
     vf = state.get("vector_findings", "")
     sf = state.get("sql_findings", "")
     wf = state.get("web_findings", "")
@@ -781,7 +846,7 @@ def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 
-def orchestrator_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
     block = "\n\n".join([
         f"=== Vector DB ===\n{state.get('vector_findings','')}",
         f"=== SQL / DB ===\n{state.get('sql_findings','')}",
@@ -818,7 +883,7 @@ def orchestrator_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 # ── 6. Knowledge Mapper ───────────────────────────────────────────────────────
-def knowledge_mapper_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
         "Return ONLY valid JSON:\n"
@@ -850,7 +915,7 @@ def knowledge_mapper_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 # ── 7. Critic ─────────────────────────────────────────────────────────────────
-def critic_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Critic Agent. If the knowledge map has fewer than 8 nodes OR "
         "key source diversity is missing, respond: "
@@ -883,7 +948,7 @@ def critic_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 # ── 8. Summarizer ─────────────────────────────────────────────────────────────
-def summarizer_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
         "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from."
@@ -915,14 +980,14 @@ def _route_critic(state: AgentState) -> str:
 # GRAPH BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_graph(api_key: str, vdb: VectorDBModule):
-    lm_r = _llm(api_key, 0.0)
-    lm_s = _llm(api_key, 0.3)
-    lm_e = _llm(api_key, 0.1)
-    lm_o = _llm(api_key, 0.2)
-    lm_m = _llm(api_key, 0.1)
-    lm_c = _llm(api_key, 0.0)
-    lm_z = _llm(api_key, 0.5)
+def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
+    lm_r = _llm(cfg, 0.0)
+    lm_s = _llm(cfg, 0.3)
+    lm_e = _llm(cfg, 0.1)
+    lm_o = _llm(cfg, 0.2)
+    lm_m = _llm(cfg, 0.1)
+    lm_c = _llm(cfg, 0.0)
+    lm_z = _llm(cfg, 0.5)
 
     g = StateGraph(AgentState)
     g.add_node("router",              lambda s: router_agent(s, lm_r))
@@ -1066,17 +1131,64 @@ with st.sidebar:
     st.markdown("## 🤝 Collaborative RAG")
     st.divider()
 
-    # API key — check env first, allow override
-    env_key = os.environ.get("OPENAI_API_KEY", "")
-    api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…")
-    if not api_key:
-        st.warning("Enter your OpenAI API key to continue.")
+    # ── Provider selection ────────────────────────────────────────────────────
+    provider = st.selectbox(
+        "LLM Provider",
+        [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_CLAUDE, PROVIDER_LOCAL],
+    )
+
+    _env_keys = {
+        PROVIDER_OPENAI: os.environ.get("OPENAI_API_KEY", ""),
+        PROVIDER_GEMINI: os.environ.get("GOOGLE_API_KEY", ""),
+        PROVIDER_CLAUDE: os.environ.get("ANTHROPIC_API_KEY", ""),
+        PROVIDER_LOCAL:  "",
+    }
+    _key_labels = {
+        PROVIDER_OPENAI: "OpenAI API Key",
+        PROVIDER_GEMINI: "Google API Key",
+        PROVIDER_CLAUDE: "Anthropic API Key",
+        PROVIDER_LOCAL:  "API Key (leave blank if none)",
+    }
+    _key_placeholders = {
+        PROVIDER_OPENAI: "sk-…",
+        PROVIDER_GEMINI: "AIza…",
+        PROVIDER_CLAUDE: "sk-ant-…",
+        PROVIDER_LOCAL:  "optional",
+    }
+
+    api_key = st.text_input(
+        _key_labels.get(provider, "API Key"),
+        value=_env_keys.get(provider, ""),
+        type="password",
+        placeholder=_key_placeholders.get(provider, ""),
+    )
+
+    default_model = _DEFAULT_MODELS.get(provider, "")
+    llm_model = st.text_input("Model", value=default_model, placeholder=default_model or "model name")
+
+    base_url = None
+    if provider == PROVIDER_LOCAL:
+        base_url = st.text_input("Base URL", value=_DEFAULT_BASE_URL,
+                                 placeholder=_DEFAULT_BASE_URL)
+
+    if provider != PROVIDER_LOCAL and not api_key:
+        st.warning(f"Enter your {_key_labels.get(provider, 'API Key')} to continue.")
         st.stop()
 
-    if st.session_state.vdb is None or st.session_state.get("_api_key") != api_key:
-        st.session_state.vdb      = VectorDBModule(api_key)
-        st.session_state._api_key = api_key
-      
+    cfg = ProviderConfig(
+        provider=provider,
+        api_key=api_key,
+        model=llm_model or default_model,
+        base_url=base_url,
+    )
+
+    # Rebuild VDB when provider/key/model changes (embeddings depend on these)
+    _vdb_cache_key = (provider, api_key, llm_model)
+    if st.session_state.vdb is None or st.session_state.get("_vdb_cfg") != _vdb_cache_key:
+        with st.spinner("Initialising embeddings…"):
+            st.session_state.vdb      = VectorDBModule(_embeddings(cfg))
+            st.session_state._vdb_cfg = _vdb_cache_key
+
         # FIX 1: auto re-index saved docs on startup
         reindexed = st.session_state.vdb.reindex_saved_docs()
         if reindexed:
@@ -1144,7 +1256,8 @@ with tab_research:
         use_cache     = st.checkbox("Use 20-day cache", value=True)
         auto_save_map = st.checkbox("Auto-save map",    value=True)
 
-    run = st.button("🚀 Run Pipeline", type="primary", disabled=not (api_key and query))
+    run = st.button("🚀 Run Pipeline", type="primary",
+                    disabled=not ((api_key or provider == PROVIDER_LOCAL) and query))
 
     if run:
         cached = cache_load(query) if use_cache else None
@@ -1152,7 +1265,7 @@ with tab_research:
             st.info("⚡ Loaded from cache")
             full_state = cached
         else:
-            app      = build_graph(api_key, vdb)
+            app      = build_graph(cfg, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
                 "router": 10, "vector_db": 25, "sql_db": 40, "web": 53,

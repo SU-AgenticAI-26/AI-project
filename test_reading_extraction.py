@@ -77,6 +77,7 @@ def _patch_imports():
         "langchain_community",
         "langchain_community.vectorstores",
         "langchain_community.vectorstores.FAISS",
+        "langchain_community.embeddings",
         "langchain_text_splitters",
         "faiss",
     ]:
