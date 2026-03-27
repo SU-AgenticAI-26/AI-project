@@ -1,0 +1,145 @@
+{
+  "query": "TELL ME about rag\n",
+  "saved_at": "2026-03-17T00:32:09.392322",
+  "map": {
+    "nodes": [
+      {
+        "id": "1",
+        "label": "Retrieval-Augmented Generation (RAG)",
+        "type": "concept"
+      },
+      {
+        "id": "2",
+        "label": "Retriever",
+        "type": "entity"
+      },
+      {
+        "id": "3",
+        "label": "Generator",
+        "type": "entity"
+      },
+      {
+        "id": "4",
+        "label": "Applications",
+        "type": "concept"
+      },
+      {
+        "id": "5",
+        "label": "Question Answering",
+        "type": "concept"
+      },
+      {
+        "id": "6",
+        "label": "Conversational Agents",
+        "type": "concept"
+      },
+      {
+        "id": "7",
+        "label": "Content Creation",
+        "type": "concept"
+      },
+      {
+        "id": "8",
+        "label": "Advantages",
+        "type": "concept"
+      },
+      {
+        "id": "9",
+        "label": "Challenges",
+        "type": "concept"
+      },
+      {
+        "id": "10",
+        "label": "Transformers",
+        "type": "entity"
+      },
+      {
+        "id": "11",
+        "label": "Knowledge Bases",
+        "type": "entity"
+      },
+      {
+        "id": "12",
+        "label": "Fine-tuning",
+        "type": "concept"
+      },
+      {
+        "id": "13",
+        "label": "Open-Domain Question Answering",
+        "type": "concept"
+      },
+      {
+        "id": "14",
+        "label": "Chatbots",
+        "type": "concept"
+      }
+    ],
+    "edges": [
+      {
+        "source": "1",
+        "target": "2",
+        "relation": "includes"
+      },
+      {
+        "source": "1",
+        "target": "3",
+        "relation": "includes"
+      },
+      {
+        "source": "1",
+        "target": "4",
+        "relation": "hasApplications"
+      },
+      {
+        "source": "4",
+        "target": "5",
+        "relation": "includes"
+      },
+      {
+        "source": "4",
+        "target": "6",
+        "relation": "includes"
+      },
+      {
+        "source": "4",
+        "target": "7",
+        "relation": "includes"
+      },
+      {
+        "source": "1",
+        "target": "8",
+        "relation": "hasAdvantages"
+      },
+      {
+        "source": "1",
+        "target": "9",
+        "relation": "hasChallenges"
+      },
+      {
+        "source": "1",
+        "target": "10",
+        "relation": "utilizes"
+      },
+      {
+        "source": "1",
+        "target": "11",
+        "relation": "requires"
+      },
+      {
+        "source": "1",
+        "target": "12",
+        "relation": "mayRequire"
+      },
+      {
+        "source": "4",
+        "target": "13",
+        "relation": "isExampleOf"
+      },
+      {
+        "source": "4",
+        "target": "14",
+        "relation": "isExampleOf"
+      }
+    ]
+  }
+}

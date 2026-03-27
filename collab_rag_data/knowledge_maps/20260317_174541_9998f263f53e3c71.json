@@ -1,0 +1,184 @@
+{
+  "query": "how do birds not end up migrating ?\n",
+  "saved_at": "2026-03-17T17:45:41.623188",
+  "map": {
+    "nodes": [
+      {
+        "id": "bird_migration",
+        "label": "Bird Migration",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "adaptive_behavior",
+        "label": "Adaptive Behavior",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "seasonal_changes",
+        "label": "Seasonal Changes",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "suitable_habitats",
+        "label": "Suitable Habitats",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "resource_availability",
+        "label": "Resource Availability",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "nesting_sites",
+        "label": "Nesting Sites",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "genetic_factors",
+        "label": "Genetic Factors",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "behavioral_factors",
+        "label": "Behavioral Factors",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "environmental_conditions",
+        "label": "Environmental Conditions",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "optimal_switching_model",
+        "label": "Optimal Switching Model",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "migration_decisions",
+        "label": "Migration Decisions",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "flexible_behavior",
+        "label": "Flexible Behavior",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "ecological_factors",
+        "label": "Ecological Factors",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "food_availability",
+        "label": "Food Availability",
+        "type": "fact",
+        "source": "merged"
+      },
+      {
+        "id": "sedentary_species",
+        "label": "Sedentary Species",
+        "type": "entity",
+        "source": "merged"
+      },
+      {
+        "id": "environmental_information",
+        "label": "Environmental Information",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "migration_impetus",
+        "label": "Migration Impetus",
+        "type": "concept",
+        "source": "merged"
+      }
+    ],
+    "edges": [
+      {
+        "source": "bird_migration",
+        "target": "adaptive_behavior",
+        "relation": "is_a",
+        "weight": 0.1
+      },
+      {
+        "source": "adaptive_behavior",
+        "target": "seasonal_changes",
+        "relation": "influences",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "suitable_habitats",
+        "relation": "aims_to_find",
+        "weight": 0.1
+      },
+      {
+        "source": "resource_availability",
+        "target": "food_availability",
+        "relation": "includes",
+        "weight": 0.1
+      },
+      {
+        "source": "resource_availability",
+        "target": "nesting_sites",
+        "relation": "includes",
+        "weight": 0.1
+      },
+      {
+        "source": "genetic_factors",
+        "target": "sedentary_species",
+        "relation": "affects",
+        "weight": 0.1
+      },
+      {
+        "source": "environmental_conditions",
+        "target": "migration_impetus",
+        "relation": "affects",
+        "weight": 0.1
+      },
+      {
+        "source": "optimal_switching_model",
+        "target": "flexible_behavior",
+        "relation": "describes",
+        "weight": 0.1
+      },
+      {
+        "source": "migration_decisions",
+        "target": "environmental_information",
+        "relation": "influences",
+        "weight": 0.1
+      },
+      {
+        "source": "environmental_conditions",
+        "target": "migration_decisions",
+        "relation": "influences",
+        "weight": 0.1
+      },
+      {
+        "source": "ecological_factors",
+        "target": "migration_impetus",
+        "relation": "influences",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "resource_availability",
+        "relation": "is_affected_by",
+        "weight": 0.1
+      }
+    ]
+  }
+}

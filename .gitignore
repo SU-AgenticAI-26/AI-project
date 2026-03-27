@@ -51,9 +51,7 @@ Thumbs.db
 *.log
 logs/
 
-# Data directories
-rag_data/
-collab_rag_data/
+
 *.db
 *.sqlite
 *.sqlite3
