@@ -1333,6 +1333,7 @@ with st.sidebar:
         st.markdown(f'<span class="src-badge {css}">{label}</span>', unsafe_allow_html=True)
 
 
+
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 tab_research, tab_sql, tab_maps, tab_sessions, tab_cache = st.tabs([
     "🚀 Research", "🗄️ SQL DB", "🗺️ Saved Maps", "💬 Sessions", "🕐 Cache",
@@ -1350,8 +1351,7 @@ with tab_research:
         use_cache     = st.checkbox("Use 20-day cache", value=True)
         auto_save_map = st.checkbox("Auto-save map",    value=True)
 
-    run = st.button("🚀 Run Pipeline", type="primary",
-                    disabled=not ((api_key or provider == PROVIDER_LOCAL) and query))
+    run = st.button("🚀 Run Pipeline", type="primary", disabled=not (api_key and query))
 
     if run:
         cached = cache_load(query) if use_cache else None
@@ -1359,11 +1359,12 @@ with tab_research:
             st.info("⚡ Loaded from cache")
             full_state = cached
         else:
-            app      = build_graph(cfg, vdb)
+            app      = build_graph(api_key, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
-                "router": 10, "vector_db": 25, "sql_db": 40, "web": 55,
-                "orchestrator": 68, "knowledge_mapper": 80, "critic": 90, "summarizer": 97,
+                "router": 10, "vector_db": 25, "sql_db": 40, "web": 53,
+                "reading_extraction": 63, "orchestrator": 72,
+                "knowledge_mapper": 82, "critic": 91, "summarizer": 97,
             }
 
             # Accumulate state across ALL agents properly
@@ -1372,6 +1373,7 @@ with tab_research:
                 "messages":[], "query": query,
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
+                "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
                 "summary":"", "current_agent":"",
@@ -1394,320 +1396,204 @@ with tab_research:
             st.error("Pipeline returned no state. Please try again.")
             st.stop()
 
-        if st.session_state.vdb is None or st.session_state.get("_api_key") != api_key:
-            st.session_state.vdb      = VectorDBModule(api_key)
-            st.session_state._api_key = api_key
+        if auto_save_map and full_state.get("knowledge_map", {}).get("nodes"):
+            fname = map_save(query, full_state["knowledge_map"])
+            st.success(f"🗺️ Map saved → `{fname}`")
 
-            # FIX 1: auto re-index saved docs on startup
-            reindexed = st.session_state.vdb.reindex_saved_docs()
-            if reindexed:
-                st.info(f"Re-indexed {reindexed} saved document(s) from disk.")
+        st.session_state.turns.append({
+            "query":   query,
+            "summary": full_state.get("summary", ""),
+            "agents":  full_state.get("active_agents", []),
+            "nodes":   len(full_state.get("knowledge_map", {}).get("nodes", [])),
+            "ts":      _stamp(),
+            "cached":  cached is not None,
+        })
+        session_save(st.session_state.session_id, st.session_state.turns)
 
-        vdb: VectorDBModule = st.session_state.vdb
-        st.success("✅ Ready")
+        r_act, r_ans, r_map, r_ctx, r_find, r_log = st.tabs([
+            "🤝 Agent Activity", "💡 Final Answer", "🗺️ Knowledge Map",
+            "🔀 Merged Context", "🔍 Per-Agent Findings", "💬 Message Log",
+        ])
 
-        st.divider()
-        st.markdown("### Index Documents")
-        uploaded = st.file_uploader("Upload .txt / .md", type=["txt", "md"], accept_multiple_files=True)
-        if uploaded:
-            for f in uploaded:
-                n = vdb.add_file(f)
-                st.success(f"{f.name} → {n} chunks")
-
-        with st.expander("Index arXiv papers"):
-            aq = st.text_input("arXiv query", placeholder="transformer attention")
-            al = st.number_input("Max papers", 1, 30, 5)
-            if st.button("Index", key="arxiv_btn"):
-                if aq:
-                    with st.spinner("Fetching from arXiv…"):
-                        n = index_arxiv_documents(aq, vdb, al)
-                    st.success(f"Indexed {n} papers")
-                else:
-                    st.error("Enter a query.")
-
-        st.metric("Vector chunks", vdb.count())
-        srcs = vdb.sources()
-        if srcs:
-            with st.expander(f"{len(srcs)} document(s)"):
-                for s in srcs:
-                    st.markdown(f"• `{s}`")
-
-        st.divider()
-        st.markdown("### Add SQL Topic")
-        with st.form("add_topic"):
-            t_title = st.text_input("Title")
-            t_cat   = st.text_input("Category")
-            t_sum   = st.text_area("Summary", height=60)
-            t_kw    = st.text_input("Keywords (comma-separated)")
-            if st.form_submit_button("Add"):
-                st.success(sql_insert_topic(t_title, t_cat, t_sum, t_kw))
-
-        st.divider()
-        st.markdown("### Legend")
-        for label, css in [("Vector DB","bv"),("SQL / DB","bs"),("Web","bw"),("Merged","bm")]:
-            st.markdown(f'<span class="src-badge {css}">{label}</span>', unsafe_allow_html=True)
-
-
-    # ── Tabs ──────────────────────────────────────────────────────────────────────
-    tab_research, tab_sql, tab_maps, tab_sessions, tab_cache = st.tabs([
-        "🚀 Research", "🗄️ SQL DB", "🗺️ Saved Maps", "💬 Sessions", "🕐 Cache",
-    ])
-
-    # ════════════ TAB 1 — RESEARCH ════════════════════════════════════════════════
-    with tab_research:
-        st.header("Collaborative Research Query")
-
-        col_q, col_opts = st.columns([3, 1])
-        with col_q:
-            query = st.text_area("Query", height=90,
-                                 placeholder="e.g. How does RAG relate to transformer architecture?")
-        with col_opts:
-            use_cache     = st.checkbox("Use 20-day cache", value=True)
-            auto_save_map = st.checkbox("Auto-save map",    value=True)
-
-        run = st.button("🚀 Run Pipeline", type="primary", disabled=not (api_key and query))
-
-        if run:
-            cached = cache_load(query) if use_cache else None
-            if cached:
-                st.info("⚡ Loaded from cache")
-                full_state = cached
-            else:
-                app      = build_graph(api_key, vdb)
-                progress = st.progress(0, "Starting…")
-                pct_map  = {
-                    "router": 10, "vector_db": 25, "sql_db": 40, "web": 53,
-                    "reading_extraction": 63, "orchestrator": 72,
-                    "knowledge_mapper": 82, "critic": 91, "summarizer": 97,
-                }
-
-                # Accumulate state across ALL agents properly
-                # Each agent returns a partial update - we merge them so nothing is lost
-                full_state = {
-                    "messages":[], "query": query,
-                    "active_agents":[], "router_reasoning":"",
-                    "vector_findings":"", "sql_findings":"", "web_findings":"",
-                    "extraction_findings":"",
-                    "activity_log":[], "merged_context":"",
-                    "knowledge_map":{}, "critique":"", "loop_count":0,
-                    "summary":"", "current_agent":"",
-                }
-                for event in app.stream(full_state.copy()):
-                    for node, state_update in event.items():
-                        progress.progress(pct_map.get(node, 50),
-                                          f"{node.replace('_',' ').title()} running...")
-                        for key, val in state_update.items():
-                            if key in ('messages', 'activity_log') and isinstance(val, list):
-                                full_state[key] = full_state.get(key, []) + val
-                            else:
-                                full_state[key] = val
-
-                progress.progress(100, "✅ Done!")
-                if full_state and use_cache:
-                    cache_save(query, full_state)
-
-            if full_state is None:
-                st.error("Pipeline returned no state. Please try again.")
-                st.stop()
-
-            if auto_save_map and full_state.get("knowledge_map", {}).get("nodes"):
-                fname = map_save(query, full_state["knowledge_map"])
-                st.success(f"🗺️ Map saved → `{fname}`")
-
-            st.session_state.turns.append({
-                "query":   query,
-                "summary": full_state.get("summary", ""),
-                "agents":  full_state.get("active_agents", []),
-                "nodes":   len(full_state.get("knowledge_map", {}).get("nodes", [])),
-                "ts":      _stamp(),
-                "cached":  cached is not None,
-            })
-            session_save(st.session_state.session_id, st.session_state.turns)
-
-            r_act, r_ans, r_map, r_ctx, r_find, r_log = st.tabs([
-                "🤝 Agent Activity", "💡 Final Answer", "🗺️ Knowledge Map",
-                "🔀 Merged Context", "🔍 Per-Agent Findings", "💬 Message Log",
-            ])
-
-            with r_act:
-                st.subheader("What each agent did")
-                badge = {
-                    "vector_db":          '<span class="src-badge bv">Vector DB</span>',
-                    "sql_db":             '<span class="src-badge bs">SQL DB</span>',
-                    "web":                '<span class="src-badge bw">Web</span>',
-                    "reading_extraction": '<span class="src-badge be">Extraction</span>',
-                    "orchestrator":       '<span class="src-badge bm">Orchestrator</span>',
-                }
-                for entry in full_state.get("activity_log", []):
-                    cls    = entry.get("agent", "")
-                    icon   = entry.get("icon", "•")
-                    title  = entry.get("title", "")
-                    detail = entry.get("detail", "")
-                    bdg    = badge.get(cls, "")
-                    st.markdown(
-                        f'<div class="agent-card {cls}">'
-                        f'<div class="agent-title">{icon} {title} {bdg}</div>'
-                        f'<div class="agent-detail">{detail}</div>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
-                    if cls == "vector_db" and entry.get("chunks"):
-                        with st.expander(f"📄 {len(entry['chunks'])} retrieved chunks"):
-                            for ch in entry["chunks"]:
-                                st.markdown(f"**`{ch['source']}`**")
-                                st.caption(ch["text"])
-                    if cls == "sql_db" and entry.get("rows"):
-                        with st.expander(f"🗄️ {len(entry['rows'])} matched rows"):
-                            for row in entry["rows"]:
-                                st.code(row, language="text")
-
-            with r_ans:
-                st.markdown(full_state.get("summary", ""))
-
-            with r_map:
-                km = full_state.get("knowledge_map", {})
-                if km.get("nodes"):
-                    src_counts: dict[str, int] = {}
-                    for n in km["nodes"]:
-                        s = n.get("source", "merged")
-                        src_counts[s] = src_counts.get(s, 0) + 1
-                    cols = st.columns(len(src_counts))
-                    css  = {"vector_db":"bv","sql_db":"bs","web":"bw","merged":"bm"}
-                    for i, (s, c) in enumerate(src_counts.items()):
-                        cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
-                                         unsafe_allow_html=True)
-                    st.components.v1.html(render_knowledge_map(km), height=520)
-                    with st.expander("📊 Raw graph data"):
-                        c1, c2 = st.columns(2)
-                        c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
-                        c2.markdown("**Edges**"); c2.dataframe(km["edges"])
-                else:
-                    st.warning("No map generated.")
-
-            with r_ctx:
-                st.markdown(full_state.get("merged_context", ""))
-
-            with r_find:
-                for label, key, bcls in [
-                    ("🗂️ Vector DB",            "vector_findings",     "bv"),
-                    ("🗄️ SQL / DB",             "sql_findings",        "bs"),
-                    ("🌐 Web",                  "web_findings",        "bw"),
-                    ("📖 Reading / Extraction", "extraction_findings", "be"),
-                ]:
-                    with st.expander(f"{label} findings"):
-                        st.markdown(full_state.get(key, ""))
-
-            with r_log:
-                av = {
-                    "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
-                    "[ReadingExtraction]":"📖",
-                    "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
-                    "[Critic]":"🧐","[Summarizer]":"✍️",
-                }
-                for msg in full_state.get("messages", []):
-                    icon = next((v for k, v in av.items() if k in msg.content), "🤖")
-                    st.chat_message("assistant", avatar=icon).write(msg.content)
-
-
-    # ════════════ TAB 2 — SQL DB ══════════════════════════════════════════════════
-    with tab_sql:
-        st.header("SQL / DB Browser")
-        topics = sql_list_topics()
-        st.metric("Topics in DB", len(topics))
-        st.dataframe(topics, use_container_width=True)
-        st.divider()
-        st.subheader("Test keyword search")
-        test_q = st.text_input("Keyword")
-        if test_q:
-            st.code(sql_search(test_q), language="text")
-
-
-    # ════════════ TAB 3 — SAVED MAPS ══════════════════════════════════════════════
-    with tab_maps:
-        st.header("Saved Knowledge Maps")
-        all_maps = map_list()
-        if not all_maps:
-            st.info("No maps saved yet.")
-        else:
-            filt = st.text_input("Filter")
-            shown = [m for m in all_maps if not filt or filt.lower() in m["query"].lower()]
-            for m in shown:
-                with st.expander(
-                    f"🗺️ {m['query'][:65]}…  ·  {m['nodes']}n / {m['edges']}e  ·  "
-                    f"{m['saved_at'][:16].replace('T',' ')}"
-                ):
-                    if st.button("Visualise", key=f"vis_{m['file']}"):
-                        raw = map_load(m["file"])
-                        if raw:
-                            st.components.v1.html(render_knowledge_map(raw["map"]), height=470)
-
-
-    # ════════════ TAB 4 — SESSIONS ════════════════════════════════════════════════
-    with tab_sessions:
-        st.header("Conversation History")
-        c1, c2 = st.columns([2, 3])
-        with c1:
-            st.markdown(f"**Session:** `{st.session_state.session_id}`")
-            if st.button("💾 Save"):
-                session_save(st.session_state.session_id, st.session_state.turns)
-                st.success("Saved!")
-            if st.button("🆕 New session"):
-                session_save(st.session_state.session_id, st.session_state.turns)
-                st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
-                st.session_state.turns = []
-                st.rerun()
-            st.divider()
-            sel = None
-            for s in session_list():
-                if st.button(
-                    f"📅 {s['updated'][:16].replace('T',' ')}  ·  {s['n']} turns\n{s['preview']}",
-                    key=f"sess_{s['sid']}",
-                ):
-                    sel = s["sid"]
-        with c2:
-            turns = session_load(sel) if sel else st.session_state.turns
-            _agent_css = {"vector_db": "bv", "sql_db": "bs", "web": "bw"}
-            for i, t in enumerate(reversed(turns), 1):
-                badges = " ".join(
-                    f'<span class="src-badge {_agent_css.get(a, "bm")}">{a}</span>'
-                    for a in t.get("agents", [])
+        with r_act:
+            st.subheader("What each agent did")
+            badge = {
+                "vector_db":          '<span class="src-badge bv">Vector DB</span>',
+                "sql_db":             '<span class="src-badge bs">SQL DB</span>',
+                "web":                '<span class="src-badge bw">Web</span>',
+                "reading_extraction": '<span class="src-badge be">Extraction</span>',
+                "orchestrator":       '<span class="src-badge bm">Orchestrator</span>',
+            }
+            for entry in full_state.get("activity_log", []):
+                cls    = entry.get("agent", "")
+                icon   = entry.get("icon", "•")
+                title  = entry.get("title", "")
+                detail = entry.get("detail", "")
+                bdg    = badge.get(cls, "")
+                st.markdown(
+                    f'<div class="agent-card {cls}">'
+                    f'<div class="agent-title">{icon} {title} {bdg}</div>'
+                    f'<div class="agent-detail">{detail}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
                 )
-                st.markdown(f"**Turn {len(turns)-i+1}** · {t['ts'][:16].replace('T',' ')} {badges}",
-                            unsafe_allow_html=True)
-                st.markdown(f"> 🔍 **{t['query']}**")
-                with st.expander("Summary", expanded=(i == 1)):
-                    st.markdown(t.get("summary", ""))
-                st.markdown(f"🗺️ {t.get('nodes', 0)} nodes")
-                st.divider()
+                if cls == "vector_db" and entry.get("chunks"):
+                    with st.expander(f"📄 {len(entry['chunks'])} retrieved chunks"):
+                        for ch in entry["chunks"]:
+                            st.markdown(f"**`{ch['source']}`**")
+                            st.caption(ch["text"])
+                if cls == "sql_db" and entry.get("rows"):
+                    with st.expander(f"🗄️ {len(entry['rows'])} matched rows"):
+                        for row in entry["rows"]:
+                            st.code(row, language="text")
+
+        with r_ans:
+            st.markdown(full_state.get("summary", ""))
+
+        with r_map:
+            km = full_state.get("knowledge_map", {})
+            if km.get("nodes"):
+                src_counts: dict[str, int] = {}
+                for n in km["nodes"]:
+                    s = n.get("source", "merged")
+                    src_counts[s] = src_counts.get(s, 0) + 1
+                cols = st.columns(len(src_counts))
+                css  = {"vector_db":"bv","sql_db":"bs","web":"bw","merged":"bm"}
+                for i, (s, c) in enumerate(src_counts.items()):
+                    cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
+                                     unsafe_allow_html=True)
+                st.components.v1.html(render_knowledge_map(km), height=520)
+                with st.expander("📊 Raw graph data"):
+                    c1, c2 = st.columns(2)
+                    c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
+                    c2.markdown("**Edges**"); c2.dataframe(km["edges"])
+            else:
+                st.warning("No map generated.")
+
+        with r_ctx:
+            st.markdown(full_state.get("merged_context", ""))
+
+        with r_find:
+            for label, key, bcls in [
+                ("🗂️ Vector DB",            "vector_findings",     "bv"),
+                ("🗄️ SQL / DB",             "sql_findings",        "bs"),
+                ("🌐 Web",                  "web_findings",        "bw"),
+                ("📖 Reading / Extraction", "extraction_findings", "be"),
+            ]:
+                with st.expander(f"{label} findings"):
+                    st.markdown(full_state.get(key, ""))
+
+        with r_log:
+            av = {
+                "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
+                "[ReadingExtraction]":"📖",
+                "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
+                "[Critic]":"🧐","[Summarizer]":"✍️",
+            }
+            for msg in full_state.get("messages", []):
+                icon = next((v for k, v in av.items() if k in msg.content), "🤖")
+                st.chat_message("assistant", avatar=icon).write(msg.content)
 
 
-    # ════════════ TAB 5 — CACHE ═══════════════════════════════════════════════════
-    with tab_cache:
-        st.header("20-Day Query Cache")
-        entries = cache_list()
-        st.metric("Cached entries", len(entries))
-        filt_c = st.text_input("Filter", key="cache_filt")
-        shown_c = [e for e in entries if not filt_c or filt_c.lower() in e["query"].lower()]
-        for e in shown_c:
-            age   = datetime.utcnow() - datetime.fromisoformat(e["ts"])
-            age_s = f"{age.days}d {age.seconds//3600}h ago" if age.days else f"{age.seconds//3600}h {(age.seconds%3600)//60}m ago"
-            with st.expander(f"🗃️ {e['query'][:75]}…  ·  {age_s}"):
-                pl = cache_load(e["query"])
-                if pl:
-                    c1, c2, c3 = st.columns(3)
-                    c1.metric("Summary",  f"{len(pl.get('summary',''))} chars")
-                    c2.metric("Nodes",    len(pl.get("knowledge_map",{}).get("nodes",[])))
-                    c3.metric("Agents",   ", ".join(pl.get("active_agents",[])))
-                    if st.button("▶️ Reload", key=f"rc_{e['file']}"):
-                        st.markdown(pl.get("summary",""))
-                        km = pl.get("knowledge_map",{})
-                        if km.get("nodes"):
-                            st.components.v1.html(render_knowledge_map(km, 400), height=420)
+# ════════════ TAB 2 — SQL DB ══════════════════════════════════════════════════
+with tab_sql:
+    st.header("SQL / DB Browser")
+    topics = sql_list_topics()
+    st.metric("Topics in DB", len(topics))
+    st.dataframe(topics, use_container_width=True)
+    st.divider()
+    st.subheader("Test keyword search")
+    test_q = st.text_input("Keyword")
+    if test_q:
+        st.code(sql_search(test_q), language="text")
+
+
+# ════════════ TAB 3 — SAVED MAPS ══════════════════════════════════════════════
+with tab_maps:
+    st.header("Saved Knowledge Maps")
+    all_maps = map_list()
+    if not all_maps:
+        st.info("No maps saved yet.")
+    else:
+        filt = st.text_input("Filter")
+        shown = [m for m in all_maps if not filt or filt.lower() in m["query"].lower()]
+        for m in shown:
+            with st.expander(
+                f"🗺️ {m['query'][:65]}…  ·  {m['nodes']}n / {m['edges']}e  ·  "
+                f"{m['saved_at'][:16].replace('T',' ')}"
+            ):
+                if st.button("Visualise", key=f"vis_{m['file']}"):
+                    raw = map_load(m["file"])
+                    if raw:
+                        st.components.v1.html(render_knowledge_map(raw["map"]), height=470)
+
+
+# ════════════ TAB 4 — SESSIONS ════════════════════════════════════════════════
+with tab_sessions:
+    st.header("Conversation History")
+    c1, c2 = st.columns([2, 3])
+    with c1:
+        st.markdown(f"**Session:** `{st.session_state.session_id}`")
+        if st.button("💾 Save"):
+            session_save(st.session_state.session_id, st.session_state.turns)
+            st.success("Saved!")
+        if st.button("🆕 New session"):
+            session_save(st.session_state.session_id, st.session_state.turns)
+            st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+            st.session_state.turns = []
+            st.rerun()
         st.divider()
-        if st.button("🧹 Clear ALL cache"):
-            for p in CACHE_DIR.glob("*.json"):
-                p.unlink()
-            st.success("Cache cleared.")
+        sel = None
+        for s in session_list():
+            if st.button(
+                f"📅 {s['updated'][:16].replace('T',' ')}  ·  {s['n']} turns\n{s['preview']}",
+                key=f"sess_{s['sid']}",
+            ):
+                sel = s["sid"]
+    with c2:
+        turns = session_load(sel) if sel else st.session_state.turns
+        _agent_css = {"vector_db": "bv", "sql_db": "bs", "web": "bw"}
+        for i, t in enumerate(reversed(turns), 1):
+            badges = " ".join(
+                f'<span class="src-badge {_agent_css.get(a, "bm")}">{a}</span>'
+                for a in t.get("agents", [])
+            )
+            st.markdown(f"**Turn {len(turns)-i+1}** · {t['ts'][:16].replace('T',' ')} {badges}",
+                        unsafe_allow_html=True)
+            st.markdown(f"> 🔍 **{t['query']}**")
+            with st.expander("Summary", expanded=(i == 1)):
+                st.markdown(t.get("summary", ""))
+            st.markdown(f"🗺️ {t.get('nodes', 0)} nodes")
+            st.divider()
+
+
+# ════════════ TAB 5 — CACHE ═══════════════════════════════════════════════════
+with tab_cache:
+    st.header("20-Day Query Cache")
+    entries = cache_list()
+    st.metric("Cached entries", len(entries))
+    filt_c = st.text_input("Filter", key="cache_filt")
+    shown_c = [e for e in entries if not filt_c or filt_c.lower() in e["query"].lower()]
+    for e in shown_c:
+        age   = datetime.utcnow() - datetime.fromisoformat(e["ts"])
+        age_s = f"{age.days}d {age.seconds//3600}h ago" if age.days else f"{age.seconds//3600}h {(age.seconds%3600)//60}m ago"
+        with st.expander(f"🗃️ {e['query'][:75]}…  ·  {age_s}"):
+            pl = cache_load(e["query"])
+            if pl:
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Summary",  f"{len(pl.get('summary',''))} chars")
+                c2.metric("Nodes",    len(pl.get("knowledge_map",{}).get("nodes",[])))
+                c3.metric("Agents",   ", ".join(pl.get("active_agents",[])))
+                if st.button("▶️ Reload", key=f"rc_{e['file']}"):
+                    st.markdown(pl.get("summary",""))
+                    km = pl.get("knowledge_map",{})
+                    if km.get("nodes"):
+                        st.components.v1.html(render_knowledge_map(km, 400), height=420)
+    st.divider()
+    if st.button("🧹 Clear ALL cache"):
+        for p in CACHE_DIR.glob("*.json"):
+            p.unlink()
+        st.success("Cache cleared.")
 
 
 if __name__ == "__main__":
