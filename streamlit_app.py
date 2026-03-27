@@ -868,7 +868,6 @@ def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
     }
 
 
-def orchestrator_agent(state: AgentState, model: ChatOpenAI) -> dict:
 def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
     block = "\n\n".join([
         f"=== Vector DB ===\n{state.get('vector_findings','')}",
