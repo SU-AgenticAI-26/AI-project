@@ -1,0 +1,17 @@
+{
+  "sid": "sess_20260317_152252",
+  "updated": "2026-03-17T15:25:03.834090",
+  "turns": [
+    {
+      "query": "how do birds migrate",
+      "summary": "Bird migration is an adaptive behavior where birds move seasonally between breeding and wintering areas to optimize their survival and reproductive success. This behavior is influenced by environmental factors such as food availability, weather conditions, and habitat changes. Researchers utilize models like the optimal switching model, which employs stochastic differential equations to analyze how birds make migration decisions based on environmental information. This interdisciplinary study combines elements of bioinformatics and ecological research, emphasizing the importance of data analysis for understanding and conserving bird populations. Ongoing research continues to explore these complex mechanisms of migration. \n\n(Source: Vector DB)",
+      "agents": [
+        "vector_db",
+        "sql_db"
+      ],
+      "nodes": 18,
+      "ts": "2026-03-17T15:25:03.834052",
+      "cached": false
+    }
+  ]
+}

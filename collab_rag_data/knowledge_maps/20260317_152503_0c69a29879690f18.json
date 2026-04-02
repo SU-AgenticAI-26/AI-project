@@ -1,0 +1,214 @@
+{
+  "query": "how do birds migrate",
+  "saved_at": "2026-03-17T15:25:03.832101",
+  "map": {
+    "nodes": [
+      {
+        "id": "bird_migration",
+        "label": "Bird Migration",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "adaptive_behavior",
+        "label": "Adaptive Behavior",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "survival_success",
+        "label": "Survival and Reproductive Success",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "seasonal_movements",
+        "label": "Seasonal Movements",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "breeding_grounds",
+        "label": "Breeding Grounds",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "wintering_areas",
+        "label": "Wintering Areas",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "optimal_switching_model",
+        "label": "Optimal Switching Model",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "stochastic_differential_equations",
+        "label": "Stochastic Differential Equations",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "environmental_conditions",
+        "label": "Environmental Conditions",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "migration_decisions",
+        "label": "Migration Decisions",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "food_availability",
+        "label": "Food Availability",
+        "type": "factor",
+        "source": "merged"
+      },
+      {
+        "id": "weather_conditions",
+        "label": "Weather Conditions",
+        "type": "factor",
+        "source": "merged"
+      },
+      {
+        "id": "habitat_changes",
+        "label": "Habitat Changes",
+        "type": "factor",
+        "source": "merged"
+      },
+      {
+        "id": "data_analysis",
+        "label": "Data Analysis",
+        "type": "process",
+        "source": "merged"
+      },
+      {
+        "id": "bioinformatics",
+        "label": "Bioinformatics",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "ecological_studies",
+        "label": "Ecological Studies",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "conservation_strategies",
+        "label": "Conservation Strategies",
+        "type": "process",
+        "source": "merged"
+      },
+      {
+        "id": "ongoing_research",
+        "label": "Ongoing Research",
+        "type": "process",
+        "source": "merged"
+      }
+    ],
+    "edges": [
+      {
+        "source": "bird_migration",
+        "target": "adaptive_behavior",
+        "relation": "is_a",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "survival_success",
+        "relation": "aims_to_optimize",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "seasonal_movements",
+        "relation": "involves",
+        "weight": 0.1
+      },
+      {
+        "source": "seasonal_movements",
+        "target": "breeding_grounds",
+        "relation": "to",
+        "weight": 0.1
+      },
+      {
+        "source": "seasonal_movements",
+        "target": "wintering_areas",
+        "relation": "to",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "optimal_switching_model",
+        "relation": "explains",
+        "weight": 0.1
+      },
+      {
+        "source": "optimal_switching_model",
+        "target": "stochastic_differential_equations",
+        "relation": "based_on",
+        "weight": 0.1
+      },
+      {
+        "source": "optimal_switching_model",
+        "target": "environmental_conditions",
+        "relation": "influenced_by",
+        "weight": 0.1
+      },
+      {
+        "source": "environmental_conditions",
+        "target": "food_availability",
+        "relation": "includes",
+        "weight": 0.1
+      },
+      {
+        "source": "environmental_conditions",
+        "target": "weather_conditions",
+        "relation": "includes",
+        "weight": 0.1
+      },
+      {
+        "source": "environmental_conditions",
+        "target": "habitat_changes",
+        "relation": "includes",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "data_analysis",
+        "relation": "integrates",
+        "weight": 0.1
+      },
+      {
+        "source": "data_analysis",
+        "target": "bioinformatics",
+        "relation": "applies",
+        "weight": 0.1
+      },
+      {
+        "source": "data_analysis",
+        "target": "ecological_studies",
+        "relation": "supports",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "conservation_strategies",
+        "relation": "important_for",
+        "weight": 0.1
+      },
+      {
+        "source": "bird_migration",
+        "target": "ongoing_research",
+        "relation": "continues_to_evolve_in",
+        "weight": 0.1
+      }
+    ]
+  }
+}

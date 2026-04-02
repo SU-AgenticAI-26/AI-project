@@ -1,0 +1,115 @@
+{
+  "query": "TELL ME about rag\n",
+  "saved_at": "2026-03-17T00:31:07.279473",
+  "map": {
+    "nodes": [
+      {
+        "id": "1",
+        "label": "Rag",
+        "type": "concept"
+      },
+      {
+        "id": "2",
+        "label": "Rag as a Piece of Cloth",
+        "type": "concept"
+      },
+      {
+        "id": "3",
+        "label": "Cleaning",
+        "type": "fact"
+      },
+      {
+        "id": "4",
+        "label": "Ragtime Music",
+        "type": "concept"
+      },
+      {
+        "id": "5",
+        "label": "Scott Joplin",
+        "type": "entity"
+      },
+      {
+        "id": "6",
+        "label": "Rag Literature",
+        "type": "concept"
+      },
+      {
+        "id": "7",
+        "label": "Ragging",
+        "type": "concept"
+      },
+      {
+        "id": "8",
+        "label": "Rag Week",
+        "type": "concept"
+      },
+      {
+        "id": "9",
+        "label": "Rag Trade",
+        "type": "concept"
+      },
+      {
+        "id": "10",
+        "label": "Ragged Style",
+        "type": "concept"
+      },
+      {
+        "id": "11",
+        "label": "Rag Doll",
+        "type": "entity"
+      }
+    ],
+    "edges": [
+      {
+        "source": "1",
+        "target": "2",
+        "relation": "is a"
+      },
+      {
+        "source": "2",
+        "target": "3",
+        "relation": "used for"
+      },
+      {
+        "source": "1",
+        "target": "4",
+        "relation": "is a"
+      },
+      {
+        "source": "4",
+        "target": "5",
+        "relation": "composed by"
+      },
+      {
+        "source": "1",
+        "target": "6",
+        "relation": "is a"
+      },
+      {
+        "source": "1",
+        "target": "7",
+        "relation": "can refer to"
+      },
+      {
+        "source": "7",
+        "target": "8",
+        "relation": "is a"
+      },
+      {
+        "source": "1",
+        "target": "9",
+        "relation": "is related to"
+      },
+      {
+        "source": "9",
+        "target": "10",
+        "relation": "includes"
+      },
+      {
+        "source": "1",
+        "target": "11",
+        "relation": "can refer to"
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "sid": "sess_20260317_174331",
+  "updated": "2026-03-17T17:45:41.627203",
+  "turns": [
+    {
+      "query": "how do birds not end up migrating ?\n",
+      "summary": "Birds may choose not to migrate for several reasons, primarily linked to environmental stability and resource availability. Here are the key factors:\n\n1. **Resource Availability**: If food and suitable nesting sites are consistently available in their current habitat throughout the year, birds may opt to remain instead of migrating. This availability reduces the necessity for migration. [Source: Vector DB]\n\n2. **Genetic and Behavioral Factors**: Certain species or populations have evolved to be sedentary, adapting to stable environments that do not require migration. This genetic predisposition can lead to non-migratory behavior. [Source: Vector DB]\n\n3. **Environmental Conditions**: Birds typically migrate in response to unfavorable climate changes or habitat conditions. If these environmental factors remain favorable year-round, the drive to migrate diminishes. [Source: Vector DB]\n\n4. **Optimal Switching Model**: Research indicates that migration behaviors can be flexible. Birds may switch between migratory and non-migratory behaviors based on environmental cues, suggesting that migration is a complex response rather than a fixed behavior. [Source: Vector DB]\n\n5. **Information Availability**: Birds that have access to accurate information about their environment are more likely to make effective decisions regarding migration. The ability to assess environmental conditions is crucial in determining whether to migrate or stay. [Source: Vector DB]\n\nIn summary, the decision for birds not to migrate is influenced by stable environmental conditions, resource availability, genetic factors, and the flexibility of their migratory behavior.",
+      "agents": [
+        "vector_db",
+        "sql_db"
+      ],
+      "nodes": 17,
+      "ts": "2026-03-17T17:45:41.627159",
+      "cached": false
+    }
+  ]
+}

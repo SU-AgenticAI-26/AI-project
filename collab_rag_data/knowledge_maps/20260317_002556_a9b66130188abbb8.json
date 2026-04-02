@@ -1,0 +1,226 @@
+{
+  "query": "what is llm",
+  "saved_at": "2026-03-17T00:25:56.721895",
+  "map": {
+    "nodes": [
+      {
+        "id": "1",
+        "label": "LLM",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "2",
+        "label": "Large Language Model",
+        "type": "definition",
+        "source": "merged"
+      },
+      {
+        "id": "3",
+        "label": "Transformer Architecture",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "4",
+        "label": "Deep Learning",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "5",
+        "label": "Natural Language Processing",
+        "type": "application",
+        "source": "merged"
+      },
+      {
+        "id": "6",
+        "label": "Text Generation",
+        "type": "application",
+        "source": "merged"
+      },
+      {
+        "id": "7",
+        "label": "Translation",
+        "type": "application",
+        "source": "merged"
+      },
+      {
+        "id": "8",
+        "label": "Summarization",
+        "type": "application",
+        "source": "merged"
+      },
+      {
+        "id": "9",
+        "label": "GPT-3",
+        "type": "entity",
+        "source": "merged"
+      },
+      {
+        "id": "10",
+        "label": "BERT",
+        "type": "entity",
+        "source": "merged"
+      },
+      {
+        "id": "11",
+        "label": "Efficient Mixed Transformer",
+        "type": "process",
+        "source": "merged"
+      },
+      {
+        "id": "12",
+        "label": "Mixed Transformer Block",
+        "type": "process",
+        "source": "merged"
+      },
+      {
+        "id": "13",
+        "label": "Personalized Attention Mechanism",
+        "type": "process",
+        "source": "merged"
+      },
+      {
+        "id": "14",
+        "label": "Multi-Layer Perceptrons",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "15",
+        "label": "Feature Representation",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "16",
+        "label": "High Complexity",
+        "type": "challenge",
+        "source": "merged"
+      },
+      {
+        "id": "17",
+        "label": "Locality Mechanisms",
+        "type": "challenge",
+        "source": "merged"
+      },
+      {
+        "id": "18",
+        "label": "Image Super-Resolution",
+        "type": "application",
+        "source": "merged"
+      },
+      {
+        "id": "19",
+        "label": "Clinical Records",
+        "type": "entity",
+        "source": "merged"
+      }
+    ],
+    "edges": [
+      {
+        "source": "1",
+        "target": "2",
+        "relation": "is a",
+        "weight": 1.0
+      },
+      {
+        "source": "1",
+        "target": "3",
+        "relation": "utilizes",
+        "weight": 0.9
+      },
+      {
+        "source": "1",
+        "target": "4",
+        "relation": "is based on",
+        "weight": 0.8
+      },
+      {
+        "source": "1",
+        "target": "5",
+        "relation": "applies to",
+        "weight": 0.9
+      },
+      {
+        "source": "1",
+        "target": "6",
+        "relation": "applies to",
+        "weight": 0.9
+      },
+      {
+        "source": "1",
+        "target": "7",
+        "relation": "applies to",
+        "weight": 0.9
+      },
+      {
+        "source": "1",
+        "target": "8",
+        "relation": "applies to",
+        "weight": 0.9
+      },
+      {
+        "source": "1",
+        "target": "9",
+        "relation": "is an example of",
+        "weight": 0.8
+      },
+      {
+        "source": "1",
+        "target": "10",
+        "relation": "is an example of",
+        "weight": 0.8
+      },
+      {
+        "source": "1",
+        "target": "11",
+        "relation": "includes",
+        "weight": 0.7
+      },
+      {
+        "source": "1",
+        "target": "13",
+        "relation": "demonstrates versatility of",
+        "weight": 0.7
+      },
+      {
+        "source": "1",
+        "target": "14",
+        "relation": "integrates with",
+        "weight": 0.6
+      },
+      {
+        "source": "1",
+        "target": "15",
+        "relation": "enhances",
+        "weight": 0.6
+      },
+      {
+        "source": "16",
+        "target": "1",
+        "relation": "is a challenge for",
+        "weight": 0.8
+      },
+      {
+        "source": "17",
+        "target": "1",
+        "relation": "is a challenge for",
+        "weight": 0.8
+      },
+      {
+        "source": "11",
+        "target": "18",
+        "relation": "improves performance in",
+        "weight": 0.7
+      },
+      {
+        "source": "13",
+        "target": "19",
+        "relation": "adapts based on",
+        "weight": 0.7
+      }
+    ]
+  }
+}
