@@ -660,8 +660,8 @@ def build_rag_context(vdb: VectorDBModule, query: str, k: int = 5) -> str:
         for d in docs
     )
 
-def answer_with_rag(api_key: str, query: str, rag_context: str) -> str:
-    model = _llm(api_key, temperature=0.2)
+def answer_with_rag(llm_or_cfg: ProviderConfig | BaseChatModel, query: str, rag_context: str) -> str:
+    model = llm_or_cfg if isinstance(llm_or_cfg, BaseChatModel) else _llm(llm_or_cfg, temperature=0.2)
     msgs = [
         SystemMessage(content=(
             "Answer the user's question using the provided RAG context when relevant. "
