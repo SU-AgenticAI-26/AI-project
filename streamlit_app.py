@@ -45,9 +45,12 @@ Architecture
 from __future__ import annotations
 
 import hashlib
+import html
 import json
+import math
 import operator
 import os
+import re
 import sqlite3
 import tempfile
 import urllib.request
@@ -578,6 +581,111 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         }],
         "current_agent": "router",
     }
+# ══════════════════════════════════════════════════════════════════════════════
+# MINIMAL WEB SEARCH + RAG HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def estimate_tokens(text: str) -> int:
+    """Very rough token estimate without extra dependencies."""
+    if not text:
+        return 0
+    return math.ceil(len(text.split()) * 1.3)
+
+def web_search(query: str, limit: int = 5) -> list[dict]:
+    """
+    Minimal web search using DuckDuckGo HTML.
+    Returns a list of dicts: title, url, snippet, content.
+    """
+    try:
+        q = urllib.parse.quote(query)
+        url = f"https://html.duckduckgo.com/html/?q={q}"
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+    except Exception as e:
+        return [{"title": "Search error", "url": "", "snippet": str(e), "content": str(e)}]
+
+    # crude but minimal parsing
+    results = []
+    blocks = re.findall(
+        r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>.*?(?:<a[^>]*class="result__snippet"|<div[^>]*class="result__snippet")[^>]*>(.*?)</',
+        html,
+        flags=re.S
+    )
+
+    for href, title_html, snippet_html in blocks[:limit]:
+        title = re.sub(r"<.*?>", "", html.unescape(title_html)).strip()
+        snippet = re.sub(r"<.*?>", "", html.unescape(snippet_html)).strip()
+        href = html.unescape(href)
+
+        # DuckDuckGo wrapped links often contain uddg=
+        parsed = urllib.parse.urlparse(href)
+        qs = urllib.parse.parse_qs(parsed.query)
+        clean_url = qs.get("uddg", [href])[0]
+
+        content = f"Title: {title}\nURL: {clean_url}\nSnippet: {snippet}"
+        results.append({
+            "title": title,
+            "url": clean_url,
+            "snippet": snippet,
+            "content": content,
+        })
+
+    if not results:
+        return [{
+            "title": "No results",
+            "url": "",
+            "snippet": "No search results parsed.",
+            "content": "No search results parsed."
+        }]
+
+    return results
+
+def add_web_results_to_rag(vdb: VectorDBModule, query: str, results: list[dict]) -> int:
+    """Index web results into the same FAISS store used by your app."""
+    total_chunks = 0
+    for i, r in enumerate(results, start=1):
+        text = (
+            f"Web Search Query: {query}\n"
+            f"Rank: {i}\n"
+            f"Title: {r.get('title','')}\n"
+            f"URL: {r.get('url','')}\n"
+            f"Snippet: {r.get('snippet','')}\n"
+        )
+        total_chunks += vdb.add_text(
+            text,
+            {
+                "source": "web_search",
+                "title": r.get("title", ""),
+                "url": r.get("url", ""),
+                "query": query,
+                "indexed_at": _stamp(),
+            },
+        )
+    return total_chunks
+
+def build_rag_context(vdb: VectorDBModule, query: str, k: int = 5) -> str:
+    docs = vdb.search(query, k=k)
+    if not docs:
+        return "(no RAG context found)"
+    return "\n\n---\n".join(
+        f"[source={d.metadata.get('source','?')}] {d.page_content}"
+        for d in docs
+    )
+
+def answer_with_rag(llm_or_cfg: ProviderConfig | BaseChatModel, query: str, rag_context: str) -> str:
+    model = llm_or_cfg if isinstance(llm_or_cfg, BaseChatModel) else _llm(llm_or_cfg, temperature=0.2)
+    msgs = [
+        SystemMessage(content=(
+            "Answer the user's question using the provided RAG context when relevant. "
+            "If the context is insufficient, say so briefly and then answer as best you can."
+        )),
+        HumanMessage(content=f"Question:\n{query}\n\nRAG Context:\n{rag_context}")
+    ]
+    return model.invoke(msgs).content
 
 # ── 2. Vector DB Agent ────────────────────────────────────────────────────────
 def vector_db_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
@@ -1263,7 +1371,7 @@ def main() -> None:
 
         # API key — check env first, allow override
         env_key = os.environ.get("OPENAI_API_KEY", "")
-        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…")
+        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…", key="sidebar_api_key")
         if not api_key:
             st.warning("Enter your OpenAI API key to continue.")
 st.set_page_config(
@@ -1312,6 +1420,17 @@ if "turns" not in st.session_state:
     st.session_state.turns = []
 if "vdb" not in st.session_state:
     st.session_state.vdb = None
+if "web_results" not in st.session_state:
+    st.session_state.web_results = []
+
+if "web_results_query" not in st.session_state:
+    st.session_state.web_results_query = ""
+
+if "rag_answer" not in st.session_state:
+    st.session_state.rag_answer = ""
+
+if "rag_context_last" not in st.session_state:
+    st.session_state.rag_context_last = ""
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -1348,6 +1467,7 @@ with st.sidebar:
         value=_env_keys.get(provider, ""),
         type="password",
         placeholder=_key_placeholders.get(provider, ""),
+        key="provider_api_key",
     )
 
     default_model = _DEFAULT_MODELS.get(provider, "")
@@ -1439,12 +1559,132 @@ with st.sidebar:
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_research, tab_sql, tab_maps, tab_sessions, tab_cache = st.tabs([
-    "🚀 Research", "🗄️ SQL DB", "🗺️ Saved Maps", "💬 Sessions", "🕐 Cache",
+tab_web, tab_research, tab_sql, tab_maps, tab_sessions, tab_cache = st.tabs([
+    "🌐 Web Search",
+    "🚀 Research",
+    "🗄️ SQL DB",
+    "🗺️ Saved Maps",
+    "💬 Sessions",
+    "🕐 Cache",
 ])
 
-# ════════════ TAB 1 — RESEARCH ════════════════════════════════════════════════
+with tab_web:
+    st.subheader("🌐 Web Search")
+
+    web_q = st.text_input(
+        "Web search query",
+        value=st.session_state.get("query", ""),
+        placeholder="e.g. latest RAG evaluation methods"
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        do_search = st.button("Search Web", use_container_width=True)
+
+    with c2:
+        add_to_rag = st.button(
+            "Add Results to RAG",
+            use_container_width=True,
+            disabled=not st.session_state.web_results
+        )
+
+    with c3:
+        ask_rag = st.button(
+            "Ask with RAG",
+            use_container_width=True,
+            disabled=not web_q
+        )
+
+    if do_search:
+        with st.spinner("Searching web..."):
+            st.session_state.web_results = web_search(web_q, limit=5)
+            st.session_state.web_results_query = web_q
+
+    if st.session_state.web_results:
+        st.markdown("#### Search Results")
+        total_search_tokens = 0
+        for idx, r in enumerate(st.session_state.web_results, start=1):
+            tok = estimate_tokens(r.get("content", ""))
+            total_search_tokens += tok
+            with st.expander(f"{idx}. {r.get('title', 'Untitled')}"):
+                st.write(r.get("snippet", ""))
+                if r.get("url"):
+                    st.markdown(f"[Open result]({r['url']})")
+                st.caption(f"Estimated tokens: {tok}")
+
+        st.info(f"Estimated total tokens in search results: {total_search_tokens}")
+
+    if add_to_rag and st.session_state.web_results:
+        with st.spinner("Indexing search results into RAG..."):
+            n = add_web_results_to_rag(
+                vdb,
+                st.session_state.web_results_query,
+                st.session_state.web_results
+            )
+        st.success(f"Added web results to RAG in {n} chunk(s).")
+
+    if ask_rag:
+        with st.spinner("Retrieving context and calling LLM..."):
+            rag_context = build_rag_context(vdb, web_q, k=5)
+            st.session_state.rag_context_last = rag_context
+            st.session_state.rag_answer = answer_with_rag(api_key, web_q, rag_context)
+
+    if st.session_state.rag_context_last:
+        with st.expander("Retrieved RAG Context"):
+            st.text(st.session_state.rag_context_last[:5000])
+
+    if st.session_state.rag_answer:
+        st.markdown("#### LLM Answer with RAG")
+        st.write(st.session_state.rag_answer)
+
+
 with tab_research:
+        st.header("Collaborative Research Query")
+
+    
+        col_q, col_opts = st.columns([3, 1])
+        with col_q:
+            query = st.text_area(
+                "Query", height=90,
+                placeholder="e.g. How does RAG relate to transformer architecture?",
+            )
+        with col_opts:
+            use_cache      = st.checkbox("Use 20-day cache", value=True)
+            auto_save_map  = st.checkbox("Auto-save map",    value=True)
+
+        run = st.button(
+            "🚀 Run Pipeline", type="primary",
+            disabled=not (api_key and query),
+        )
+
+        # Ensure full_state and cached exist even before first run to avoid NameError
+        full_state = {}
+        cached = None
+
+        if run:
+            cached = cache_load(query) if use_cache else None
+            if cached:
+                st.info("⚡ Loaded from cache")
+                full_state = cached
+            else:
+                app      = build_graph(api_key, vdb)
+                progress = st.progress(0, "Starting…")
+                pct_map  = {
+                    "router": 10, "vector_db": 25, "sql_db": 40, "web": 55,
+                    "orchestrator": 68, "knowledge_mapper": 80, "critic": 90, "summarizer": 97,
+                }
+                # Stream for progress updates
+                for event in app.stream({
+                    "messages":[], "query":query,
+                    "active_agents":[], "router_reasoning":"",
+                    "vector_findings":"", "sql_findings":"", "web_findings":"",
+                    "activity_log":[], "merged_context":"",
+                    "knowledge_map":{}, "critique":"", "loop_count":0,
+                    "summary":"", "current_agent":"",
+                }):
+                    for node in event:
+                        progress.progress(pct_map.get(node, 50), f"{node.replace('_',' ').title()} running…")
     st.header("Collaborative Research Query")
 
     col_q, col_opts = st.columns([3, 1])
@@ -1638,7 +1878,7 @@ with tab_maps:
     if not all_maps:
         st.info("No maps saved yet.")
     else:
-        filt = st.text_input("Filter")
+        filt = st.text_input("Filter", key="maps_filter")
         shown = [m for m in all_maps if not filt or filt.lower() in m["query"].lower()]
         for m in shown:
             with st.expander(
