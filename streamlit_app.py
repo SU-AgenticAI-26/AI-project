@@ -45,10 +45,12 @@ Architecture
 from __future__ import annotations
 
 import hashlib
+import html
 import json
 import math
 import operator
 import os
+import re
 import sqlite3
 import tempfile
 import urllib.request
@@ -563,9 +565,6 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         }],
         "current_agent": "router",
     }
-import re
-import math
-from html import unescape
 # ══════════════════════════════════════════════════════════════════════════════
 # MINIMAL WEB SEARCH + RAG HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -602,9 +601,9 @@ def web_search(query: str, limit: int = 5) -> list[dict]:
     )
 
     for href, title_html, snippet_html in blocks[:limit]:
-        title = re.sub(r"<.*?>", "", unescape(title_html)).strip()
-        snippet = re.sub(r"<.*?>", "", unescape(snippet_html)).strip()
-        href = unescape(href)
+        title = re.sub(r"<.*?>", "", html.unescape(title_html)).strip()
+        snippet = re.sub(r"<.*?>", "", html.unescape(snippet_html)).strip()
+        href = html.unescape(href)
 
         # DuckDuckGo wrapped links often contain uddg=
         parsed = urllib.parse.urlparse(href)
