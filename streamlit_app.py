@@ -58,7 +58,7 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, List, Optional, TypedDict
 
@@ -137,6 +137,7 @@ class AgentState(TypedDict):
     summary:               str
     experiment_plan:       str
     current_agent:         str
+    _needs_more:           bool
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -144,7 +145,7 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _stamp() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 def _hash(q: str) -> str:
     return hashlib.sha256(q.strip().lower().encode()).hexdigest()[:16]
@@ -163,7 +164,7 @@ def cache_load(query: str) -> Optional[dict]:
     if not p.exists():
         return None
     raw = json.loads(p.read_text())
-    if datetime.utcnow() - datetime.fromisoformat(raw["ts"]) > timedelta(days=CACHE_TTL_DAYS):
+    if datetime.now(timezone.utc) - datetime.fromisoformat(raw["ts"]).replace(tzinfo=timezone.utc) > timedelta(days=CACHE_TTL_DAYS):
         p.unlink(missing_ok=True)
         return None
     return raw["payload"]
@@ -181,7 +182,7 @@ def cache_list() -> list[dict]:
 # ── Knowledge Maps ─────────────────────────────────────────────────────────────
 
 def map_save(query: str, km: dict) -> str:
-    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = f"{ts}_{_hash(query)}.json"
     (MAPS_DIR / name).write_text(
         json.dumps({"query": query, "saved_at": _stamp(), "map": km}, indent=2)
@@ -406,6 +407,8 @@ class VectorDBModule:
         return self._store.index.ntotal if self._store else 0
 
     def sources(self) -> list[str]:
+        if not DOCS_DIR.exists():
+            return []
         return [p.name for p in DOCS_DIR.iterdir() if p.is_file()]
 
     # FIX 1: Re-index saved docs on startup 
@@ -415,7 +418,8 @@ class VectorDBModule:
     def reindex_saved_docs(self) -> int:
         if self.count() > 0:
             return 0  # index already has data so skip
-          
+        if not DOCS_DIR.exists():
+            return 0
         count = 0
         for p in DOCS_DIR.iterdir():
             if p.suffix in (".txt", ".md"):
@@ -448,7 +452,6 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
     except Exception:
         return 0
 
-    import xml.etree.ElementTree as ET
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     try:
         root    = ET.fromstring(xml)
@@ -559,7 +562,9 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
     resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}")])
-    raw  = resp.content.strip().lstrip("```json").rstrip("```").strip()
+    raw  = resp.content.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
     try:
         parsed = json.loads(raw)
         agents = parsed.get("agents", ["vector_db", "sql_db"])
@@ -604,7 +609,7 @@ def web_search(query: str, limit: int = 5) -> list[dict]:
             headers={"User-Agent": "Mozilla/5.0"}
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            html = resp.read().decode("utf-8", errors="ignore")
+            response_html = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
         return [{"title": "Search error", "url": "", "snippet": str(e), "content": str(e)}]
 
@@ -612,7 +617,7 @@ def web_search(query: str, limit: int = 5) -> list[dict]:
     results = []
     blocks = re.findall(
         r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>.*?(?:<a[^>]*class="result__snippet"|<div[^>]*class="result__snippet")[^>]*>(.*?)</',
-        html,
+        response_html,
         flags=re.S
     )
 
@@ -909,7 +914,7 @@ _EMPTY_PLACEHOLDER = {"", "(none)", "(not activated)", "(no SQL results)"}
 def _has_content(s: str) -> bool:
     return s.strip() not in _EMPTY_PLACEHOLDER
 
-def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def reading_extraction_agent(state: AgentState, model: BaseChatModel) -> dict:
     vf = state.get("vector_findings", "")
     sf = state.get("sql_findings", "")
     wf = state.get("web_findings", "")
@@ -1073,7 +1078,9 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
         f"Sources: {list({n.get('source','?') for n in state['knowledge_map'].get('nodes',[])})}\n"
         f"Edges: {len(state['knowledge_map'].get('edges',[]))}"
     ))])
-    raw = resp.content.strip().lstrip("```json").rstrip("```").strip()
+    raw = resp.content.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
     try:
         result = json.loads(raw)
     except Exception:
@@ -1299,81 +1306,19 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
         except Exception:
             pass
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
-        net.save_graph(f.name)
-        html = Path(f.name).read_text()
-        Path(f.name).unlink(missing_ok=True)
+        tmp_path = Path(f.name)
+    try:
+        net.save_graph(str(tmp_path))
+        html = tmp_path.read_text()
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return html
 
 
 
-def main() -> None:
-    # Create data directories on first run
-    for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
-        _d.mkdir(parents=True, exist_ok=True)
+for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
 
-    # ══════════════════════════════════════════════════════════════════════════════
-    # STREAMLIT UI
-    # ══════════════════════════════════════════════════════════════════════════════
-
-    st.set_page_config(
-        page_title="Collaborative RAG",
-        page_icon="🤝",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;600;800&display=swap');
-    html,[class*="css"]{font-family:'Outfit',sans-serif}
-    code,pre{font-family:'JetBrains Mono',monospace!important}
-    [data-testid="stSidebar"]{background:#0d1117!important}
-    [data-testid="stSidebar"] *{color:#c9d1d9!important}
-    h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
-    [data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
-    .agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
-    .agent-card.router{border-color:#9B59B6}
-    .agent-card.vector_db{border-color:#4A90D9}
-    .agent-card.sql_db{border-color:#E67E22}
-    .agent-card.web{border-color:#2ECC71}
-    .agent-card.reading_extraction{border-color:#27AE60}
-    .agent-card.orchestrator{border-color:#E74C3C}
-    .agent-card.knowledge_mapper{border-color:#1ABC9C}
-    .agent-card.critic{border-color:#F39C12}
-    .agent-card.summarizer{border-color:#95A5A6}
-    .agent-card.experiment_design{border-color:#00BCD4}
-    .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
-    .agent-detail{font-size:0.78rem;color:#8b949e}
-    .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
-    .bv{background:#1a3a5c;color:#4A90D9}
-    .bs{background:#4a2010;color:#E67E22}
-    .bw{background:#0f3d20;color:#2ECC71}
-    .be{background:#0d2e1a;color:#27AE60}
-    .bm{background:#2d1a4a;color:#9B59B6}
-    .bx{background:#002d33;color:#00BCD4}
-    </style>
-    """, unsafe_allow_html=True)
-
-    # ── Init ──────────────────────────────────────────────────────────────────────
-    init_sql_db()
-
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
-    if "turns" not in st.session_state:
-        st.session_state.turns = []
-    if "vdb" not in st.session_state:
-        st.session_state.vdb = None
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("## 🤝 Collaborative RAG")
-        st.divider()
-
-        # API key — check env first, allow override
-        env_key = os.environ.get("OPENAI_API_KEY", "")
-        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…", key="sidebar_api_key")
-        if not api_key:
-            st.warning("Enter your OpenAI API key to continue.")
 st.set_page_config(
     page_title="Collaborative RAG",
     page_icon="🤝",
@@ -1395,6 +1340,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .agent-card.vector_db{border-color:#4A90D9}
 .agent-card.sql_db{border-color:#E67E22}
 .agent-card.web{border-color:#2ECC71}
+.agent-card.reading_extraction{border-color:#27AE60}
 .agent-card.orchestrator{border-color:#E74C3C}
 .agent-card.knowledge_mapper{border-color:#1ABC9C}
 .agent-card.critic{border-color:#F39C12}
@@ -1406,6 +1352,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .bv{background:#1a3a5c;color:#4A90D9}
 .bs{background:#4a2010;color:#E67E22}
 .bw{background:#0f3d20;color:#2ECC71}
+.be{background:#0d2e1a;color:#27AE60}
 .bm{background:#2d1a4a;color:#9B59B6}
 .bx{background:#002d33;color:#00BCD4}
 </style>
@@ -1415,7 +1362,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 init_sql_db()
 
 if "session_id" not in st.session_state:
-    st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+    st.session_state.session_id = datetime.now(timezone.utc).strftime("sess_%Y%m%d_%H%M%S")
 if "turns" not in st.session_state:
     st.session_state.turns = []
 if "vdb" not in st.session_state:
@@ -1628,7 +1575,7 @@ with tab_web:
         with st.spinner("Retrieving context and calling LLM..."):
             rag_context = build_rag_context(vdb, web_q, k=5)
             st.session_state.rag_context_last = rag_context
-            st.session_state.rag_answer = answer_with_rag(api_key, web_q, rag_context)
+            st.session_state.rag_answer = answer_with_rag(cfg, web_q, rag_context)
 
     if st.session_state.rag_context_last:
         with st.expander("Retrieved RAG Context"):
@@ -1640,51 +1587,6 @@ with tab_web:
 
 
 with tab_research:
-        st.header("Collaborative Research Query")
-
-    
-        col_q, col_opts = st.columns([3, 1])
-        with col_q:
-            query = st.text_area(
-                "Query", height=90,
-                placeholder="e.g. How does RAG relate to transformer architecture?",
-            )
-        with col_opts:
-            use_cache      = st.checkbox("Use 20-day cache", value=True)
-            auto_save_map  = st.checkbox("Auto-save map",    value=True)
-
-        run = st.button(
-            "🚀 Run Pipeline", type="primary",
-            disabled=not (api_key and query),
-        )
-
-        # Ensure full_state and cached exist even before first run to avoid NameError
-        full_state = {}
-        cached = None
-
-        if run:
-            cached = cache_load(query) if use_cache else None
-            if cached:
-                st.info("⚡ Loaded from cache")
-                full_state = cached
-            else:
-                app      = build_graph(api_key, vdb)
-                progress = st.progress(0, "Starting…")
-                pct_map  = {
-                    "router": 10, "vector_db": 25, "sql_db": 40, "web": 55,
-                    "orchestrator": 68, "knowledge_mapper": 80, "critic": 90, "summarizer": 97,
-                }
-                # Stream for progress updates
-                for event in app.stream({
-                    "messages":[], "query":query,
-                    "active_agents":[], "router_reasoning":"",
-                    "vector_findings":"", "sql_findings":"", "web_findings":"",
-                    "activity_log":[], "merged_context":"",
-                    "knowledge_map":{}, "critique":"", "loop_count":0,
-                    "summary":"", "current_agent":"",
-                }):
-                    for node in event:
-                        progress.progress(pct_map.get(node, 50), f"{node.replace('_',' ').title()} running…")
     st.header("Collaborative Research Query")
 
     col_q, col_opts = st.columns([3, 1])
@@ -1722,7 +1624,7 @@ with tab_research:
                 "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
-                "summary":"", "experiment_plan":"", "current_agent":"",
+                "summary":"", "experiment_plan":"", "current_agent":"", "_needs_more": False,
             }
             for event in app.stream(full_state.copy()):
                 for node, state_update in event.items():
@@ -1737,10 +1639,6 @@ with tab_research:
             progress.progress(100, "✅ Done!")
             if full_state and use_cache:
                 cache_save(query, full_state)
-
-        if full_state is None:
-            st.error("Pipeline returned no state. Please try again.")
-            st.stop()
 
         if auto_save_map and full_state.get("knowledge_map", {}).get("nodes"):
             fname = map_save(query, full_state["knowledge_map"])
@@ -1902,7 +1800,7 @@ with tab_sessions:
             st.success("Saved!")
         if st.button("🆕 New session"):
             session_save(st.session_state.session_id, st.session_state.turns)
-            st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+            st.session_state.session_id = datetime.now(timezone.utc).strftime("sess_%Y%m%d_%H%M%S")
             st.session_state.turns = []
             st.rerun()
         st.divider()
@@ -1938,7 +1836,7 @@ with tab_cache:
     filt_c = st.text_input("Filter", key="cache_filt")
     shown_c = [e for e in entries if not filt_c or filt_c.lower() in e["query"].lower()]
     for e in shown_c:
-        age   = datetime.utcnow() - datetime.fromisoformat(e["ts"])
+        age   = datetime.now(timezone.utc) - datetime.fromisoformat(e["ts"]).replace(tzinfo=timezone.utc)
         age_s = f"{age.days}d {age.seconds//3600}h ago" if age.days else f"{age.seconds//3600}h {(age.seconds%3600)//60}m ago"
         with st.expander(f"🗃️ {e['query'][:75]}…  ·  {age_s}"):
             pl = cache_load(e["query"])
@@ -1959,5 +1857,3 @@ with tab_cache:
         st.success("Cache cleared.")
 
 
-if __name__ == "__main__":
-    main()
