@@ -1489,7 +1489,7 @@ with tab_web:
         ask_rag = st.button(
             "Ask with RAG",
             use_container_width=True,
-            disabled=not (api_key and web_q)
+            disabled=not web_q
         )
 
     if do_search:
