@@ -1277,7 +1277,7 @@ def main() -> None:
 
         # API key — check env first, allow override
         env_key = os.environ.get("OPENAI_API_KEY", "")
-        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…")
+        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…", key="sidebar_api_key")
         if not api_key:
             st.warning("Enter your OpenAI API key to continue.")
 st.set_page_config(
@@ -1371,6 +1371,7 @@ with st.sidebar:
         value=_env_keys.get(provider, ""),
         type="password",
         placeholder=_key_placeholders.get(provider, ""),
+        key="provider_api_key",
     )
 
     default_model = _DEFAULT_MODELS.get(provider, "")
@@ -1730,7 +1731,7 @@ with tab_maps:
     if not all_maps:
         st.info("No maps saved yet.")
     else:
-        filt = st.text_input("Filter")
+        filt = st.text_input("Filter", key="maps_filter")
         shown = [m for m in all_maps if not filt or filt.lower() in m["query"].lower()]
         for m in shown:
             with st.expander(
