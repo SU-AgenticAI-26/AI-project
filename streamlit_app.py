@@ -2,12 +2,23 @@
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║        Collaborative Multi-Agent RAG  —  Single-File Edition                 ║
 ║                                                                              ║
-║  Install:                                                                    ║
+║  FIXES APPLIED:                                                              ║
+║  1. Double pipeline run removed — stream now captures final state directly   ║
+║  2. VectorDB persistence — reindex_saved_docs() rebuilds index on startup    ║
+║  3. Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv     ║
+║                                                                              ║
+║  Install (core):                                                             ║
 ║    pip install streamlit langgraph langchain-openai langchain-core           ║
 ║               langchain-community faiss-cpu langchain-text-splitters         ║
-║               networkx pyvis tiktoken arxiv                                  ║
+║               networkx pyvis tiktoken arxiv requests                         ║
 ║                                                                              ║
-║  Run:   streamlit run collaborative_rag.py                                   ║
+║  Optional providers:                                                         ║
+║    Gemini:  pip install langchain-google-genai                               ║
+║    Claude:  pip install langchain-anthropic                                  ║
+║    Local embeddings (Claude/Local provider):                                 ║
+║             pip install sentence-transformers                                ║
+║                                                                              ║
+║  Run:   streamlit run streamlit_app.py                                       ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 Architecture
@@ -21,6 +32,8 @@ Architecture
 [VectorDB Agent] [SQL/DB Agent] [Web/API Agent]
   │   │                │
   └───┴────────────────┘
+          │
+  [Reading/Extraction Agent]  ← per-paper structured records + provenance
           │
     [Orchestrator Agent]  ← merges, deduplicates, weights evidence
           │
@@ -40,14 +53,19 @@ import sqlite3
 import tempfile
 import urllib.request
 import urllib.parse
+import xml.etree.ElementTree as ET
+
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Annotated, List, Optional, TypedDict
 
+import requests
 import streamlit as st
 from pyvis.network import Network
 
 from langchain_core.documents import Document
+from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -66,30 +84,56 @@ CACHE_DIR   = ROOT / "cache"
 SESSIONS_DIR = ROOT / "sessions"
 SQL_DB_PATH = ROOT / "knowledge.db"
 
-for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
-    _d.mkdir(parents=True, exist_ok=True)
 
 CACHE_TTL_DAYS = 20
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROVIDER CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+
+PROVIDER_OPENAI = "OpenAI"
+PROVIDER_GEMINI = "Google Gemini"
+PROVIDER_CLAUDE = "Anthropic Claude"
+PROVIDER_LOCAL  = "Local (llama.cpp / Ollama / LMStudio)"
+
+_DEFAULT_MODELS = {
+    PROVIDER_OPENAI: "gpt-4o-mini",
+    PROVIDER_GEMINI: "gemini-2.0-flash",
+    PROVIDER_CLAUDE: "claude-haiku-4-5-20251001",
+    PROVIDER_LOCAL:  "",
+}
+
+_DEFAULT_BASE_URL = "http://localhost:8080/v1"  # llama.cpp server default
+
+
+@dataclass
+class ProviderConfig:
+    provider: str
+    api_key:  str
+    model:    str
+    base_url: Optional[str] = None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENT STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
-    messages:           Annotated[List, operator.add]
-    query:              str
-    active_agents:      List[str]
-    router_reasoning:   str
-    vector_findings:    str
-    sql_findings:       str
-    web_findings:       str
-    activity_log:       Annotated[List, operator.add]
-    merged_context:     str
-    knowledge_map:      dict
-    critique:           str
-    loop_count:         int
-    summary:            str
-    current_agent:      str
+    messages:              Annotated[List, operator.add]
+    query:                 str
+    active_agents:         List[str]
+    router_reasoning:      str
+    vector_findings:       str
+    sql_findings:          str
+    web_findings:          str
+    extraction_findings:   str
+    activity_log:          Annotated[List, operator.add]
+    merged_context:        str
+    knowledge_map:         dict
+    critique:              str
+    loop_count:            int
+    summary:               str
+    current_agent:         str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,11 +146,11 @@ def _stamp() -> str:
 def _hash(q: str) -> str:
     return hashlib.sha256(q.strip().lower().encode()).hexdigest()[:16]
 
-
 # ── Cache ─────────────────────────────────────────────────────────────────────
 
 def cache_save(query: str, payload: dict) -> None:
     p = CACHE_DIR / f"{_hash(query)}.json"
+
     # Strip LangChain message objects — they're not needed in cache
     safe = {k: v for k, v in payload.items() if k != "messages"}
     p.write_text(json.dumps({"query": query, "ts": _stamp(), "payload": safe}, indent=2))
@@ -130,7 +174,6 @@ def cache_list() -> list[dict]:
         except Exception:
             pass
     return sorted(out, key=lambda x: x["ts"], reverse=True)
-
 
 # ── Knowledge Maps ─────────────────────────────────────────────────────────────
 
@@ -162,7 +205,6 @@ def map_load(filename: str) -> Optional[dict]:
     p = MAPS_DIR / filename
     return json.loads(p.read_text()) if p.exists() else None
 
-
 # ── Sessions ───────────────────────────────────────────────────────────────────
 
 def session_save(sid: str, turns: list) -> None:
@@ -178,7 +220,7 @@ def session_list() -> list[dict]:
     out = []
     for p in SESSIONS_DIR.glob("*.json"):
         try:
-            raw  = json.loads(p.read_text())
+            raw   = json.loads(p.read_text())
             turns = raw.get("turns", [])
             out.append({
                 "sid":     raw.get("sid", p.stem),
@@ -260,9 +302,9 @@ def init_sql_db() -> None:
 
 
 def sql_search(query: str, k: int = 8) -> str:
-    con  = sqlite3.connect(SQL_DB_PATH)
-    cur  = con.cursor()
-    words   = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3]
+    con   = sqlite3.connect(SQL_DB_PATH)
+    cur   = con.cursor()
+    words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3]
     results = []
     for word in words[:5]:
         for row in cur.execute(
@@ -316,18 +358,19 @@ def sql_list_topics() -> list[dict]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class VectorDBModule:
-    def __init__(self, api_key: str):
-        self.api_key    = api_key
-        self.embeddings = OpenAIEmbeddings(api_key=api_key)
+    def __init__(self, embeddings, vector_dir: Path = VECTOR_DIR):
+        self.embeddings = embeddings
+        self.vector_dir = vector_dir
+        self.vector_dir.mkdir(parents=True, exist_ok=True)
         self.splitter   = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=80)
         self._store: Optional[FAISS] = None
         self._load()
 
     def _load(self) -> None:
-        if (VECTOR_DIR / "index.faiss").exists():
+        if (self.vector_dir / "index.faiss").exists():
             try:
                 self._store = FAISS.load_local(
-                    str(VECTOR_DIR), self.embeddings,
+                    str(self.vector_dir), self.embeddings,
                     allow_dangerous_deserialization=True,
                 )
             except Exception:
@@ -335,7 +378,7 @@ class VectorDBModule:
 
     def _save(self) -> None:
         if self._store:
-            self._store.save_local(str(VECTOR_DIR))
+            self._store.save_local(str(self.vector_dir))
 
     def add_text(self, text: str, meta: dict | None = None) -> int:
         chunks = self.splitter.create_documents([text], metadatas=[meta or {}])
@@ -362,6 +405,26 @@ class VectorDBModule:
     def sources(self) -> list[str]:
         return [p.name for p in DOCS_DIR.iterdir() if p.is_file()]
 
+    # FIX 1: Re-index saved docs on startup 
+    # Rebuild FAISS index from docs already saved to DOCS_DIR.
+    # Fixes the Codespace restart problem where the FAISS index gets wiped,
+    # but the raw document files survive because they are tracked by git.
+    def reindex_saved_docs(self) -> int:
+        if self.count() > 0:
+            return 0  # index already has data so skip
+          
+        count = 0
+        for p in DOCS_DIR.iterdir():
+            if p.suffix in (".txt", ".md"):
+                try:
+                    text = p.read_text(errors="ignore")
+                    self.add_text(text, {"source": p.name, "indexed_at": _stamp()})
+                    count += 1
+                except Exception:
+                    pass
+                  
+        return count
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ARXIV INDEXER  (stdlib only — no extra deps)
@@ -369,6 +432,7 @@ class VectorDBModule:
 
 def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> int:
     """Search arXiv via its public API and index abstracts into the vector DB."""
+  
     encoded = urllib.parse.quote(query)
     url = (
         f"http://export.arxiv.org/api/query"
@@ -378,7 +442,7 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
     try:
         with urllib.request.urlopen(url, timeout=15) as resp:
             xml = resp.read().decode("utf-8")
-    except Exception as e:
+    except Exception:
         return 0
 
     import xml.etree.ElementTree as ET
@@ -392,21 +456,18 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
     indexed = 0
     for entry in entries:
         try:
-            title   = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
-            summary = (entry.findtext("atom:summary", "", ns) or "").strip().replace("\n", " ")
-            entry_id = (entry.findtext("atom:id", "", ns) or "").strip()
-            authors = [
-                a.findtext("atom:name", "", ns)
-                for a in entry.findall("atom:author", ns)
-            ]
+            title    = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
+            summary  = (entry.findtext("atom:summary", "", ns) or "").strip().replace("\n", " ")
+            entry_id = (entry.findtext("atom:id",      "", ns) or "").strip()
+            authors  = [a.findtext("atom:name", "", ns) for a in entry.findall("atom:author", ns)]
             if not title:
                 continue
             doc = f"Title: {title}\nAuthors: {', '.join(authors)}\nAbstract: {summary}"
             vdb.add_text(doc, {
-                "source": f"arXiv",
-                "title":  title,
-                "url":    entry_id,
-                "indexed_at": _stamp(),
+              "source": "arXiv", 
+              "title": title, 
+              "url": entry_id, 
+              "indexed_at": _stamp()
             })
             indexed += 1
         except Exception:
@@ -415,24 +476,68 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LLM FACTORY
+# LLM + EMBEDDINGS FACTORIES
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _llm(api_key: str, temperature: float = 0.3) -> ChatOpenAI:
-    return ChatOpenAI(api_key=api_key, model="gpt-4o-mini", temperature=temperature)
+def _llm(cfg: ProviderConfig, temperature: float = 0.3) -> BaseChatModel:
+    """Return a LangChain chat model for the configured provider."""
+    if cfg.provider == PROVIDER_OPENAI:
+        return ChatOpenAI(api_key=cfg.api_key, model=cfg.model, temperature=temperature)
+    elif cfg.provider == PROVIDER_GEMINI:
+        from langchain_google_genai import ChatGoogleGenerativeAI  # type: ignore
+        return ChatGoogleGenerativeAI(
+            google_api_key=cfg.api_key, model=cfg.model, temperature=temperature
+        )
+    elif cfg.provider == PROVIDER_CLAUDE:
+        from langchain_anthropic import ChatAnthropic  # type: ignore
+        return ChatAnthropic(api_key=cfg.api_key, model=cfg.model, temperature=temperature)
+    else:  # PROVIDER_LOCAL — llama.cpp / Ollama / LMStudio all expose OpenAI-compatible API
+        return ChatOpenAI(
+            base_url=cfg.base_url or _DEFAULT_BASE_URL,
+            api_key=cfg.api_key or "no-key",
+            model=cfg.model or "local-model",
+            temperature=temperature,
+        )
+
+
+def _embeddings(cfg: ProviderConfig):
+    """Return a LangChain embeddings object for the configured provider."""
+    if cfg.provider == PROVIDER_OPENAI:
+        return OpenAIEmbeddings(api_key=cfg.api_key)
+    elif cfg.provider == PROVIDER_GEMINI:
+        from langchain_google_genai import GoogleGenerativeAIEmbeddings  # type: ignore
+        return GoogleGenerativeAIEmbeddings(
+            google_api_key=cfg.api_key, model="models/text-embedding-004"
+        )
+    else:  # Claude or Local — use a free local model via sentence-transformers
+        from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+
+
+def _embedding_key(cfg: ProviderConfig) -> str:
+    """Return a stable, filesystem-safe identifier for the embedding backend.
+
+    Used to namespace the FAISS vector store directory so that indices built
+    with different embedding models (and therefore different vector dimensions)
+    are stored separately and never mixed up.
+    """
+    if cfg.provider == PROVIDER_OPENAI:
+        return "openai-text-embedding-ada-002"
+    elif cfg.provider == PROVIDER_GEMINI:
+        return "gemini-text-embedding-004"
+    else:  # Claude or Local — HuggingFace sentence-transformers
+        return "huggingface-all-MiniLM-L6-v2"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── 1. Router ─────────────────────────────────────────────────────────────────
-
-def router_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def router_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Router Agent. Given a user query, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
-        "'web' (live arXiv search — use when query needs recent papers or external knowledge).\n"
+        "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
     resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}")])
@@ -450,10 +555,11 @@ def router_agent(state: AgentState, model: ChatOpenAI) -> dict:
         "router_reasoning": reason,
         "messages":         [AIMessage(content=f"[Router] {reason} → {agents}")],
         "activity_log":     [{
-            "agent":  "router", "icon": "🔀",
-            "title":  "Router decided",
-            "detail": f"Activating: {', '.join(agents)} — {reason}",
-            "ts":     _stamp(),
+          "agent": "router", 
+          "icon": "🔀", 
+          "title": "Router decided",
+          "detail": f"Activating: {', '.join(agents)} — {reason}", 
+          "ts": _stamp(),
         }],
         "current_agent": "router",
     }
@@ -567,17 +673,17 @@ def answer_with_rag(api_key: str, query: str, rag_context: str) -> str:
     return model.invoke(msgs).content
 
 # ── 2. Vector DB Agent ────────────────────────────────────────────────────────
-
-def vector_db_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -> dict:
+def vector_db_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
     if "vector_db" not in state.get("active_agents", []):
         return {
             "vector_findings": "(not activated)",
-            "messages":       [AIMessage(content="[VectorDB] skipped")],
-            "activity_log":   [{
-                "agent": "vector_db", "icon": "🗂️",
-                "title": "Vector DB — skipped", "detail": "Router did not activate.",
-                "ts": _stamp(),
-            }],
+            "messages":        [AIMessage(content="[VectorDB] skipped")],
+            "activity_log":    [{
+              "agent": "vector_db", 
+              "icon": "🗂️",
+              "title": "Vector DB — skipped",
+              "detail": "Router did not activate.", 
+              "ts": _stamp()}],
             "current_agent": "vector_db",
         }
 
@@ -595,17 +701,14 @@ def vector_db_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -
         "You are a Vector DB Search Agent. Synthesise the retrieved document chunks into "
         "structured research notes relevant to the query. Include facts, definitions, relationships."
     ))
-    resp = model.invoke([
-        system,
-        HumanMessage(content=f"Query: {state['query']}\n\nChunks:\n{raw_ctx}"),
-    ])
+    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\nChunks:\n{raw_ctx}")])
 
     return {
         "vector_findings": resp.content,
         "messages":        [AIMessage(content=f"[VectorDB] {resp.content[:120]}…")],
         "activity_log":    [{
-            "agent":  "vector_db", "icon": "🗂️",
-            "title":  "Vector DB agent",
+            "agent":  "vector_db", "icon": "🗂️", 
+            "title": "Vector DB agent",
             "detail": f"Retrieved {len(docs)} chunks from {len(sources)} source(s): {', '.join(sources) or 'none'}",
             "chunks": [{"source": d.metadata.get("source","?"), "text": d.page_content[:200]+"…"} for d in docs],
             "ts": _stamp(),
@@ -614,162 +717,304 @@ def vector_db_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -
     }
 
 
-# ── 3. SQL Agent ──────────────────────────────────────────────────────────────
-
-def sql_db_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def sql_db_agent(state: AgentState, model: BaseChatModel) -> dict:
     if "sql_db" not in state.get("active_agents", []):
         return {
             "sql_findings": "(not activated)",
             "messages":     [AIMessage(content="[SQLDB] skipped")],
             "activity_log": [{
-                "agent": "sql_db", "icon": "🗄️",
-                "title": "SQL DB — skipped", "detail": "Router did not activate.",
-                "ts": _stamp(),
-            }],
+              "agent": "sql_db", "icon": "🗄️",
+              "title": "SQL DB — skipped","detail": "Router did not activate.", 
+              "ts": _stamp()}],
             "current_agent": "sql_db",
         }
 
-    raw = sql_search(state["query"], k=10)
+    raw  = sql_search(state["query"], k=10)
+    rows = [l for l in raw.split("\n") if l.strip()]
     system = SystemMessage(content=(
         "You are a SQL Database Agent. Given a query and raw SQL results "
         "(topics, relationships, facts), extract the most relevant structured information."
     ))
-    resp = model.invoke([
-        system,
-        HumanMessage(content=f"Query: {state['query']}\n\nSQL results:\n{raw}"),
-    ])
-    rows = [l for l in raw.split("\n") if l.strip()]
+    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\nSQL results:\n{raw}")])
 
     return {
         "sql_findings": resp.content,
         "messages":     [AIMessage(content=f"[SQLDB] {resp.content[:120]}…")],
         "activity_log": [{
-            "agent":  "sql_db", "icon": "🗄️",
-            "title":  "SQL / DB agent",
+            "agent": "sql_db", "icon": "🗄️", 
+            "title": "SQL / DB agent",
             "detail": f"{len(rows)} row(s) matched across topics, relationships, facts tables",
-            "rows":   rows[:12],
-            "ts": _stamp(),
+            "rows": rows[:12], "ts": _stamp(),
         }],
         "current_agent": "sql_db",
     }
 
-
 # ── 4. Web / arXiv Agent ──────────────────────────────────────────────────────
-
-def web_agent(state: AgentState, model: ChatOpenAI, vdb: VectorDBModule) -> dict:
+# FIX 3: Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv
+def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
     if "web" not in state.get("active_agents", []):
         return {
             "web_findings": "(not activated)",
             "messages":     [AIMessage(content="[Web] skipped")],
-            "activity_log": [{
-                "agent": "web", "icon": "🌐",
-                "title": "Web agent — skipped", "detail": "Router did not activate.",
-                "ts": _stamp(),
-            }],
+            "activity_log": [{"agent": "web", "icon": "🌐",
+                               "title": "Web agent — skipped",
+                               "detail": "Router did not activate.", "ts": _stamp()}],
             "current_agent": "web",
         }
 
-    # Search arXiv
-    encoded = urllib.parse.quote(state["query"])
-    url = (
-        f"http://export.arxiv.org/api/query"
-        f"?search_query=all:{encoded}&start=0&max_results=8&sortBy=relevance"
-    )
+    query        = state["query"]
     results_text = []
-    indexed = 0
+    indexed      = 0
+    sources_used = []
+
+    # OpenAlex ──────────────────────────────────────────────────────────────
     try:
-        import xml.etree.ElementTree as ET
+        r = requests.get("https://api.openalex.org/works",
+                         params={"search": query, "per-page": 5, "mailto": "research@example.com"},
+                         timeout=10)
+        if r.ok:
+            for item in r.json().get("results", []):
+                title   = item.get("title", "No title")
+                year    = item.get("publication_year", "")
+                authors = [a.get("author", {}).get("display_name", "")
+                           for a in item.get("authorships", [])[:3]]
+                results_text.append(f"[OpenAlex] {title} ({year}) — {', '.join(authors)}")
+                vdb.add_text(f"Title: {title}\nAuthors: {', '.join(authors)}\nYear: {year}",
+                             {"source": "openalex", "title": title})
+                indexed += 1
+            sources_used.append("OpenAlex")
+    except Exception as e:
+        results_text.append(f"[OpenAlex error] {e}")
+
+    # ── Crossref ──────────────────────────────────────────────────────────────
+    try:
+        r = requests.get("https://api.crossref.org/works",
+                         params={"query": query, "rows": 5, "mailto": "research@example.com"},
+                         timeout=10)
+        if r.ok:
+            for item in r.json().get("message", {}).get("items", []):
+                title   = (item.get("title") or ["No title"])[0]
+                doi     = item.get("DOI", "")
+                authors = [f"{a.get('given','')} {a.get('family','')}".strip()
+                           for a in item.get("author", [])[:3]]
+                results_text.append(f"[Crossref] {title} — {', '.join(authors)} | doi:{doi}")
+                vdb.add_text(f"Title: {title}\nAuthors: {', '.join(authors)}\nDOI: {doi}",
+                             {"source": "crossref", "title": title})
+                indexed += 1
+            sources_used.append("Crossref")
+    except Exception as e:
+        results_text.append(f"[Crossref error] {e}")
+
+    # Semantic Scholar ──────────────────────────────────────────────────────
+    try:
+        ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+        headers = {"x-api-key": ss_key} if ss_key else {}
+        r = requests.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            params={"query": query, 
+                    "limit": 5,
+                    "fields": "title,year,citationCount,authors"},
+            headers=headers, timeout=10
+        )
+      
+        if r.ok:
+            for paper in r.json().get("data", []):
+                title   = paper.get("title", "No title")
+                year    = paper.get("year", "")
+                cites   = paper.get("citationCount", 0)
+                authors = [a.get("name","") for a in (paper.get("authors") or [])[:3]]
+                results_text.append(f"[Semantic Scholar] {title} ({year}) — {', '.join(authors)} — {cites} citations")
+                vdb.add_text(
+                    f"Title: {title}\nAuthors: {', '.join(authors)}\nYear: {year}\nCitations: {cites}",
+                    {"source": "semantic_scholar", "title": title}
+                )
+                indexed += 1
+            sources_used.append("Semantic Scholar")
+    except Exception as e:
+        results_text.append(f"[Semantic Scholar error] {e}")
+
+    # arXiv ─────────────────────────────────────────────────────────────────
+    try:
+        encoded = urllib.parse.quote(query)
+        url = (f"http://export.arxiv.org/api/query"
+               f"?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance")
+      
         with urllib.request.urlopen(url, timeout=15) as resp:
             xml = resp.read().decode("utf-8")
+          
         ns      = {"atom": "http://www.w3.org/2005/Atom"}
         root    = ET.fromstring(xml)
         entries = root.findall("atom:entry", ns)
-        for entry in entries[:8]:
+      
+        for entry in entries:
             title   = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
             summary = (entry.findtext("atom:summary", "", ns) or "").strip()[:400]
             eid     = (entry.findtext("atom:id",      "", ns) or "").strip()
             authors = [a.findtext("atom:name","",ns) for a in entry.findall("atom:author",ns)]
-            results_text.append(
-                f"**{title}**\nAuthors: {', '.join(authors[:3])}\n{summary}\nURL: {eid}"
-            )
+            results_text.append(f"[arXiv] {title} — {', '.join(authors[:3])}\n{eid}")
+          
             # Index into vector DB
             vdb.add_text(
                 f"Title: {title}\nAuthors: {', '.join(authors)}\nAbstract: {summary}",
                 {"source": "arXiv", "title": title, "url": eid, "indexed_at": _stamp()},
             )
             indexed += 1
+        sources_used.append("arXiv")
+      
     except Exception as e:
-        results_text.append(f"arXiv search error: {e}")
+        results_text.append(f"[arXiv error] {e}")
 
     combined = "\n\n---\n".join(results_text) if results_text else "(no results)"
-
     system = SystemMessage(content=(
-        "You are a Web Research Agent. Summarise the arXiv search results below into "
-        "structured research notes relevant to the query."
+        "You are a Web Research Agent. Summarise the scholarly search results below into "
+        "structured research notes relevant to the query. Cite the source for each finding "
+        "(OpenAlex, Crossref, Semantic Scholar, or arXiv)."
     ))
-    resp = model.invoke([
-        system,
-        HumanMessage(content=f"Query: {state['query']}\n\narXiv results:\n{combined}"),
-    ])
+    resp = model.invoke([system, HumanMessage(
+        content=f"Query: {query}\n\nResults:\n{combined}"
+    )])
 
     return {
         "web_findings": resp.content,
         "messages":     [AIMessage(content=f"[Web] {resp.content[:120]}…")],
         "activity_log": [{
-            "agent":  "web", "icon": "🌐",
-            "title":  "Web / arXiv agent",
-            "detail": f"Fetched {indexed} arXiv papers; {indexed} indexed into vector DB",
+            "agent": "web", "icon": "🌐", "title": "Web / API agent",
+            "detail": (f"Sources queried: {', '.join(sources_used) or 'none'} — "
+                       f"{indexed} papers indexed into VectorDB"),
             "ts": _stamp(),
         }],
         "current_agent": "web",
     }
 
 
-# ── 5. Orchestrator ───────────────────────────────────────────────────────────
+# ── 5. Reading / Extraction Agent ────────────────────────────────────────────
 
-def orchestrator_agent(state: AgentState, model: ChatOpenAI) -> dict:
+_EMPTY_PLACEHOLDER = {"", "(none)", "(not activated)", "(no SQL results)"}
+
+def _has_content(s: str) -> bool:
+    return s.strip() not in _EMPTY_PLACEHOLDER
+
+def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
+    vf = state.get("vector_findings", "")
+    sf = state.get("sql_findings", "")
+    wf = state.get("web_findings", "")
+
+    # Skip if all retrievers returned empty or placeholder content
+    if not any(_has_content(f) for f in (vf, sf, wf)):
+        return {
+            "extraction_findings": "(none)",
+            "messages": [AIMessage(content="[ReadingExtraction] skipped — no retrieval content")],
+            "activity_log": [{
+                "agent":  "reading_extraction",
+                "icon":   "📖",
+                "title":  "Reading / Extraction — skipped",
+                "detail": "No content from any retrieval channel.",
+                "ts":     _stamp(),
+            }],
+            "current_agent": "reading_extraction",
+        }
+
+    # Build combined input, filtering out placeholder values
+    sections = []
+    if _has_content(vf):
+        sections.append(f"=== Vector DB findings ===\n{vf}")
+    if _has_content(sf):
+        sections.append(f"=== SQL / DB findings ===\n{sf}")
+    if _has_content(wf):
+        sections.append(f"=== Web / API findings ===\n{wf}")
+    combined = "\n\n".join(sections)
+
+    system = SystemMessage(content=(
+        "You are a Reading and Extraction Agent for academic research.\n"
+        "Given synthesised retrieval findings from multiple sources, extract a structured record "
+        "for every distinct paper, study, or source you can identify.\n\n"
+        "For each paper output a block in this exact format:\n"
+        "---\n"
+        "**Title / Topic:** <title or identifier>\n"
+        "**Provenance:** <abstract-only | full-text | structured-db>\n"
+        "**Research Problem:** <one sentence>\n"
+        "**Methodology:** <one sentence>\n"
+        "**Key Findings:**\n- <bullet points>\n"
+        "**Limitations:** <one sentence>\n"
+        "**Future Work:** <one sentence>\n"
+        "---\n\n"
+        "Provenance rules:\n"
+        "- 'structured-db' if the source is from the SQL/DB findings section\n"
+        "- 'full-text' if large paragraphs of text were available (VectorDB)\n"
+        "- 'abstract-only' if only title/abstract/year was available (Web API results)\n\n"
+        "If no distinct papers can be identified, output exactly: NO_PAPERS_EXTRACTED\n\n"
+        "Be precise. Do not hallucinate citations."
+    ))
+    resp = model.invoke([system, HumanMessage(
+        content=f"Query: {state['query']}\n\nRetrieval findings:\n{combined}"
+    )])
+
+    extraction = resp.content.strip()
+    # Count records by structured markers: prefer the required "**Title / Topic:**" field,
+    # and fall back to counting exact '---' delimiter lines if that is missing.
+    title_marker = "**Title / Topic:**"
+    paper_count = extraction.count(title_marker)
+    if paper_count == 0:
+        # Each record is expected to have a start and end '---' delimiter, so count
+        # delimiter lines and infer the number of papers from delimiter *pairs*.
+        delimiter_lines = sum(1 for line in extraction.splitlines() if line.strip() == "---")
+        paper_count = max(1, delimiter_lines // 2) if delimiter_lines > 0 else 0
+
+    return {
+        "extraction_findings": extraction,
+        "messages": [AIMessage(content=f"[ReadingExtraction] {paper_count} paper(s) structured")],
+        "activity_log": [{
+            "agent":  "reading_extraction",
+            "icon":   "📖",
+            "title":  "Reading / Extraction agent",
+            "detail": (
+                f"{paper_count} paper(s) extracted — fields: research problem, methodology, "
+                f"findings, limitations, future work. Provenance tagged per source."
+            ),
+            "ts":     _stamp(),
+        }],
+        "current_agent": "reading_extraction",
+    }
+
+
+def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
     block = "\n\n".join([
         f"=== Vector DB ===\n{state.get('vector_findings','')}",
         f"=== SQL / DB ===\n{state.get('sql_findings','')}",
-        f"=== Web / arXiv ===\n{state.get('web_findings','')}",
+        f"=== Web / APIs ===\n{state.get('web_findings','')}",
+        f"=== Structured Extraction ===\n{state.get('extraction_findings','')}",
     ])
     system = SystemMessage(content=(
-        "You are an Orchestrator Agent. Merge findings from three specialised agents:\n"
+        "You are an Orchestrator Agent. Merge findings from four specialised agents "
+        "(VectorDB, SQL/DB, Web, and Extraction):\n"
         "1. Deduplicate overlapping information\n"
         "2. Resolve contradictions, preferring higher-confidence structured sources\n"
-        "3. Label each claim: [VectorDB] / [SQL] / [Web]\n"
+        "3. Label each claim: [VectorDB] / [SQL] / [Web] / [Extraction]\n"
         "4. Produce one coherent merged context for downstream agents."
     ))
-    resp = model.invoke([
-        system,
-        HumanMessage(content=f"Query: {state['query']}\n\n{block}"),
-    ])
-
+    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\n{block}")])
     active = [
         src for src, key in [
-            ("Vector DB", "vector_findings"),
-            ("SQL DB",    "sql_findings"),
-            ("Web",       "web_findings"),
+            ("Vector DB",  "vector_findings"),
+            ("SQL DB",     "sql_findings"),
+            ("Web",        "web_findings"),
+            ("Extraction", "extraction_findings"),
         ]
-        if "not activated" not in state.get(key, "not activated")
+        if state.get(key, "") not in ("", "(none)", "NO_PAPERS_EXTRACTED", "(not activated)")
+        and "not activated" not in state.get(key, "")
     ]
-
     return {
         "merged_context": resp.content,
         "messages":       [AIMessage(content=f"[Orchestrator] {resp.content[:120]}…")],
         "activity_log":   [{
-            "agent":  "orchestrator", "icon": "🤝",
-            "title":  "Orchestrator merged findings",
-            "detail": f"Sources merged: {', '.join(active) or 'none'}",
-            "ts": _stamp(),
+            "agent": "orchestrator", "icon": "🤝", "title": "Orchestrator merged findings",
+            "detail": f"Sources merged: {', '.join(active) or 'none'}", "ts": _stamp(),
         }],
         "current_agent": "orchestrator",
     }
 
-
 # ── 6. Knowledge Mapper ───────────────────────────────────────────────────────
-
-def knowledge_mapper_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
         "Return ONLY valid JSON:\n"
@@ -778,10 +1023,9 @@ def knowledge_mapper_agent(state: AgentState, model: ChatOpenAI) -> dict:
         '"edges": [{"source":"str","target":"str","relation":"str","weight":0.1}]}\n'
         "Include 12–20 nodes. No text outside JSON."
     ))
-    resp = model.invoke([
-        system,
-        HumanMessage(content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"),
-    ])
+    resp = model.invoke([system, HumanMessage(
+        content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"
+    )])
     raw = resp.content.strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:]).rstrip("```").strip()
@@ -794,18 +1038,15 @@ def knowledge_mapper_agent(state: AgentState, model: ChatOpenAI) -> dict:
         "knowledge_map": km,
         "messages":      [AIMessage(content=f"[KnowledgeMapper] {len(km.get('nodes',[]))} nodes")],
         "activity_log":  [{
-            "agent":  "knowledge_mapper", "icon": "🗺️",
-            "title":  "Knowledge Mapper",
+            "agent": "knowledge_mapper", "icon": "🗺️", "title": "Knowledge Mapper",
             "detail": f"{len(km.get('nodes',[]))} nodes, {len(km.get('edges',[]))} edges extracted",
             "ts": _stamp(),
         }],
         "current_agent": "knowledge_mapper",
     }
 
-
 # ── 7. Critic ─────────────────────────────────────────────────────────────────
-
-def critic_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Critic Agent. If the knowledge map has fewer than 8 nodes OR "
         "key source diversity is missing, respond: "
@@ -825,23 +1066,20 @@ def critic_agent(state: AgentState, model: ChatOpenAI) -> dict:
 
     needs = result.get("needs_more", False)
     return {
-        "critique":     result.get("feedback", ""),
-        "_needs_more":  needs,
-        "loop_count":   state.get("loop_count", 0) + 1,
-        "messages":     [AIMessage(content=f"[Critic] needs_more={needs}")],
+        "critique":    result.get("feedback", ""),
+        "_needs_more": needs,
+        "loop_count":  state.get("loop_count", 0) + 1,
+        "messages":    [AIMessage(content=f"[Critic] needs_more={needs}")],
         "activity_log": [{
-            "agent":  "critic", "icon": "🧐",
-            "title":  f"Critic — {'needs enrichment' if needs else 'approved'}",
-            "detail": result.get("feedback", "Graph looks sufficient."),
-            "ts": _stamp(),
+            "agent": "critic", "icon": "🧐",
+            "title": f"Critic — {'needs enrichment' if needs else 'approved'}",
+            "detail": result.get("feedback", "Graph looks sufficient."), "ts": _stamp(),
         }],
         "current_agent": "critic",
     }
 
-
 # ── 8. Summarizer ─────────────────────────────────────────────────────────────
-
-def summarizer_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
         "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from."
@@ -855,17 +1093,14 @@ def summarizer_agent(state: AgentState, model: ChatOpenAI) -> dict:
         "summary":      resp.content,
         "messages":     [AIMessage(content=f"[Summarizer] {resp.content[:120]}…")],
         "activity_log": [{
-            "agent":  "summarizer", "icon": "✍️",
-            "title":  "Summarizer — final answer",
-            "detail": f"{len(resp.content)} characters",
-            "ts": _stamp(),
+            "agent": "summarizer", "icon": "✍️", "title": "Summarizer — final answer",
+            "detail": f"{len(resp.content)} characters", "ts": _stamp(),
         }],
         "current_agent": "summarizer",
     }
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
-
 def _route_critic(state: AgentState) -> str:
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
         return "orchestrator"
@@ -879,28 +1114,38 @@ def _route_critic(state: AgentState) -> str:
 def build_graph(api_key: str, vdb: VectorDBModule):
     lm_r = _llm(api_key, 0.0)
     lm_s = _llm(api_key, 0.3)
+    lm_e = _llm(api_key, 0.1)
     lm_o = _llm(api_key, 0.2)
     lm_m = _llm(api_key, 0.1)
     lm_c = _llm(api_key, 0.0)
     lm_z = _llm(api_key, 0.5)
+def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
+    lm_r = _llm(cfg, 0.0)
+    lm_s = _llm(cfg, 0.3)
+    lm_o = _llm(cfg, 0.2)
+    lm_m = _llm(cfg, 0.1)
+    lm_c = _llm(cfg, 0.0)
+    lm_z = _llm(cfg, 0.5)
 
     g = StateGraph(AgentState)
-    g.add_node("router",           lambda s: router_agent(s, lm_r))
-    g.add_node("vector_db",        lambda s: vector_db_agent(s, lm_s, vdb))
-    g.add_node("sql_db",           lambda s: sql_db_agent(s, lm_s))
-    g.add_node("web",              lambda s: web_agent(s, lm_s, vdb))
-    g.add_node("orchestrator",     lambda s: orchestrator_agent(s, lm_o))
-    g.add_node("knowledge_mapper", lambda s: knowledge_mapper_agent(s, lm_m))
-    g.add_node("critic",           lambda s: critic_agent(s, lm_c))
-    g.add_node("summarizer",       lambda s: summarizer_agent(s, lm_z))
+    g.add_node("router",              lambda s: router_agent(s, lm_r))
+    g.add_node("vector_db",           lambda s: vector_db_agent(s, lm_s, vdb))
+    g.add_node("sql_db",              lambda s: sql_db_agent(s, lm_s))
+    g.add_node("web",                 lambda s: web_agent(s, lm_s, vdb))
+    g.add_node("reading_extraction",  lambda s: reading_extraction_agent(s, lm_e))
+    g.add_node("orchestrator",        lambda s: orchestrator_agent(s, lm_o))
+    g.add_node("knowledge_mapper",    lambda s: knowledge_mapper_agent(s, lm_m))
+    g.add_node("critic",              lambda s: critic_agent(s, lm_c))
+    g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
 
     g.set_entry_point("router")
-    g.add_edge("router",           "vector_db")
-    g.add_edge("vector_db",        "sql_db")
-    g.add_edge("sql_db",           "web")
-    g.add_edge("web",              "orchestrator")
-    g.add_edge("orchestrator",     "knowledge_mapper")
-    g.add_edge("knowledge_mapper", "critic")
+    g.add_edge("router",              "vector_db")
+    g.add_edge("vector_db",           "sql_db")
+    g.add_edge("sql_db",              "web")
+    g.add_edge("web",                 "reading_extraction")
+    g.add_edge("reading_extraction",  "orchestrator")
+    g.add_edge("orchestrator",        "knowledge_mapper")
+    g.add_edge("knowledge_mapper",    "critic")
     g.add_conditional_edges(
         "critic", _route_critic,
         {"orchestrator": "orchestrator", "summarizer": "summarizer"},
@@ -927,10 +1172,8 @@ _TYPE_SHAPE = {
 }
 
 def render_knowledge_map(km: dict, height: int = 500) -> str:
-    net = Network(
-        height=f"{height}px", width="100%",
-        bgcolor="#0d1117", font_color="white", directed=True,
-    )
+    net = Network(height=f"{height}px", width="100%",
+                  bgcolor="#0d1117", font_color="white", directed=True)
     net.set_options(json.dumps({
         "edges": {
             "arrows": {"to": {"enabled": True, "scaleFactor": 0.7}},
@@ -953,18 +1196,16 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
     for node in km.get("nodes", []):
         color = _SRC_COLOR.get(node.get("source", "merged"), _SRC_COLOR["merged"])
         shape = _TYPE_SHAPE.get(node.get("type", "concept"), "dot")
-        net.add_node(
-            node["id"], label=node["label"], color=color, shape=shape,
-            title=f"<b>{node['label']}</b><br>Type: {node.get('type','?')}<br>Source: {node.get('source','?')}",
-            size=22,
-        )
+        net.add_node(node["id"], label=node["label"], color=color, shape=shape,
+                     title=f"<b>{node['label']}</b><br>Type: {node.get('type','?')}<br>Source: {node.get('source','?')}",
+                     size=22)
     for edge in km.get("edges", []):
-        net.add_edge(
-            edge["source"], edge["target"],
-            title=edge.get("relation", ""),
-            label=edge.get("relation", ""),
-            width=max(1, edge.get("weight", 0.5) * 4),
-        )
+        try:
+            net.add_edge(edge["source"], edge["target"],
+                         title=edge.get("relation", ""), label=edge.get("relation", ""),
+                         width=max(1, edge.get("weight", 0.5) * 4))
+        except Exception:
+            pass
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
         net.save_graph(f.name)
         html = Path(f.name).read_text()
@@ -972,10 +1213,73 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
     return html
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STREAMLIT UI
-# ══════════════════════════════════════════════════════════════════════════════
 
+def main() -> None:
+    # Create data directories on first run
+    for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
+        _d.mkdir(parents=True, exist_ok=True)
+
+    # ══════════════════════════════════════════════════════════════════════════════
+    # STREAMLIT UI
+    # ══════════════════════════════════════════════════════════════════════════════
+
+    st.set_page_config(
+        page_title="Collaborative RAG",
+        page_icon="🤝",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;600;800&display=swap');
+    html,[class*="css"]{font-family:'Outfit',sans-serif}
+    code,pre{font-family:'JetBrains Mono',monospace!important}
+    [data-testid="stSidebar"]{background:#0d1117!important}
+    [data-testid="stSidebar"] *{color:#c9d1d9!important}
+    h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
+    [data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
+    .agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
+    .agent-card.router{border-color:#9B59B6}
+    .agent-card.vector_db{border-color:#4A90D9}
+    .agent-card.sql_db{border-color:#E67E22}
+    .agent-card.web{border-color:#2ECC71}
+    .agent-card.reading_extraction{border-color:#27AE60}
+    .agent-card.orchestrator{border-color:#E74C3C}
+    .agent-card.knowledge_mapper{border-color:#1ABC9C}
+    .agent-card.critic{border-color:#F39C12}
+    .agent-card.summarizer{border-color:#95A5A6}
+    .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
+    .agent-detail{font-size:0.78rem;color:#8b949e}
+    .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
+    .bv{background:#1a3a5c;color:#4A90D9}
+    .bs{background:#4a2010;color:#E67E22}
+    .bw{background:#0f3d20;color:#2ECC71}
+    .be{background:#0d2e1a;color:#27AE60}
+    .bm{background:#2d1a4a;color:#9B59B6}
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Init ──────────────────────────────────────────────────────────────────────
+    init_sql_db()
+
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+    if "turns" not in st.session_state:
+        st.session_state.turns = []
+    if "vdb" not in st.session_state:
+        st.session_state.vdb = None
+
+    # ── Sidebar ───────────────────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("## 🤝 Collaborative RAG")
+        st.divider()
+
+        # API key — check env first, allow override
+        env_key = os.environ.get("OPENAI_API_KEY", "")
+        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…")
+        if not api_key:
+            st.warning("Enter your OpenAI API key to continue.")
 st.set_page_config(
     page_title="Collaborative RAG",
     page_icon="🤝",
@@ -1037,38 +1341,85 @@ with st.sidebar:
     st.markdown("## 🤝 Collaborative RAG")
     st.divider()
 
-    # API key — check env first, allow override
-    env_key  = os.environ.get("OPENAI_API_KEY", "")
-    api_key  = st.text_input(
-        "OpenAI API Key",
-        value=env_key,
-        type="password",
-        placeholder="sk-…",
+    # ── Provider selection ────────────────────────────────────────────────────
+    provider = st.selectbox(
+        "LLM Provider",
+        [PROVIDER_OPENAI, PROVIDER_GEMINI, PROVIDER_CLAUDE, PROVIDER_LOCAL],
     )
-    if not api_key:
-        st.warning("Enter your OpenAI API key to continue.")
+
+    _env_keys = {
+        PROVIDER_OPENAI: os.environ.get("OPENAI_API_KEY", ""),
+        PROVIDER_GEMINI: os.environ.get("GOOGLE_API_KEY", ""),
+        PROVIDER_CLAUDE: os.environ.get("ANTHROPIC_API_KEY", ""),
+        PROVIDER_LOCAL:  "",
+    }
+    _key_labels = {
+        PROVIDER_OPENAI: "OpenAI API Key",
+        PROVIDER_GEMINI: "Google API Key",
+        PROVIDER_CLAUDE: "Anthropic API Key",
+        PROVIDER_LOCAL:  "API Key (leave blank if none)",
+    }
+    _key_placeholders = {
+        PROVIDER_OPENAI: "sk-…",
+        PROVIDER_GEMINI: "AIza…",
+        PROVIDER_CLAUDE: "sk-ant-…",
+        PROVIDER_LOCAL:  "optional",
+    }
+
+    api_key = st.text_input(
+        _key_labels.get(provider, "API Key"),
+        value=_env_keys.get(provider, ""),
+        type="password",
+        placeholder=_key_placeholders.get(provider, ""),
+    )
+
+    default_model = _DEFAULT_MODELS.get(provider, "")
+    llm_model = st.text_input("Model", value=default_model, placeholder=default_model or "model name")
+
+    base_url = None
+    if provider == PROVIDER_LOCAL:
+        base_url = st.text_input("Base URL", value=_DEFAULT_BASE_URL,
+                                 placeholder=_DEFAULT_BASE_URL)
+
+    if provider != PROVIDER_LOCAL and not api_key:
+        st.warning(f"Enter your {_key_labels.get(provider, 'API Key')} to continue.")
         st.stop()
 
-    if st.session_state.vdb is None or st.session_state.get("_api_key") != api_key:
-        st.session_state.vdb       = VectorDBModule(api_key)
-        st.session_state._api_key  = api_key
+    cfg = ProviderConfig(
+        provider=provider,
+        api_key=api_key,
+        model=llm_model or default_model,
+        base_url=base_url,
+    )
+
+    # Rebuild VDB when provider/key/model changes (embeddings depend on these).
+    # Each embedding backend gets its own subdirectory under VECTOR_DIR so that
+    # indices built with different dimensionalities (e.g. OpenAI 1536-d vs
+    # sentence-transformers 384-d) never collide and cause runtime errors.
+    _vdb_cache_key = (provider, api_key, llm_model)
+    if st.session_state.vdb is None or st.session_state.get("_vdb_cfg") != _vdb_cache_key:
+        with st.spinner("Initialising embeddings…"):
+            vdb_dir = VECTOR_DIR / _embedding_key(cfg)
+            st.session_state.vdb      = VectorDBModule(_embeddings(cfg), vector_dir=vdb_dir)
+            st.session_state._vdb_cfg = _vdb_cache_key
+
+        # FIX 1: auto re-index saved docs on startup
+        reindexed = st.session_state.vdb.reindex_saved_docs()
+        if reindexed:
+            st.info(f"Re-indexed {reindexed} saved document(s) from disk.")
 
     vdb: VectorDBModule = st.session_state.vdb
     st.success("✅ Ready")
 
     st.divider()
-    st.markdown("### 📄 Index Documents")
-
-    uploaded = st.file_uploader(
-        "Upload .txt / .md", type=["txt", "md"], accept_multiple_files=True
-    )
+    st.markdown("### Index Documents")
+    uploaded = st.file_uploader("Upload .txt / .md", type=["txt", "md"], accept_multiple_files=True)
     if uploaded:
         for f in uploaded:
             n = vdb.add_file(f)
             st.success(f"{f.name} → {n} chunks")
 
-    # ArXiv quick-index
-    with st.expander("🔍 Index arXiv papers"):
+    with st.expander("Index arXiv papers"):
         aq = st.text_input("arXiv query", placeholder="transformer attention")
         al = st.number_input("Max papers", 1, 30, 5)
         if st.button("Index", key="arxiv_btn"):
@@ -1082,12 +1433,12 @@ with st.sidebar:
     st.metric("Vector chunks", vdb.count())
     srcs = vdb.sources()
     if srcs:
-        with st.expander(f"📚 {len(srcs)} document(s)"):
+        with st.expander(f"{len(srcs)} document(s)"):
             for s in srcs:
                 st.markdown(f"• `{s}`")
 
     st.divider()
-    st.markdown("### 🗄️ Add SQL Topic")
+    st.markdown("### Add SQL Topic")
     with st.form("add_topic"):
         t_title = st.text_input("Title")
         t_cat   = st.text_input("Category")
@@ -1100,6 +1451,7 @@ with st.sidebar:
     st.markdown("### Legend")
     for label, css in [("Vector DB","bv"),("SQL / DB","bs"),("Web","bw"),("Merged","bm")]:
         st.markdown(f'<span class="src-badge {css}">{label}</span>', unsafe_allow_html=True)
+
 
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
@@ -1230,24 +1582,39 @@ with tab_research:
                     for node in event:
                         progress.progress(pct_map.get(node, 50), f"{node.replace('_',' ').title()} running…")
 
-            # Full invoke for final state
-            full_state = app.invoke({
-                "messages":[], "query":query,
+            # Accumulate state across ALL agents properly
+            # Each agent returns a partial update - we merge them so nothing is lost
+            full_state = {
+                "messages":[], "query": query,
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
+                "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
                 "summary":"", "current_agent":"",
-            })
+            }
+            for event in app.stream(full_state.copy()):
+                for node, state_update in event.items():
+                    progress.progress(pct_map.get(node, 50),
+                                      f"{node.replace('_',' ').title()} running...")
+                    for key, val in state_update.items():
+                        if key in ('messages', 'activity_log') and isinstance(val, list):
+                            full_state[key] = full_state.get(key, []) + val
+                        else:
+                            full_state[key] = val
+
             progress.progress(100, "✅ Done!")
-            if use_cache:
+            if full_state and use_cache:
                 cache_save(query, full_state)
+
+        if full_state is None:
+            st.error("Pipeline returned no state. Please try again.")
+            st.stop()
 
         if auto_save_map and full_state.get("knowledge_map", {}).get("nodes"):
             fname = map_save(query, full_state["knowledge_map"])
             st.success(f"🗺️ Map saved → `{fname}`")
 
-        # Save session turn
         st.session_state.turns.append({
             "query":   query,
             "summary": full_state.get("summary", ""),
@@ -1258,24 +1625,19 @@ with tab_research:
         })
         session_save(st.session_state.session_id, st.session_state.turns)
 
-        # ── Result tabs ───────────────────────────────────────────────────
         r_act, r_ans, r_map, r_ctx, r_find, r_log = st.tabs([
-            "🤝 Agent Activity",
-            "💡 Final Answer",
-            "🗺️ Knowledge Map",
-            "🔀 Merged Context",
-            "🔍 Per-Agent Findings",
-            "💬 Message Log",
+            "🤝 Agent Activity", "💡 Final Answer", "🗺️ Knowledge Map",
+            "🔀 Merged Context", "🔍 Per-Agent Findings", "💬 Message Log",
         ])
 
-        # Activity
         with r_act:
             st.subheader("What each agent did")
             badge = {
-                "vector_db":    '<span class="src-badge bv">Vector DB</span>',
-                "sql_db":       '<span class="src-badge bs">SQL DB</span>',
-                "web":          '<span class="src-badge bw">Web</span>',
-                "orchestrator": '<span class="src-badge bm">Orchestrator</span>',
+                "vector_db":          '<span class="src-badge bv">Vector DB</span>',
+                "sql_db":             '<span class="src-badge bs">SQL DB</span>',
+                "web":                '<span class="src-badge bw">Web</span>',
+                "reading_extraction": '<span class="src-badge be">Extraction</span>',
+                "orchestrator":       '<span class="src-badge bm">Orchestrator</span>',
             }
             for entry in full_state.get("activity_log", []):
                 cls    = entry.get("agent", "")
@@ -1300,11 +1662,9 @@ with tab_research:
                         for row in entry["rows"]:
                             st.code(row, language="text")
 
-        # Final answer
         with r_ans:
             st.markdown(full_state.get("summary", ""))
 
-        # Knowledge map
         with r_map:
             km = full_state.get("knowledge_map", {})
             if km.get("nodes"):
@@ -1315,38 +1675,33 @@ with tab_research:
                 cols = st.columns(len(src_counts))
                 css  = {"vector_db":"bv","sql_db":"bs","web":"bw","merged":"bm"}
                 for i, (s, c) in enumerate(src_counts.items()):
-                    cols[i].markdown(
-                        f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
-                        unsafe_allow_html=True,
-                    )
+                    cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
+                                     unsafe_allow_html=True)
                 st.components.v1.html(render_knowledge_map(km), height=520)
                 with st.expander("📊 Raw graph data"):
                     c1, c2 = st.columns(2)
-                    c1.markdown("**Nodes**")
-                    c1.dataframe(km["nodes"])
-                    c2.markdown("**Edges**")
-                    c2.dataframe(km["edges"])
+                    c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
+                    c2.markdown("**Edges**"); c2.dataframe(km["edges"])
             else:
                 st.warning("No map generated.")
 
-        # Merged context
         with r_ctx:
             st.markdown(full_state.get("merged_context", ""))
 
-        # Per-agent findings
         with r_find:
             for label, key, bcls in [
-                ("🗂️ Vector DB", "vector_findings", "bv"),
-                ("🗄️ SQL / DB",  "sql_findings",    "bs"),
-                ("🌐 Web",       "web_findings",     "bw"),
+                ("🗂️ Vector DB",            "vector_findings",     "bv"),
+                ("🗄️ SQL / DB",             "sql_findings",        "bs"),
+                ("🌐 Web",                  "web_findings",        "bw"),
+                ("📖 Reading / Extraction", "extraction_findings", "be"),
             ]:
                 with st.expander(f"{label} findings"):
                     st.markdown(full_state.get(key, ""))
 
-        # Message log
         with r_log:
             av = {
                 "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
+                "[ReadingExtraction]":"📖",
                 "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
                 "[Critic]":"🧐","[Summarizer]":"✍️",
             }
@@ -1418,10 +1773,8 @@ with tab_sessions:
                 f'<span class="src-badge {_agent_css.get(a, "bm")}">{a}</span>'
                 for a in t.get("agents", [])
             )
-            st.markdown(
-                f"**Turn {len(turns)-i+1}** · {t['ts'][:16].replace('T',' ')} {badges}",
-                unsafe_allow_html=True,
-            )
+            st.markdown(f"**Turn {len(turns)-i+1}** · {t['ts'][:16].replace('T',' ')} {badges}",
+                        unsafe_allow_html=True)
             st.markdown(f"> 🔍 **{t['query']}**")
             with st.expander("Summary", expanded=(i == 1)):
                 st.markdown(t.get("summary", ""))
@@ -1437,7 +1790,7 @@ with tab_cache:
     filt_c = st.text_input("Filter", key="cache_filt")
     shown_c = [e for e in entries if not filt_c or filt_c.lower() in e["query"].lower()]
     for e in shown_c:
-        age = datetime.utcnow() - datetime.fromisoformat(e["ts"])
+        age   = datetime.utcnow() - datetime.fromisoformat(e["ts"])
         age_s = f"{age.days}d {age.seconds//3600}h ago" if age.days else f"{age.seconds//3600}h {(age.seconds%3600)//60}m ago"
         with st.expander(f"🗃️ {e['query'][:75]}…  ·  {age_s}"):
             pl = cache_load(e["query"])
@@ -1456,3 +1809,7 @@ with tab_cache:
         for p in CACHE_DIR.glob("*.json"):
             p.unlink()
         st.success("Cache cleared.")
+
+
+if __name__ == "__main__":
+    main()
