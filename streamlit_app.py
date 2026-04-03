@@ -132,6 +132,7 @@ class AgentState(TypedDict):
     critique:              str
     loop_count:            int
     summary:               str
+    experiment_plan:       str
     current_agent:         str
 
 
@@ -497,6 +498,21 @@ def _llm(cfg: ProviderConfig, temperature: float = 0.3) -> BaseChatModel:
             model=cfg.model or "local-model",
             temperature=temperature,
         )
+
+
+def _fetch_local_models(base_url: str) -> list[str]:
+    """Query a local OpenAI-compatible server for its available models."""
+    import urllib.request, json as _json
+    # Strip trailing /v1 or /v1/ so we can reconstruct the path cleanly
+    root = base_url.rstrip("/")
+    if not root.endswith("/v1"):
+        root = root + "/v1"
+    try:
+        with urllib.request.urlopen(f"{root}/models", timeout=2) as resp:
+            data = _json.loads(resp.read())
+        return [m["id"] for m in data.get("data", [])]
+    except Exception:
+        return []
 
 
 def _embeddings(cfg: ProviderConfig):
@@ -991,6 +1007,87 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     }
 
 
+# ── 9. Experiment Design ──────────────────────────────────────────────────────
+def experiment_design_agent(state: AgentState, model: BaseChatModel) -> dict:
+    system = SystemMessage(content=(
+        "You are a Planning Agent in a multi-agent research assistant system. "
+        "Your role is to translate a completed literature analysis into an actionable, "
+        "citation-grounded structured research plan.\n\n"
+        "You have access to: (1) the user's research question, (2) a synthesized literature "
+        "summary, (3) per-paper extraction records containing each paper's research problem, "
+        "methods, findings, limitations, and stated future work, and (4) a merged evidence "
+        "context from all retrieval channels.\n\n"
+        "Produce a structured research plan in markdown with EXACTLY these sections, in order:\n\n"
+        "## Research Landscape Overview\n"
+        "One concise paragraph: what is well-established, which methods dominate, and where "
+        "the field currently stands relative to the research question.\n\n"
+        "## Identified Research Gaps\n"
+        "List 3–5 specific, concrete gaps derived from reported limitations and future-work "
+        "statements in the literature. Each gap must cite the paper(s) that reveal it. "
+        "Format each as:\n"
+        "**Gap N: <short title>** — <description of what is missing or unresolved>  \n"
+        "*Grounded in: <paper title / author shorthand>*\n\n"
+        "## Proposed Hypotheses\n"
+        "One falsifiable, testable hypothesis per gap. Each must be explicitly grounded in the "
+        "evidence and directly address its corresponding gap. Format each as:\n"
+        "**H-N** *(addresses Gap N)*: <hypothesis statement>\n\n"
+        "## Recommended Methodologies\n"
+        "For each hypothesis, specify: study design, experimental protocol, key procedures, "
+        "and evaluation approach. Where the literature already validates a method, reference it "
+        "by name and source. Note which methodologies are novel vs. established.\n\n"
+        "## Datasets & Domains\n"
+        "For each hypothesis, identify: concrete public datasets or benchmarks (with names), "
+        "data collection approaches if no public dataset exists, domain scope and inclusion "
+        "criteria, and approximate scale needed. Reference datasets already used in the "
+        "literature where applicable.\n\n"
+        "## Anticipated Challenges & Risks\n"
+        "For each major risk (technical, logistical, or validity-related), briefly describe "
+        "the risk and a concrete mitigation strategy. Include risks around reproducibility, "
+        "data access, computational cost, and evaluation validity.\n\n"
+        "## Short-term Next Steps (0–3 months)\n"
+        "A numbered list of immediate, concrete actions a researcher could begin today. "
+        "Be specific: name tools, datasets, baselines, or collaborators where relevant.\n\n"
+        "## Medium-term Next Steps (3–12 months)\n"
+        "Milestones that build on short-term work toward full experimental execution and "
+        "publication. Include checkpoints for evaluating progress.\n\n"
+        "IMPORTANT: Every claim must be grounded in the provided evidence. "
+        "Do not fabricate paper titles, authors, or dataset names. "
+        "If evidence is sparse for a section, say so explicitly rather than hallucinating."
+    ))
+
+    extraction = state.get("extraction_findings", "") or ""
+    context    = state.get("merged_context", "") or ""
+    km_nodes   = [n.get("label", "") for n in state.get("knowledge_map", {}).get("nodes", [])]
+
+    resp = model.invoke([system, HumanMessage(content=(
+        f"Research question: {state['query']}\n\n"
+        f"Synthesized literature summary:\n{state['summary']}\n\n"
+        f"Per-paper extraction records (problems · methods · findings · limitations · future work):\n"
+        f"{extraction[:2500]}\n\n"
+        f"Merged evidence context:\n{context[:2000]}\n\n"
+        f"Key concepts from knowledge graph: {', '.join(km_nodes[:30])}"
+    ))])
+
+    plan = resp.content
+    n_gaps  = plan.count("**Gap ")
+    n_hyp   = plan.count("**H-")
+    n_steps = plan.count("## Short-term") + plan.count("## Medium-term")
+
+    return {
+        "experiment_plan": plan,
+        "messages":        [AIMessage(content=f"[ExperimentDesign] {plan[:120]}…")],
+        "activity_log":    [{
+            "agent":  "experiment_design",
+            "icon":   "🧪",
+            "title":  "Planning Agent — structured research plan generated",
+            "detail": (f"{n_gaps} gaps identified · {n_hyp} hypotheses · "
+                       f"{n_steps} step horizons · {len(plan)} characters"),
+            "ts":     _stamp(),
+        }],
+        "current_agent": "experiment_design",
+    }
+
+
 # ── Routing ───────────────────────────────────────────────────────────────────
 def _route_critic(state: AgentState) -> str:
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
@@ -1002,21 +1099,15 @@ def _route_critic(state: AgentState) -> str:
 # GRAPH BUILDER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def build_graph(api_key: str, vdb: VectorDBModule):
-    lm_r = _llm(api_key, 0.0)
-    lm_s = _llm(api_key, 0.3)
-    lm_e = _llm(api_key, 0.1)
-    lm_o = _llm(api_key, 0.2)
-    lm_m = _llm(api_key, 0.1)
-    lm_c = _llm(api_key, 0.0)
-    lm_z = _llm(api_key, 0.5)
 def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     lm_r = _llm(cfg, 0.0)
     lm_s = _llm(cfg, 0.3)
+    lm_e = _llm(cfg, 0.1)
     lm_o = _llm(cfg, 0.2)
     lm_m = _llm(cfg, 0.1)
     lm_c = _llm(cfg, 0.0)
     lm_z = _llm(cfg, 0.5)
+    lm_x = _llm(cfg, 0.4)
 
     g = StateGraph(AgentState)
     g.add_node("router",              lambda s: router_agent(s, lm_r))
@@ -1028,6 +1119,7 @@ def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     g.add_node("knowledge_mapper",    lambda s: knowledge_mapper_agent(s, lm_m))
     g.add_node("critic",              lambda s: critic_agent(s, lm_c))
     g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
+    g.add_node("experiment_design",   lambda s: experiment_design_agent(s, lm_x))
 
     g.set_entry_point("router")
     g.add_edge("router",              "vector_db")
@@ -1041,7 +1133,8 @@ def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
         "critic", _route_critic,
         {"orchestrator": "orchestrator", "summarizer": "summarizer"},
     )
-    g.add_edge("summarizer", END)
+    g.add_edge("summarizer",          "experiment_design")
+    g.add_edge("experiment_design",   END)
     return g.compile()
 
 
@@ -1140,6 +1233,7 @@ def main() -> None:
     .agent-card.knowledge_mapper{border-color:#1ABC9C}
     .agent-card.critic{border-color:#F39C12}
     .agent-card.summarizer{border-color:#95A5A6}
+    .agent-card.experiment_design{border-color:#00BCD4}
     .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
     .agent-detail{font-size:0.78rem;color:#8b949e}
     .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
@@ -1148,6 +1242,7 @@ def main() -> None:
     .bw{background:#0f3d20;color:#2ECC71}
     .be{background:#0d2e1a;color:#27AE60}
     .bm{background:#2d1a4a;color:#9B59B6}
+    .bx{background:#002d33;color:#00BCD4}
     </style>
     """, unsafe_allow_html=True)
 
@@ -1196,6 +1291,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .agent-card.knowledge_mapper{border-color:#1ABC9C}
 .agent-card.critic{border-color:#F39C12}
 .agent-card.summarizer{border-color:#95A5A6}
+.agent-card.experiment_design{border-color:#00BCD4}
 .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
 .agent-detail{font-size:0.78rem;color:#8b949e}
 .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
@@ -1203,6 +1299,7 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .bs{background:#4a2010;color:#E67E22}
 .bw{background:#0f3d20;color:#2ECC71}
 .bm{background:#2d1a4a;color:#9B59B6}
+.bx{background:#002d33;color:#00BCD4}
 </style>
 """, unsafe_allow_html=True)
 
@@ -1254,12 +1351,19 @@ with st.sidebar:
     )
 
     default_model = _DEFAULT_MODELS.get(provider, "")
-    llm_model = st.text_input("Model", value=default_model, placeholder=default_model or "model name")
 
     base_url = None
     if provider == PROVIDER_LOCAL:
         base_url = st.text_input("Base URL", value=_DEFAULT_BASE_URL,
                                  placeholder=_DEFAULT_BASE_URL)
+        _local_models = _fetch_local_models(base_url or _DEFAULT_BASE_URL)
+        if _local_models:
+            llm_model = st.selectbox("Model", options=_local_models)
+        else:
+            st.warning("Could not reach local server — enter model name manually.")
+            llm_model = st.text_input("Model", value=default_model, placeholder="model name")
+    else:
+        llm_model = st.text_input("Model", value=default_model, placeholder=default_model or "model name")
 
     if provider != PROVIDER_LOCAL and not api_key:
         st.warning(f"Enter your {_key_labels.get(provider, 'API Key')} to continue.")
@@ -1351,7 +1455,8 @@ with tab_research:
         use_cache     = st.checkbox("Use 20-day cache", value=True)
         auto_save_map = st.checkbox("Auto-save map",    value=True)
 
-    run = st.button("🚀 Run Pipeline", type="primary", disabled=not (api_key and query))
+    _ready = bool(query) and (bool(api_key) or provider == PROVIDER_LOCAL)
+    run = st.button("🚀 Run Pipeline", type="primary", disabled=not _ready)
 
     if run:
         cached = cache_load(query) if use_cache else None
@@ -1359,12 +1464,13 @@ with tab_research:
             st.info("⚡ Loaded from cache")
             full_state = cached
         else:
-            app      = build_graph(api_key, vdb)
+            app      = build_graph(cfg, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
-                "router": 10, "vector_db": 25, "sql_db": 40, "web": 53,
-                "reading_extraction": 63, "orchestrator": 72,
-                "knowledge_mapper": 82, "critic": 91, "summarizer": 97,
+                "router": 10, "vector_db": 25, "sql_db": 38, "web": 50,
+                "reading_extraction": 60, "orchestrator": 69,
+                "knowledge_mapper": 78, "critic": 87, "summarizer": 93,
+                "experiment_design": 97,
             }
 
             # Accumulate state across ALL agents properly
@@ -1376,7 +1482,7 @@ with tab_research:
                 "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
-                "summary":"", "current_agent":"",
+                "summary":"", "experiment_plan":"", "current_agent":"",
             }
             for event in app.stream(full_state.copy()):
                 for node, state_update in event.items():
@@ -1410,9 +1516,10 @@ with tab_research:
         })
         session_save(st.session_state.session_id, st.session_state.turns)
 
-        r_act, r_ans, r_map, r_ctx, r_find, r_log = st.tabs([
-            "🤝 Agent Activity", "💡 Final Answer", "🗺️ Knowledge Map",
-            "🔀 Merged Context", "🔍 Per-Agent Findings", "💬 Message Log",
+        r_act, r_ans, r_exp, r_map, r_ctx, r_find, r_log = st.tabs([
+            "🤝 Agent Activity", "💡 Final Answer", "🧪 Research Plan",
+            "🗺️ Knowledge Map", "🔀 Merged Context", "🔍 Per-Agent Findings",
+            "💬 Message Log",
         ])
 
         with r_act:
@@ -1423,6 +1530,7 @@ with tab_research:
                 "web":                '<span class="src-badge bw">Web</span>',
                 "reading_extraction": '<span class="src-badge be">Extraction</span>',
                 "orchestrator":       '<span class="src-badge bm">Orchestrator</span>',
+                "experiment_design":  '<span class="src-badge bx">Planning Agent</span>',
             }
             for entry in full_state.get("activity_log", []):
                 cls    = entry.get("agent", "")
@@ -1449,6 +1557,21 @@ with tab_research:
 
         with r_ans:
             st.markdown(full_state.get("summary", ""))
+
+        with r_exp:
+            st.subheader("Structured Research Plan")
+            plan = full_state.get("experiment_plan", "")
+            if plan:
+                n_gaps = plan.count("**Gap ")
+                n_hyp  = plan.count("**H-")
+                mc1, mc2, mc3 = st.columns(3)
+                mc1.metric("Research Gaps", n_gaps)
+                mc2.metric("Hypotheses",    n_hyp)
+                mc3.metric("Plan Length",   f"{len(plan):,} chars")
+                st.divider()
+                st.markdown(plan)
+            else:
+                st.info("No research plan generated yet.")
 
         with r_map:
             km = full_state.get("knowledge_map", {})
@@ -1488,7 +1611,7 @@ with tab_research:
                 "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
                 "[ReadingExtraction]":"📖",
                 "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
-                "[Critic]":"🧐","[Summarizer]":"✍️",
+                "[Critic]":"🧐","[Summarizer]":"✍️","[ExperimentDesign]":"🧪",
             }
             for msg in full_state.get("messages", []):
                 icon = next((v for k, v in av.items() if k in msg.content), "🤖")
