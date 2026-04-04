@@ -138,6 +138,12 @@ class AgentState(TypedDict):
     experiment_plan:       str
     current_agent:         str
     _needs_more:           bool
+    # ── Scoping Agent fields ──────────────────────────────────────────────────
+    sub_questions:         List[str]
+    search_keywords:       List[str]
+    scoping_summary:       str
+    # ── Synthesis Agent field ─────────────────────────────────────────────────
+    synthesis_report:      str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -554,6 +560,146 @@ def _embedding_key(cfg: ProviderConfig) -> str:
 # AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCOPING AGENT  (Layer 1 — runs before Router)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def scoping_agent(state: AgentState, model: BaseChatModel) -> dict:
+    """
+    First agent in the pipeline.
+    Reads:  state['query']
+    Writes: state['sub_questions'], state['search_keywords'], state['scoping_summary']
+    Decomposes the raw query so Router and retrieval agents get richer context.
+    """
+    system = SystemMessage(content=(
+        "You are a Scoping Agent. Analyse the research query and decompose it.\n\n"
+        "Return ONLY valid JSON with exactly these fields:\n"
+        "{\n"
+        '  "sub_questions": [<3 to 5 strings — distinct aspects of the topic>],\n'
+        '  "search_keywords": [<4 to 8 strings — concise academic search terms>],\n'
+        '  "scoping_summary": "<one sentence describing what this query is really asking>"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- sub_questions must each address a DIFFERENT facet of the topic\n"
+        "- search_keywords should be short (1-3 words each), suitable for API queries\n"
+        "- Do not include any text outside the JSON"
+    ))
+    resp = model.invoke([system, HumanMessage(content=f"Research query: {state['query']}")])
+    raw = resp.content.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
+    try:
+        parsed          = json.loads(raw)
+        sub_questions   = parsed.get("sub_questions", [])[:5]
+        search_keywords = parsed.get("search_keywords", [])[:8]
+        scoping_summary = parsed.get("scoping_summary", "")
+    except Exception:
+        sub_questions   = [state["query"]]
+        search_keywords = state["query"].lower().split()[:8]
+        scoping_summary = f"Could not parse scope for: {state['query']}"
+
+    return {
+        "sub_questions":   sub_questions,
+        "search_keywords": search_keywords,
+        "scoping_summary": scoping_summary,
+        "messages":        [AIMessage(content=f"[Scoping] {scoping_summary}")],
+        "activity_log":    [{
+            "agent":  "scoping",
+            "icon":   "🔭",
+            "title":  "Scoping Agent decomposed the query",
+            "detail": (
+                f"Summary: {scoping_summary} | "
+                f"Sub-questions ({len(sub_questions)}): "
+                + " | ".join(f"({i+1}) {q}" for i, q in enumerate(sub_questions))
+                + f" | Keywords: {', '.join(search_keywords)}"
+            ),
+            "ts": _stamp(),
+        }],
+        "current_agent": "scoping",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNTHESIS AGENT  (Layer 3 — sits between Critic and Summarizer)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def synthesis_agent(state: AgentState, model: BaseChatModel) -> dict:
+    """
+    Reads:  state['merged_context'], state['extraction_findings'], state['knowledge_map']
+    Writes: state['synthesis_report']
+    Produces a thematic literature review grouped by topics, methods, disagreements.
+    The Summarizer reads synthesis_report instead of raw merged_context.
+    """
+    merged     = state.get("merged_context", "")
+    extraction = state.get("extraction_findings", "")
+    km_nodes   = [n.get("label", "") for n in state.get("knowledge_map", {}).get("nodes", [])]
+
+    if not merged.strip() and not extraction.strip():
+        return {
+            "synthesis_report": "(no content to synthesise)",
+            "messages":         [AIMessage(content="[Synthesis] skipped — no content")],
+            "activity_log":     [{
+                "agent":  "synthesis",
+                "icon":   "🧵",
+                "title":  "Synthesis Agent — skipped",
+                "detail": "No merged context or extraction findings available.",
+                "ts":     _stamp(),
+            }],
+            "current_agent": "synthesis",
+        }
+
+    system = SystemMessage(content=(
+        "You are a Synthesis Agent in a multi-agent academic research assistant.\n"
+        "Produce a DEDICATED THEMATIC LITERATURE REVIEW in markdown with EXACTLY these sections:\n\n"
+        "## 1. Thematic Groups\n"
+        "Cluster all papers/findings into 2-5 coherent research themes. For each theme:\n"
+        "  - Give it a descriptive name\n"
+        "  - List which papers/sources belong to it\n"
+        "  - Summarise the shared focus and key contributions\n"
+        "  - Note trends across the group\n\n"
+        "## 2. Methodological Landscape\n"
+        "Compare the methods used across all papers. For each distinct methodology:\n"
+        "  - Name it and describe it briefly\n"
+        "  - List which papers use it\n"
+        "  - Compare strengths and weaknesses\n"
+        "  - Note whether it is dominant, emerging, or rarely used\n\n"
+        "## 3. Disagreements & Open Questions\n"
+        "Identify where papers CONTRADICT or DISAGREE. For each disagreement:\n"
+        "  - Describe what the conflict is about\n"
+        "  - Name which papers hold each position\n"
+        "  - DO NOT resolve the disagreement — preserve both viewpoints\n"
+        "  - Flag it as an open research question\n\n"
+        "Ground every claim in the evidence. Cite [VectorDB]/[SQL]/[Web]/[Extraction].\n"
+        "If evidence is sparse for a section, say so rather than fabricating."
+    ))
+
+    human_content = f"Research query: {state['query']}\n\nMerged evidence:\n{merged[:3000]}\n\n"
+    if extraction.strip() and extraction.strip() not in ("(none)", "NO_PAPERS_EXTRACTED"):
+        human_content += f"Per-paper extraction records:\n{extraction[:2000]}\n\n"
+    if km_nodes:
+        human_content += f"Key concepts from knowledge graph: {', '.join(km_nodes[:25])}"
+
+    resp   = model.invoke([system, HumanMessage(content=human_content)])
+    report = resp.content.strip()
+
+    return {
+        "synthesis_report": report,
+        "messages":         [AIMessage(content=f"[Synthesis] {report[:120]}…")],
+        "activity_log":     [{
+            "agent":  "synthesis",
+            "icon":   "🧵",
+            "title":  "Synthesis Agent — thematic literature review generated",
+            "detail": (
+                "3 sections: Thematic Groups · Methodological Landscape · "
+                f"Disagreements & Open Questions | {len(report):,} characters"
+            ),
+            "ts": _stamp(),
+        }],
+        "current_agent": "synthesis",
+    }
+
+
 def router_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Router Agent. Given a user query, decide which search agents to activate.\n"
@@ -561,7 +707,15 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
-    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}")])
+    # Enrich prompt with Scoping Agent output when available
+    scope_extra = ""
+    if state.get("scoping_summary"):
+        scope_extra = (
+            f"\nScope summary: {state['scoping_summary']}"
+            f"\nSub-questions: {state.get('sub_questions', [])}"
+            f"\nSearch keywords: {state.get('search_keywords', [])}"
+        )
+    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}{scope_extra}")])
     raw  = resp.content.strip()
     if raw.startswith("```"):
         raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
@@ -1106,9 +1260,12 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
         "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
         "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from."
     ))
+    # Prefer synthesis_report over raw merged_context when available
+    synthesis = state.get("synthesis_report", "")
+    context_src = synthesis if synthesis and synthesis != "(no content to synthesise)" else state.get("merged_context", "")
     resp = model.invoke([system, HumanMessage(content=(
         f"Query: {state['query']}\n\n"
-        f"Merged context:\n{state['merged_context']}\n\n"
+        f"Thematic synthesis:\n{context_src}\n\n"
         f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
     ))])
     return {
@@ -1215,13 +1372,15 @@ def _route_critic(state: AgentState) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
-    lm_r = _llm(cfg, 0.0)
+    lm_sc = _llm(cfg, 0.2)   # scoping
+    lm_r  = _llm(cfg, 0.0)   # router
     lm_s = _llm(cfg, 0.3)
     lm_e = _llm(cfg, 0.1)
     lm_o = _llm(cfg, 0.2)
     lm_m = _llm(cfg, 0.1)
     lm_c = _llm(cfg, 0.0)
-    lm_z = _llm(cfg, 0.5)
+    lm_sy = _llm(cfg, 0.3)   # synthesis
+    lm_z  = _llm(cfg, 0.5)   # summarizer
     lm_x = _llm(cfg, 0.4)
 
     g = StateGraph(AgentState)
@@ -1236,7 +1395,11 @@ def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
     g.add_node("experiment_design",   lambda s: experiment_design_agent(s, lm_x))
 
-    g.set_entry_point("router")
+    g.add_node("scoping",             lambda s: scoping_agent(s, lm_sc))
+    g.add_node("synthesis",           lambda s: synthesis_agent(s, lm_sy))
+
+    g.set_entry_point("scoping")
+    g.add_edge("scoping",             "router")
     g.add_edge("router",              "vector_db")
     g.add_edge("vector_db",           "sql_db")
     g.add_edge("sql_db",              "web")
@@ -1246,8 +1409,9 @@ def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     g.add_edge("knowledge_mapper",    "critic")
     g.add_conditional_edges(
         "critic", _route_critic,
-        {"orchestrator": "orchestrator", "summarizer": "summarizer"},
+        {"orchestrator": "orchestrator", "summarizer": "synthesis"},
     )
+    g.add_edge("synthesis",           "summarizer")
     g.add_edge("summarizer",          "experiment_design")
     g.add_edge("experiment_design",   END)
     return g.compile()
@@ -1346,6 +1510,8 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .agent-card.critic{border-color:#F39C12}
 .agent-card.summarizer{border-color:#95A5A6}
 .agent-card.experiment_design{border-color:#00BCD4}
+.agent-card.scoping{border-color:#FF6B6B}
+.agent-card.synthesis{border-color:#A29BFE}
 .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
 .agent-detail{font-size:0.78rem;color:#8b949e}
 .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
@@ -1609,22 +1775,27 @@ with tab_research:
             app      = build_graph(cfg, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
-                "router": 10, "vector_db": 25, "sql_db": 38, "web": 50,
-                "reading_extraction": 60, "orchestrator": 69,
-                "knowledge_mapper": 78, "critic": 87, "summarizer": 93,
-                "experiment_design": 97,
+                "scoping": 5, "router": 12, "vector_db": 24, "sql_db": 36, "web": 47,
+                "reading_extraction": 57, "orchestrator": 66,
+                "knowledge_mapper": 74, "critic": 82, "synthesis": 89,
+                "summarizer": 94, "experiment_design": 98,
             }
 
             # Accumulate state across ALL agents properly
             # Each agent returns a partial update - we merge them so nothing is lost
             full_state = {
                 "messages":[], "query": query,
+                # Scoping Agent
+                "sub_questions":[], "search_keywords":[], "scoping_summary":"",
+                # Router + retrieval
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
                 "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
-                "summary":"", "experiment_plan":"", "current_agent":"", "_needs_more": False,
+                # Synthesis + summary
+                "synthesis_report":"", "summary":"", "experiment_plan":"",
+                "current_agent":"", "_needs_more": False,
             }
             for event in app.stream(full_state.copy()):
                 for node, state_update in event.items():
@@ -1740,14 +1911,15 @@ with tab_research:
                 ("🗄️ SQL / DB",             "sql_findings",        "bs"),
                 ("🌐 Web",                  "web_findings",        "bw"),
                 ("📖 Reading / Extraction", "extraction_findings", "be"),
+                    ("🧵 Synthesis",           "synthesis_report",     "bm"),
             ]:
                 with st.expander(f"{label} findings"):
                     st.markdown(full_state.get(key, ""))
 
         with r_log:
             av = {
-                "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
-                "[ReadingExtraction]":"📖",
+                "[Scoping]":"🔭","[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
+                "[ReadingExtraction]":"📖","[Synthesis]":"🧵",
                 "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
                 "[Critic]":"🧐","[Summarizer]":"✍️","[ExperimentDesign]":"🧪",
             }
@@ -1855,5 +2027,3 @@ with tab_cache:
         for p in CACHE_DIR.glob("*.json"):
             p.unlink()
         st.success("Cache cleared.")
-
-
