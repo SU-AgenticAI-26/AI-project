@@ -635,7 +635,13 @@ def synthesis_agent(state: AgentState, model: BaseChatModel) -> dict:
     extraction = state.get("extraction_findings", "")
     km_nodes   = [n.get("label", "") for n in state.get("knowledge_map", {}).get("nodes", [])]
 
-    if not merged.strip() and not extraction.strip():
+    merged_text = merged.strip()
+    extraction_text = extraction.strip()
+    extraction_placeholders = {"NO_PAPERS_EXTRACTED", "(none)"}
+    has_merged_content = bool(merged_text)
+    has_extraction_content = bool(extraction_text) and extraction_text not in extraction_placeholders
+
+    if not has_merged_content and not has_extraction_content:
         return {
             "synthesis_report": "(no content to synthesise)",
             "messages":         [AIMessage(content="[Synthesis] skipped — no content")],
