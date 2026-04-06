@@ -314,27 +314,46 @@ def init_sql_db() -> None:
 def sql_search(query: str, k: int = 8) -> str:
     con   = sqlite3.connect(SQL_DB_PATH)
     cur   = con.cursor()
-    words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3]
+    words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3][:5]
+
+    if not words:
+        con.close()
+        return "(no SQL results)"
+
     results = []
-    for word in words[:5]:
-        for row in cur.execute(
-            "SELECT title,category,summary FROM topics WHERE "
-            "LOWER(title) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(summary) LIKE ?",
-            (f"%{word}%", f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[TOPIC] {row[0]} ({row[1]}): {row[2]}")
-        for row in cur.execute(
-            "SELECT from_topic,relation_type,to_topic FROM relationships WHERE "
-            "LOWER(from_topic) LIKE ? OR LOWER(to_topic) LIKE ?",
-            (f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[REL] {row[0]} —[{row[1]}]→ {row[2]}")
-        for row in cur.execute(
-            "SELECT subject,predicate,object,source FROM facts WHERE "
-            "LOWER(subject) LIKE ? OR LOWER(object) LIKE ?",
-            (f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
+    like = [f"%{w}%" for w in words]
+
+    # One query per table, all keywords combined with OR — avoids N×3 round-trips.
+    topic_clause = " OR ".join(
+        ["LOWER(title) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(summary) LIKE ?"] * len(words)
+    )
+    topic_params = [p for w in like for p in (w, w, w)]
+    for row in cur.execute(
+        f"SELECT title,category,summary FROM topics WHERE {topic_clause}",
+        topic_params,
+    ).fetchall():
+        results.append(f"[TOPIC] {row[0]} ({row[1]}): {row[2]}")
+
+    rel_clause = " OR ".join(
+        ["LOWER(from_topic) LIKE ? OR LOWER(to_topic) LIKE ?"] * len(words)
+    )
+    rel_params = [p for w in like for p in (w, w)]
+    for row in cur.execute(
+        f"SELECT from_topic,relation_type,to_topic FROM relationships WHERE {rel_clause}",
+        rel_params,
+    ).fetchall():
+        results.append(f"[REL] {row[0]} —[{row[1]}]→ {row[2]}")
+
+    fact_clause = " OR ".join(
+        ["LOWER(subject) LIKE ? OR LOWER(object) LIKE ?"] * len(words)
+    )
+    fact_params = [p for w in like for p in (w, w)]
+    for row in cur.execute(
+        f"SELECT subject,predicate,object,source FROM facts WHERE {fact_clause}",
+        fact_params,
+    ).fetchall():
+        results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
+
     con.close()
     seen, unique = set(), []
     for r in results:
@@ -537,7 +556,7 @@ def _embeddings(cfg: ProviderConfig):
             google_api_key=cfg.api_key, model="models/text-embedding-004"
         )
     else:  # Claude or Local — use a free local model via sentence-transformers
-        from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
@@ -944,6 +963,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
 
     query        = state["query"]
     results_text = []
+    errors       = []   # API failures tracked separately and may be surfaced later in fallback/reporting content
     indexed      = 0
     sources_used = []
 
@@ -964,7 +984,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("OpenAlex")
     except Exception as e:
-        results_text.append(f"[OpenAlex error] {e}")
+        errors.append(f"OpenAlex: {e}")
 
     # ── Crossref ──────────────────────────────────────────────────────────────
     try:
@@ -983,7 +1003,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("Crossref")
     except Exception as e:
-        results_text.append(f"[Crossref error] {e}")
+        errors.append(f"Crossref: {e}")
 
     # Semantic Scholar ──────────────────────────────────────────────────────
     try:
@@ -991,12 +1011,12 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
         headers = {"x-api-key": ss_key} if ss_key else {}
         r = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query, 
+            params={"query": query,
                     "limit": 5,
                     "fields": "title,year,citationCount,authors"},
             headers=headers, timeout=10
         )
-      
+
         if r.ok:
             for paper in r.json().get("data", []):
                 title   = paper.get("title", "No title")
@@ -1011,28 +1031,28 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("Semantic Scholar")
     except Exception as e:
-        results_text.append(f"[Semantic Scholar error] {e}")
+        errors.append(f"Semantic Scholar: {e}")
 
     # arXiv ─────────────────────────────────────────────────────────────────
     try:
         encoded = urllib.parse.quote(query)
         url = (f"http://export.arxiv.org/api/query"
                f"?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance")
-      
+
         with urllib.request.urlopen(url, timeout=15) as resp:
             xml = resp.read().decode("utf-8")
-          
+
         ns      = {"atom": "http://www.w3.org/2005/Atom"}
         root    = ET.fromstring(xml)
         entries = root.findall("atom:entry", ns)
-      
+
         for entry in entries:
             title   = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
             summary = (entry.findtext("atom:summary", "", ns) or "").strip()[:400]
             eid     = (entry.findtext("atom:id",      "", ns) or "").strip()
             authors = [a.findtext("atom:name","",ns) for a in entry.findall("atom:author",ns)]
             results_text.append(f"[arXiv] {title} — {', '.join(authors[:3])}\n{eid}")
-          
+
             # Index into vector DB
             vdb.add_text(
                 f"Title: {title}\nAuthors: {', '.join(authors)}\nAbstract: {summary}",
@@ -1040,11 +1060,19 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
             )
             indexed += 1
         sources_used.append("arXiv")
-      
-    except Exception as e:
-        results_text.append(f"[arXiv error] {e}")
 
-    combined = "\n\n---\n".join(results_text) if results_text else "(no results)"
+    except Exception as e:
+        errors.append(f"arXiv: {e}")
+
+    # Build content for the LLM — errors are noted but never treated as findings.
+    if results_text:
+        combined = "\n\n---\n".join(results_text)
+        if errors:
+            combined += f"\n\n(Note: the following sources failed and returned no results: {'; '.join(errors)})"
+    elif errors:
+        combined = f"(All sources failed to return results. Errors: {'; '.join(errors)})"
+    else:
+        combined = "(no results)"
     system = SystemMessage(content=(
         "You are a Web Research Agent. Summarise the scholarly search results below into "
         "structured research notes relevant to the query. Cite the source for each finding "
