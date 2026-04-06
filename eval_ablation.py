@@ -11,7 +11,8 @@ Runs all 4 test queries under 5 configurations and writes a comparison CSV:
 For each configuration x query, reports:
   - node_count, source_diversity, entity_recall (from eval_graph)
   - loop_count, cap_hit
-  - wall_time_s, total_tokens, cost_usd (from perf wrapper)
+  - wall_time_s measured by this script, plus total_tokens and cost_usd
+    estimated via count_tokens() over concatenated text and estimate_cost()
 
 RAGAS metrics are NOT run in ablation (too slow / expensive for 20 runs).
 Run eval_ragas.py separately on full and baseline only.
