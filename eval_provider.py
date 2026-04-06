@@ -243,8 +243,11 @@ class EvalConfig:
                 OpenAIEmbeddings(openai_api_key=self._jk())
             )
         else:
-            from langchain_huggingface import HuggingFaceEmbeddings
             from ragas.embeddings import LangchainEmbeddingsWrapper
+            try:
+                from langchain_huggingface import HuggingFaceEmbeddings
+            except ImportError:
+                from langchain_community.embeddings import HuggingFaceEmbeddings
             emb = LangchainEmbeddingsWrapper(
                 HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
             )
