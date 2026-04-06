@@ -556,7 +556,7 @@ def _embeddings(cfg: ProviderConfig):
             google_api_key=cfg.api_key, model="models/text-embedding-004"
         )
     else:  # Claude or Local — use a free local model via sentence-transformers
-        from langchain_huggingface import HuggingFaceEmbeddings
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
