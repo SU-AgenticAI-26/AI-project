@@ -963,7 +963,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
 
     query        = state["query"]
     results_text = []
-    errors       = []   # API failures tracked separately — not fed to the LLM as content
+    errors       = []   # API failures tracked separately and may be surfaced later in fallback/reporting content
     indexed      = 0
     sources_used = []
 
