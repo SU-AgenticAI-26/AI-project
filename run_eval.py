@@ -71,7 +71,7 @@ PASS_THRESHOLDS = {
 }
 
 
-def check_pass(results: list[dict], metric: str, threshold: float) -> tuple[float, bool]:
+def check_pass(results: list[dict], metric: str, threshold: float) -> tuple[float | None, bool | None]:
     vals = [r[metric] for r in results if r.get(metric) is not None]
     if not vals:
         return None, None
