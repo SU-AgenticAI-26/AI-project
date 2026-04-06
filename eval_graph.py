@@ -95,11 +95,22 @@ def compute_graph_metrics(knowledge_map: dict, merged_context: str) -> dict:
     edge_pairs: dict[tuple, set] = {}
     for ed in edges:
         pair = (ed.get("source", ""), ed.get("target", ""))
-        rev  = (pair[1], pair[0])
-        if rev in edge_pairs:
-            edge_pairs[rev].add(ed.get("relation", ""))
-    contradictions = sum(1 for _, rels in edge_pairs.items() if len(rels) > 1)
+        edge_pairs.setdefault(pair, set()).add(ed.get("relation", ""))
 
+    contradictions = 0
+    counted_pairs = set()
+    for pair, rels in edge_pairs.items():
+        rev = (pair[1], pair[0])
+        if pair == rev or rev not in edge_pairs:
+            continue
+
+        unordered_pair = tuple(sorted((pair, rev)))
+        if unordered_pair in counted_pairs:
+            continue
+
+        if rels != edge_pairs[rev]:
+            contradictions += 1
+        counted_pairs.add(unordered_pair)
     return {
         "node_count":             n,
         "edge_count":             e,
