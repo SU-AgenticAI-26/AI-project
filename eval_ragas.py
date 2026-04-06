@@ -74,17 +74,20 @@ async def evaluate_single(
     # Generous timeout for local/slow judge models; avoids silent nan scores.
     run_cfg = RunConfig(timeout=300, max_retries=1, max_wait=10)
 
-    result = evaluate(
-        dataset=dataset,
-        metrics=[
-            Faithfulness(llm=ragas_llm),
-            ResponseRelevancy(llm=ragas_llm, embeddings=ragas_emb),
-            LLMContextPrecisionWithoutReference(llm=ragas_llm),
-        ],
-        run_config=run_cfg,
-    )
-    df = result.to_pandas()
-    row = df.iloc[0]
+    def _run_ragas_evaluation():
+        result = evaluate(
+            dataset=dataset,
+            metrics=[
+                Faithfulness(llm=ragas_llm),
+                ResponseRelevancy(llm=ragas_llm, embeddings=ragas_emb),
+                LLMContextPrecisionWithoutReference(llm=ragas_llm),
+            ],
+            run_config=run_cfg,
+        )
+        df = result.to_pandas()
+        return df.iloc[0]
+
+    row = await asyncio.to_thread(_run_ragas_evaluation)
     return {
         "faithfulness":       round(float(row.get("faithfulness", 0)), 4),
         "response_relevancy": round(float(row.get("response_relevancy", 0)), 4),
