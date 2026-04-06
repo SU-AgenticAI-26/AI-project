@@ -338,7 +338,7 @@ def estimate_cost(
     """
     Estimate USD cost from token counts and a provider pricing dict.
 
-    If output_tokens is omitted, applies a 20 % output-fraction heuristic
+    If output_tokens is omitted, applies a 25 % output-fraction heuristic
     (i.e. output ≈ 25 % of input).
     """
     if output_tokens is None:

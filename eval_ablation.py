@@ -33,7 +33,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from test_queries import TEST_QUERIES, run_pipeline, INITIAL_STATE_TEMPLATE
+from test_queries import TEST_QUERIES, run_pipeline
 from eval_graph import compute_graph_metrics
 from eval_baseline import run_baseline_query
 from eval_provider import EvalConfig, add_provider_args, cfg_from_args, count_tokens, estimate_cost

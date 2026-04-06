@@ -93,7 +93,10 @@ def _add_project_to_path():
     import logging
     logging.getLogger("streamlit").setLevel(logging.ERROR)
 
-    candidates = [
+    candidates = []
+    if os.environ.get("PROJECT_DIR"):
+        candidates.append(Path(os.environ["PROJECT_DIR"]))
+    candidates += [
         Path(__file__).parent.parent / "AI-project-main",
         Path(__file__).parent.parent / "project_src" / "AI-project-main",
         Path.cwd() / "AI-project-main",
@@ -106,7 +109,8 @@ def _add_project_to_path():
             return str(p)
     raise FileNotFoundError(
         "Cannot find streamlit_app.py. Run eval scripts from the project root "
-        "or set PROJECT_DIR environment variable."
+        "or set the PROJECT_DIR environment variable to the directory containing "
+        "streamlit_app.py."
     )
 
 
@@ -204,9 +208,10 @@ def run_pipeline(
 
         if force_channels is not None:
             _orig_router = _sa.router_agent
+            lm_r = _sa._llm(app_cfg, 0.0)
 
-            def _patched_router(state, model):
-                result = _orig_router(state, model)
+            def _patched_router(state):
+                result = _orig_router(state, lm_r)
                 result["active_agents"] = force_channels
                 result["router_reasoning"] = f"[FORCED for ablation: {force_channels}]"
                 return result
@@ -215,9 +220,10 @@ def run_pipeline(
 
         if disable_critic:
             _orig_critic = _sa.critic_agent
+            lm_c = _sa._llm(app_cfg, 0.0)
 
-            def _patched_critic(state, model):
-                result = _orig_critic(state, model)
+            def _patched_critic(state):
+                result = _orig_critic(state, lm_c)
                 result["_needs_more"] = False  # always approve
                 return result
 
