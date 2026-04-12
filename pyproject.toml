@@ -32,8 +32,9 @@ dependencies = [
 [project.optional-dependencies]
 # Install with: uv sync --extra eval   OR   pip install -r requirements-eval.txt
 eval = [
-    "ragas",
-    "deepeval",
+    # eval_provider.py requires ragas 0.4+ module paths (ragas.llms.base etc.)
+    "ragas>=0.4,<0.5",
+    "deepeval>=1,<2",
     "tiktoken>=0.5.0",
 ]
 

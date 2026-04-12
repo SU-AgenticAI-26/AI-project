@@ -1973,7 +1973,7 @@ def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 # ── 6. Knowledge Mapper ───────────────────────────────────────────────────────
 def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
-    # The Orchestrator labels each claim inline: [VectorDB], [SQL], [Web].
+    # The Orchestrator labels each claim inline: [VectorDB], [SQL], [Web], [Extraction].
     # Pass that mapping to the LLM so nodes can be attributed to the correct source.
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
@@ -2017,40 +2017,36 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
 def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     nodes = state['knowledge_map'].get('nodes', [])
     edges = state['knowledge_map'].get('edges', [])
-    types = {n.get('type') for n in nodes if isinstance(n, dict) and n.get('type')}
-    system = SystemMessage(content=(
-        "You are a Critic Agent reviewing a knowledge graph. "
-        "Respond with needs_more=true only if ANY of these structural problems exist:\n"
-        "  1. Fewer than 8 nodes (graph is too sparse)\n"
-        "  2. Fewer than 4 edges (almost no relationships captured)\n"
-        "  3. Fewer than 2 distinct node types (lacks conceptual variety)\n"
-        "Otherwise respond needs_more=false. "
-        'Only JSON: {"needs_more": bool, "feedback": "str"}'
-    ))
-    resp = model.invoke([system, HumanMessage(content=(
-        f"Node count: {len(nodes)}\n"
-        f"Edge count: {len(edges)}\n"
-        f"Distinct node types: {sorted(types)}\n"
-        f"Node labels: {[n.get('label', '') for n in nodes if isinstance(n, dict)]}"
-    ))])
-    raw = resp.content.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
-    try:
-        result = json.loads(raw)
-    except Exception:
-        result = {"needs_more": False, "feedback": ""}
+    # Normalise to lowercase strings so "Concept" and "concept" don't count twice.
+    types = {
+        t.lower() for n in nodes
+        if isinstance(n, dict)
+        for t in [n.get('type', '')]
+        if isinstance(t, str) and t
+    }
 
-    needs = result.get("needs_more", False)
+    # All three criteria are structural facts — compute deterministically in Python
+    # rather than asking an LLM, which adds latency/tokens and can misparse output.
+    failures = []
+    if len(nodes) < 8:
+        failures.append(f"only {len(nodes)} nodes (need ≥ 8)")
+    if len(edges) < 4:
+        failures.append(f"only {len(edges)} edges (need ≥ 4)")
+    if len(types) < 2:
+        failures.append(f"only {len(types)} distinct node type(s) (need ≥ 2)")
+
+    needs = bool(failures)
+    feedback = "Needs enrichment: " + "; ".join(failures) if failures else "Graph meets structural requirements."
+
     return {
-        "critique":    result.get("feedback", ""),
+        "critique":    feedback,
         "_needs_more": needs,
         "loop_count":  state.get("loop_count", 0) + 1,
         "messages":    [AIMessage(content=f"[Critic] needs_more={needs}")],
         "activity_log": [{
             "agent": "critic", "icon": "🧐",
             "title": f"Critic — {'needs enrichment' if needs else 'approved'}",
-            "detail": result.get("feedback", "Graph looks sufficient."), "ts": _stamp(),
+            "detail": feedback, "ts": _stamp(),
         }],
         "current_agent": "critic",
     }

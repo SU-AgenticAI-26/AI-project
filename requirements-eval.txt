@@ -9,8 +9,10 @@
 -r requirements.txt
 
 # ── LLM-as-judge evaluation frameworks ───────────────────────────────────────
-ragas
-deepeval
+# eval_provider.py imports from ragas.llms.base and ragas.embeddings.base,
+# which require ragas 0.4+.  Cap at <0.5 to avoid breaking API changes.
+ragas>=0.4,<0.5
+deepeval>=1,<2
 
 # ── Token counting (eval_provider.py cost estimates) ─────────────────────────
 tiktoken>=0.5.0
