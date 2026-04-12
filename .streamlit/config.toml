@@ -1,0 +1,7 @@
+[server]
+# Disable the file-system watcher to suppress spurious "No module named torchvision"
+# warnings emitted at startup. These occur because Streamlit's watcher inspects
+# __path__ on every imported module, which triggers transformers' lazy importer and
+# causes it to attempt importing optional vision backends that aren't installed.
+# Hot-reload is not needed for this app; restart the server to pick up code changes.
+fileWatcherType = "none"

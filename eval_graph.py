@@ -4,7 +4,8 @@ eval_graph.py — Knowledge graph quality evaluation.
 Metrics (all computed without external API calls):
   - node_count:       Number of nodes. Target: 8-25.
   - edge_count:       Number of edges.
-  - source_diversity: Fraction of nodes from more than one source channel.
+  - source_diversity: 1 - (largest single-source share). 0 = all nodes from one source;
+                      higher values mean more even distribution across sources. Pass: >= 0.3.
   - type_coverage:    Fraction of node types present (concept/entity/fact/process).
   - edge_density:     edges / (nodes * (nodes-1)) — measures graph connectivity.
   - entity_recall:    Fraction of KG node labels appearing in merged_context.

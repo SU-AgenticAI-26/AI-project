@@ -1973,13 +1973,23 @@ def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 # ── 6. Knowledge Mapper ───────────────────────────────────────────────────────
 def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
+    # The Orchestrator labels each claim inline: [VectorDB], [SQL], [Web], [Extraction].
+    # Pass that mapping to the LLM so nodes can be attributed to the correct source.
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
-        "Return ONLY valid JSON:\n"
-        '{"nodes": [{"id":"str","label":"str","type":"concept|entity|fact|process",'
-        '"source":"vector_db|sql_db|web|merged"}],'
-        '"edges": [{"source":"str","target":"str","relation":"str","weight":0.1}]}\n'
-        "Include 12–20 nodes. No text outside JSON."
+        "The context labels each claim with its origin: [VectorDB], [SQL], [Web], or [Extraction]. "
+        "Use those labels to set each node's \"source\" field:\n"
+        "  [VectorDB]   → \"vector_db\"\n"
+        "  [SQL]        → \"sql_db\"\n"
+        "  [Web]        → \"web\"\n"
+        "  [Extraction] → \"merged\"\n"
+        "  no label     → \"merged\"\n\n"
+        "Return ONLY valid JSON (no markdown, no extra text):\n"
+        '{"nodes": [{"id":"str","label":"str","type":"concept","source":"vector_db"}],'
+        '"edges": [{"source":"str","target":"str","relation":"str","weight":0.5}]}\n'
+        "\"type\" must be exactly one of: concept, entity, fact, process.\n"
+        "\"source\" must be exactly one of: vector_db, sql_db, web, merged.\n"
+        "Include 12–20 nodes."
     ))
     resp = model.invoke([system, HumanMessage(
         content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"
@@ -2005,35 +2015,38 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 # ── 7. Critic ─────────────────────────────────────────────────────────────────
 def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
-    system = SystemMessage(content=(
-        "You are a Critic Agent. If the knowledge map has fewer than 8 nodes OR "
-        "key source diversity is missing, respond: "
-        '{\"needs_more\": true, \"feedback\": \"specific gaps\"}. '
-        'Otherwise: {\"needs_more\": false, \"feedback\": \"\"}. Only JSON.'
-    ))
-    resp = model.invoke([system, HumanMessage(content=(
-        f"Nodes: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}\n"
-        f"Sources: {list({n.get('source','?') for n in state['knowledge_map'].get('nodes',[])})}\n"
-        f"Edges: {len(state['knowledge_map'].get('edges',[]))}"
-    ))])
-    raw = resp.content.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
-    try:
-        result = json.loads(raw)
-    except Exception:
-        result = {"needs_more": False, "feedback": ""}
+    nodes = state['knowledge_map'].get('nodes', [])
+    edges = state['knowledge_map'].get('edges', [])
+    # Normalise to lowercase strings so "Concept" and "concept" don't count twice.
+    types = {
+        t.lower() for n in nodes
+        if isinstance(n, dict)
+        for t in [n.get('type', '')]
+        if isinstance(t, str) and t
+    }
 
-    needs = result.get("needs_more", False)
+    # All three criteria are structural facts — compute deterministically in Python
+    # rather than asking an LLM, which adds latency/tokens and can misparse output.
+    failures = []
+    if len(nodes) < 8:
+        failures.append(f"only {len(nodes)} nodes (need ≥ 8)")
+    if len(edges) < 4:
+        failures.append(f"only {len(edges)} edges (need ≥ 4)")
+    if len(types) < 2:
+        failures.append(f"only {len(types)} distinct node type(s) (need ≥ 2)")
+
+    needs = bool(failures)
+    feedback = "Needs enrichment: " + "; ".join(failures) if failures else "Graph meets structural requirements."
+
     return {
-        "critique":    result.get("feedback", ""),
+        "critique":    feedback,
         "_needs_more": needs,
         "loop_count":  state.get("loop_count", 0) + 1,
         "messages":    [AIMessage(content=f"[Critic] needs_more={needs}")],
         "activity_log": [{
             "agent": "critic", "icon": "🧐",
             "title": f"Critic — {'needs enrichment' if needs else 'approved'}",
-            "detail": result.get("feedback", "Graph looks sufficient."), "ts": _stamp(),
+            "detail": feedback, "ts": _stamp(),
         }],
         "current_agent": "critic",
     }

@@ -1,0 +1,44 @@
+[project]
+name = "ai-research-assistant"
+version = "0.1.0"
+description = "Multi-agent AI research assistant using LangGraph, Claude, and Streamlit"
+requires-python = ">=3.11"
+dependencies = [
+    # ── Core application ───────────────────────────────────────────────────────
+    "streamlit>=1.32.0",
+    "langgraph~=1.1",
+    "requests>=2.31.0",
+
+    # ── LangChain stack ────────────────────────────────────────────────────────
+    "langchain-core~=1.2",
+    "langchain-openai~=1.1",           # ChatOpenAI + OpenAIEmbeddings
+    "langchain-community~=0.4",        # FAISS vectorstore + HuggingFaceEmbeddings
+    "langchain-text-splitters~=1.1",   # RecursiveCharacterTextSplitter
+
+    # ── Vector store ───────────────────────────────────────────────────────────
+    "faiss-cpu>=1.7.0",
+
+    # ── Embeddings (local / Claude provider) ──────────────────────────────────
+    "sentence-transformers>=2.2.0",    # HuggingFace all-MiniLM-L6-v2
+
+    # ── Visualisation ──────────────────────────────────────────────────────────
+    "pyvis>=0.3.2",                    # Interactive knowledge-graph network view
+
+    # ── Optional LLM providers ────────────────────────────────────────────────
+    "langchain-anthropic~=1.4",
+    "langchain-google-genai~=4.2",
+]
+
+[project.optional-dependencies]
+# Install with: uv sync --extra eval   OR   pip install -r requirements-eval.txt
+eval = [
+    # eval_provider.py requires ragas 0.4+ module paths (ragas.llms.base etc.)
+    "ragas>=0.4,<0.5",
+    "deepeval>=1,<2",
+    "tiktoken>=0.5.0",
+]
+
+[tool.uv]
+# This is an application, not a library — uv should not try to build/install it
+# as a package.
+package = false
