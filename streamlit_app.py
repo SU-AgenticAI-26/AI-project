@@ -56,6 +56,8 @@ import tempfile
 import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
+import zipfile
+import io
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -65,6 +67,18 @@ from typing import Annotated, List, Optional, TypedDict
 import requests
 import streamlit as st
 from pyvis.network import Network
+
+# Conference paper search integration
+try:
+    from conference_paper_search import (
+        SEARCH_PAPERS_TOOL,
+        handle_conference_paper_tool_call,
+        OPENREVIEW_CONFERENCES,
+        ACL_CONFERENCES,
+    )
+    HAS_CONFERENCE_SEARCH = True
+except ImportError:
+    HAS_CONFERENCE_SEARCH = False
 
 from langchain_core.documents import Document
 from langchain_core.language_models import BaseChatModel
@@ -117,33 +131,119 @@ class ProviderConfig:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# TOOL DEFINITIONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# VectorDB Search Tool — used by vector_db_agent for LLM-driven decisions
+SEARCH_VECTORDB_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_vectordb",
+        "description": (
+            "Search the Vector Database for relevant documents, papers, or indexed content. "
+            "Use this when you need to find information from previously indexed documents, "
+            "web search results, or uploaded files. Returns matching documents with source metadata."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to find relevant documents. Keep it concise (1-10 words)."
+                },
+                "top_k": {
+                    "type": "integer",
+                    "description": "Number of top results to retrieve. Default: 5. Range: 1-20."
+                },
+                "filter_source": {
+                    "type": "string",
+                    "enum": ["web_search", "arxiv", "openalex", "crossref", "semantic_scholar", "conference", "uploaded"],
+                    "description": "Optional: filter results by source type. Omit to search all sources."
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+# SQL DB Search Tool — used by sql_db_agent for LLM-driven decisions
+SEARCH_SQLDB_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "search_sqldb",
+        "description": (
+            "Search the SQL database for structured facts, topics, and relationships. "
+            "Use this to find structured knowledge about specific topics, entities, and their relationships. "
+            "Returns matching topics, relationships, and facts with categories and sources."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The search query to find topics, relationships, or facts. Use short, focused terms."
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum number of results to retrieve. Default: 10. Range: 1-20."
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # AGENT STATE
 # ══════════════════════════════════════════════════════════════════════════════
 
 class AgentState(TypedDict):
     messages:              Annotated[List, operator.add]
     query:                 str
+
+    # ── Scoping ───────────────────────────────────────────────────────────────
+    sub_questions:         List[str]      # 3-5 decomposed questions
+    keywords:              List[str]      # 4-8 key themes
+    scoping_reasoning:     str
+
+    # ── Router ────────────────────────────────────────────────────────────────
     active_agents:         List[str]
     router_reasoning:      str
+
+    # ── Retrieval ─────────────────────────────────────────────────────────────
     vector_findings:       str
     sql_findings:          str
     web_findings:          str
+
+    # ── Extraction + merge ────────────────────────────────────────────────────
     extraction_findings:   str
-    activity_log:          Annotated[List, operator.add]
     merged_context:        str
+    synthesis_report:      str            # optional thematic synthesis
+
+    # ── Knowledge graph ───────────────────────────────────────────────────────
     knowledge_map:         dict
+
+    # ── Critic loop ───────────────────────────────────────────────────────────
     critique:              str
-    loop_count:            int
-    summary:               str
-    experiment_plan:       str
-    current_agent:         str
     _needs_more:           bool
-    # ── Scoping Agent fields ──────────────────────────────────────────────────
-    sub_questions:         List[str]
-    search_keywords:       List[str]
-    scoping_summary:       str
-    # ── Synthesis Agent field ─────────────────────────────────────────────────
-    synthesis_report:      str
+    loop_count:            int
+
+    # ── Conflict detection (Block 3) ──────────────────────────────────────────
+    conflicts:             List[dict]     # [{topic, claim_a, source_a, claim_b, source_b, resolution}]
+    credibility_map:       dict           # {source: {label, score}}
+
+    # ── Final outputs ─────────────────────────────────────────────────────────
+    summary:               str
+    citation_grounding:    dict           # {citation: {grounded, source, evidence}}
+    grounding_score:       float          # 0.0-1.0
+    experiment_plan:       str
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    activity_log:          Annotated[List, operator.add]
+    current_agent:         str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -242,6 +342,203 @@ def session_list() -> list[dict]:
         except Exception:
             pass
     return sorted(out, key=lambda x: x["updated"], reverse=True)
+
+# ╭─ BLOCK 4: EXPORT (MARKDOWN + BIBTEX) ─────────────────────────────────────
+
+def extract_bibtex_entries(extraction_findings: str, web_findings: str) -> tuple[str, list[dict]]:
+    """
+    Extract paper metadata from extraction findings and generate BibTeX entries.
+    Returns (bibtex_str, papers_list).
+    """
+    bibtex_entries = []
+    papers = []
+    
+    # Parse extraction findings for paper records
+    # Expected format from reading_extraction_agent: structured per-paper records
+    lines = extraction_findings.split('\n')
+    
+    current_paper = {}
+    counter = 1
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Try to extract title (usually first substantive line)
+        if line.startswith('Title:') or line.startswith('**Title'):
+            title = re.sub(r'\*\*|Title:\s*', '', line).strip()
+            if title and len(title) > 5:
+                current_paper['title'] = title
+        
+        # Extract authors/source info
+        if 'author' in line.lower() or 'source:' in line.lower():
+            current_paper['author'] = re.sub(r'[*_]|Author[s]*:|Source:', '', line).strip()[:100]
+        
+        # Try to get year from extraction or default to current
+        if re.search(r'\b(20\d{2})\b', line):
+            year = re.search(r'\b(20\d{2})\b', line).group(1)
+            current_paper['year'] = year
+    
+    # Also extract from web_findings if available
+    for match in re.finditer(r'Title:\s*([^(]+)\(([^)]+)\)', web_findings):
+        title = match.group(1).strip()
+        source_info = match.group(2).strip()
+        
+        paper = {
+            'title': title,
+            'author': source_info.split(',')[0] if ',' in source_info else 'Unknown',
+            'year': re.search(r'20\d{2}', source_info).group(0) if re.search(r'20\d{2}', source_info) else '2024',
+            'url': '',
+        }
+        papers.append(paper)
+    
+    # Generate BibTeX
+    bibtex_str = "% Bibliography generated by Collaborative RAG\n"
+    bibtex_str += f"% Generated: {_stamp()}\n\n"
+    
+    if not papers:
+        papers = [
+            {
+                'title': 'Literature Review Results',
+                'author': 'Collaborative RAG System',
+                'year': '2024',
+                'url': '',
+            }
+        ]
+    
+    for i, paper in enumerate(papers[:50], 1):  # Max 50 entries
+        title = paper.get('title', f'Paper {i}').replace('"', '\\"')
+        author = paper.get('author', 'Anonymous').replace('"', '\\"')
+        year = paper.get('year', '2024')
+        
+        # Create sanitized key
+        key = f"ref{i:03d}"
+        
+        bibtex_str += (
+            f"@article{{{key},\n"
+            f'  title="{title}",\n'
+            f'  author="{author}",\n'
+            f'  year="{year}"\n'
+            f"}}\n\n"
+        )
+    
+    return bibtex_str, papers
+
+def generate_markdown_report(
+    query: str,
+    sub_questions: list[str],
+    keywords: list[str],
+    summary: str,
+    experiment_plan: str,
+    extraction_findings: str,
+    knowledge_map: dict,
+) -> str:
+    """Generate a complete markdown literature review document."""
+    
+    md = f"# Literature Review: {query}\n\n"
+    md += f"**Generated**: {_stamp()}\n\n"
+    
+    # Query understanding
+    md += "## Research Question Decomposition\n\n"
+    md += f"**Primary Query**: {query}\n\n"
+    
+    if sub_questions:
+        md += "### Sub-Questions\n"
+        for i, q in enumerate(sub_questions[:5], 1):
+            md += f"{i}. {q}\n"
+        md += "\n"
+    
+    if keywords:
+        md += "### Key Themes\n"
+        md += ", ".join([f"`{k}`" for k in keywords[:8]]) + "\n\n"
+    
+    # Literature summary
+    md += "## Literature Summary\n\n"
+    md += summary.strip() + "\n\n"
+    
+    # Structured findings
+    md += "## Structured Findings\n\n"
+    if extraction_findings.strip():
+        md += extraction_findings.strip() + "\n\n"
+    
+    # Knowledge map overview
+    if knowledge_map.get('nodes'):
+        md += "## Knowledge Structure\n\n"
+        md += f"**Nodes Identified**: {len(knowledge_map.get('nodes', []))}\n"
+        md += f"**Relationships**: {len(knowledge_map.get('edges', []))}\n\n"
+        
+        md += "### Key Concepts\n"
+        for node in knowledge_map.get('nodes', [])[:15]:
+            label = node.get('label', 'Unknown')
+            node_type = node.get('type', 'concept')
+            md += f"- **{label}** ({node_type})\n"
+        md += "\n"
+    
+    # Research plan
+    md += "## Proposed Research Direction\n\n"
+    if experiment_plan.strip():
+        md += experiment_plan.strip() + "\n\n"
+    
+    # Footer
+    md += "---\n"
+    md += "_This literature review was generated using a multi-agent retrieval system._\n"
+    md += "_Powered by: Vector DB + SQL DB + Web APIs + LLM synthesis_\n"
+    
+    return md
+
+def create_export_zip(
+    query: str,
+    full_state: dict,
+) -> tuple[bytes, str]:
+    """
+    Create a .zip file containing markdown report + bibtex bibliography.
+    Returns (zip_bytes, filename).
+    """
+    import io
+    import zipfile
+    
+    # Generate content
+    markdown = generate_markdown_report(
+        query=query,
+        sub_questions=full_state.get("sub_questions", []),
+        keywords=full_state.get("keywords", []),
+        summary=full_state.get("summary", ""),
+        experiment_plan=full_state.get("experiment_plan", ""),
+        extraction_findings=full_state.get("extraction_findings", ""),
+        knowledge_map=full_state.get("knowledge_map", {}),
+    )
+    
+    bibtex, papers = extract_bibtex_entries(
+        extraction_findings=full_state.get("extraction_findings", ""),
+        web_findings=full_state.get("web_findings", ""),
+    )
+    
+    # Create zip in memory
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
+        # Add markdown
+        clean_query = re.sub(r'[^a-z0-9\s]', '', query.lower())[:50]
+        md_filename = f"literature_review_{clean_query[:30]}.md"
+        zipf.writestr(md_filename, markdown)
+        
+        # Add bibtex
+        bib_filename = f"bibliography_{clean_query[:30]}.bib"
+        zipf.writestr(bib_filename, bibtex)
+        
+        # Add metadata
+        metadata = {
+            "query": query,
+            "generated_at": _stamp(),
+            "papers_count": len(papers),
+            "files": [md_filename, bib_filename],
+        }
+        zipf.writestr("metadata.json", json.dumps(metadata, indent=2))
+    
+    zip_buffer.seek(0)
+    filename = f"literature_review_{_hash(query)}.zip"
+    
+    return zip_buffer.getvalue(), filename
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -579,171 +876,217 @@ def _embedding_key(cfg: ProviderConfig) -> str:
 # AGENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SCOPING AGENT  (Layer 1 — runs before Router)
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ╭─ BLOCK 1: QUERY SCOPING (UI EXPLICITNESS) ──────────────────────────────────
 def scoping_agent(state: AgentState, model: BaseChatModel) -> dict:
     """
-    First agent in the pipeline.
-    Reads:  state['query']
-    Writes: state['sub_questions'], state['search_keywords'], state['scoping_summary']
-    Decomposes the raw query so Router and retrieval agents get richer context.
+    Extract sub-questions and keywords from user query.
+    Makes query understanding visible to users before results appear.
     """
     system = SystemMessage(content=(
-        "You are a Scoping Agent. Analyse the research query and decompose it.\n\n"
-        "Return ONLY valid JSON with exactly these fields:\n"
-        "{\n"
-        '  "sub_questions": [<3 to 5 strings — distinct aspects of the topic>],\n'
-        '  "search_keywords": [<4 to 8 strings — concise academic search terms>],\n'
-        '  "scoping_summary": "<one sentence describing what this query is really asking>"\n'
-        "}\n\n"
-        "Rules:\n"
-        "- sub_questions must each address a DIFFERENT facet of the topic\n"
-        "- search_keywords should be short (1-3 words each), suitable for API queries\n"
-        "- Do not include any text outside the JSON"
+        "You are a Query Scoping Agent. Decompose the user's query into:\n"
+        "1. 3–5 focused sub-questions that break down the research\n"
+        "2. 4–8 key terms/themes for retrieval\n"
+        "Return ONLY JSON:\n"
+        '{"sub_questions": ["q1", "q2", ...], "keywords": ["k1", "k2", ...], "reasoning": "brief explain"}\n'
+        "No other text or markdown."
     ))
-    resp = model.invoke([system, HumanMessage(content=f"Research query: {state['query']}")])
-    raw = resp.content.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
+    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}")])
+    raw = resp.content.strip().lstrip("```json").rstrip("```").strip()
     try:
-        parsed          = json.loads(raw)
-        sub_questions   = parsed.get("sub_questions", [])[:5]
-        search_keywords = parsed.get("search_keywords", [])[:8]
-        scoping_summary = parsed.get("scoping_summary", "")
+        parsed = json.loads(raw)
+        subs = parsed.get("sub_questions", [])[:5]  # Max 5
+        keys = parsed.get("keywords", [])[:8]       # Max 8
+        reason = parsed.get("reasoning", "")
     except Exception:
-        sub_questions   = [state["query"]]
-        search_keywords = state["query"].lower().split()[:8]
-        scoping_summary = f"Could not parse scope for: {state['query']}"
+        subs = [state["query"]]
+        keys = state["query"].split()[:5]
+        reason = "scoping_failed"
 
     return {
-        "sub_questions":   sub_questions,
-        "search_keywords": search_keywords,
-        "scoping_summary": scoping_summary,
-        "messages":        [AIMessage(content=f"[Scoping] {scoping_summary}")],
-        "activity_log":    [{
-            "agent":  "scoping",
-            "icon":   "🔭",
-            "title":  "Scoping Agent decomposed the query",
-            "detail": (
-                f"Summary: {scoping_summary} | "
-                f"Sub-questions ({len(sub_questions)}): "
-                + " | ".join(f"({i+1}) {q}" for i, q in enumerate(sub_questions))
-                + f" | Keywords: {', '.join(search_keywords)}"
-            ),
+        "sub_questions": subs,
+        "keywords": keys,
+        "scoping_reasoning": reason,
+        "messages": [AIMessage(content=f"[Scoping] {len(subs)} sub-questions, {len(keys)} keywords")],
+        "activity_log": [{
+            "agent": "scoping",
+            "icon": "🔍",
+            "title": "Query Scoped",
+            "detail": f"→ {len(subs)} sub-questions · {len(keys)} keywords",
             "ts": _stamp(),
         }],
         "current_agent": "scoping",
     }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SYNTHESIS AGENT  (Layer 3 — sits between Critic and Summarizer)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def synthesis_agent(state: AgentState, model: BaseChatModel) -> dict:
+# ╭─ BLOCK 2: CITATION GROUNDING VALIDATOR ──────────────────────────────────
+def validate_citations(summary: str, merged_context: str, extraction_findings: str) -> tuple[dict, float]:
     """
-    Reads:  state['merged_context'], state['extraction_findings'], state['knowledge_map']
-    Writes: state['synthesis_report']
-    Produces a thematic literature review grouped by topics, methods, disagreements.
-    The Summarizer reads synthesis_report instead of raw merged_context.
+    Validate that citations in summary actually appear in retrieved context.
+    Returns (grounding_map, score) where score is 0.0-1.0.
     """
-    merged     = state.get("merged_context", "")
-    extraction = state.get("extraction_findings", "")
-    km_nodes   = [n.get("label", "") for n in state.get("knowledge_map", {}).get("nodes", [])]
+    grounding_map = {}
 
-    merged_text = merged.strip()
-    extraction_text = extraction.strip()
-    extraction_placeholders = {"NO_PAPERS_EXTRACTED", "(none)"}
-    has_merged_content = bool(merged_text)
-    has_extraction_content = bool(extraction_text) and extraction_text not in extraction_placeholders
+    # Extract potential citations from three patterns
+    citation_patterns = [
+        r'"([^"]{20,150})"',      # "quoted claims"
+        r'\(([^)]{20,150})\)',    # (parenthetical claims)
+    ]
+    citations = []
+    for pattern in citation_patterns:
+        citations.extend(re.findall(pattern, summary))
 
-    if not has_merged_content and not has_extraction_content:
-        return {
-            "synthesis_report": "(no content to synthesise)",
-            "messages":         [AIMessage(content="[Synthesis] skipped — no content")],
-            "activity_log":     [{
-                "agent":  "synthesis",
-                "icon":   "🧵",
-                "title":  "Synthesis Agent — skipped",
-                "detail": "No merged context or extraction findings available.",
-                "ts":     _stamp(),
-            }],
-            "current_agent": "synthesis",
+    # Numeric citations [1], [2] — extract surrounding sentence as the claim
+    for match in re.finditer(r'\[(\d+)\]', summary):
+        idx        = match.start()
+        sent_start = summary.rfind('.', 0, idx) + 1
+        sent_end   = summary.find('.', idx)
+        if sent_end == -1:
+            sent_end = len(summary)
+        sentence = summary[sent_start:sent_end].strip()[:150]
+        if len(sentence.split()) >= 3:
+            citations.append(sentence)
+
+    citations      = list(set(citations))[:15]   # deduplicate, cap at 15
+    context_text   = merged_context + "\n" + extraction_findings
+    context_lower  = context_text.lower()
+    grounded_count = 0
+
+    for cit in citations:
+        cit_lower = cit.lower()
+        words     = cit_lower.split()
+        if len(words) < 3:
+            continue
+
+        found_in_merged     = cit_lower in merged_context.lower()
+        found_in_extraction = cit_lower in extraction_findings.lower()
+
+        # Fallback: >60% content-word overlap
+        if not (found_in_merged or found_in_extraction):
+            content_words = [w for w in words if len(w) > 3]
+            if content_words:
+                matching = sum(1 for w in content_words if w in context_lower)
+                if matching >= len(content_words) * 0.6:
+                    found_in_merged = True
+
+        is_grounded = found_in_merged or found_in_extraction
+        if is_grounded:
+            grounded_count += 1
+            evidence = next(
+                (line.strip()[:150] for line in context_text.split('\n')
+                 if any(w in line.lower() for w in words[:3])),
+                ""
+            )
+        else:
+            evidence = ""
+
+        grounding_map[cit[:100]] = {
+            "grounded": is_grounded,
+            "source":   "merged" if found_in_merged else (
+                        "extraction" if found_in_extraction else "none"),
+            "evidence": evidence,
         }
 
+    score = grounded_count / len(citations) if citations else 1.0
+    return grounding_map, score
+
+# ╭─ CONFLICT DETECTION ────────────────────────────────────────────────────────
+
+CREDIBILITY_TIERS = {
+    "sql_db":   {"label": "peer-reviewed corpus", "score": 0.9},
+    "vector_db": {"label": "indexed papers",       "score": 0.8},
+    "web":      {"label": "web / preprints",       "score": 0.6},
+    "merged":   {"label": "consensus",             "score": 0.7},
+}
+
+def conflict_agent(state: AgentState, model: BaseChatModel) -> dict:
+    """
+    Identify conflicts/disagreements between sources in the merged context.
+    Uses LLM to read findings and spot contradictions.
+    """
+    if not state.get("merged_context") or len(state.get("merged_context", "")) < 100:
+        return {
+            "conflicts": [],
+            "credibility_map": CREDIBILITY_TIERS,
+            "messages": [AIMessage(content="[Conflict] No conflicts (insufficient context)")],
+            "activity_log": [{
+                "agent": "conflict_detector",
+                "icon": "⚡",
+                "title": "Conflict Detection",
+                "detail": "Insufficient context to identify conflicts",
+                "ts": _stamp(),
+            }],
+            "current_agent": "conflict_detector",
+        }
+    
     system = SystemMessage(content=(
-        "You are a Synthesis Agent in a multi-agent academic research assistant.\n"
-        "Produce a DEDICATED THEMATIC LITERATURE REVIEW in markdown with EXACTLY these sections:\n\n"
-        "## 1. Thematic Groups\n"
-        "Cluster all papers/findings into 2-5 coherent research themes. For each theme:\n"
-        "  - Give it a descriptive name\n"
-        "  - List which papers/sources belong to it\n"
-        "  - Summarise the shared focus and key contributions\n"
-        "  - Note trends across the group\n\n"
-        "## 2. Methodological Landscape\n"
-        "Compare the methods used across all papers. For each distinct methodology:\n"
-        "  - Name it and describe it briefly\n"
-        "  - List which papers use it\n"
-        "  - Compare strengths and weaknesses\n"
-        "  - Note whether it is dominant, emerging, or rarely used\n\n"
-        "## 3. Disagreements & Open Questions\n"
-        "Identify where papers CONTRADICT or DISAGREE. For each disagreement:\n"
-        "  - Describe what the conflict is about\n"
-        "  - Name which papers hold each position\n"
-        "  - DO NOT resolve the disagreement — preserve both viewpoints\n"
-        "  - Flag it as an open research question\n\n"
-        "Ground every claim in the evidence. Cite [VectorDB]/[SQL]/[Web]/[Extraction].\n"
-        "If evidence is sparse for a section, say so rather than fabricating."
+        "You are a Conflict Detection Agent. Read the research findings and identify any direct "
+        "contradictions or disagreements between sources.\n\n"
+        "Examples of conflicts:\n"
+        "- Source A claims 'X improves performance', Source B claims 'X has no effect'\n"
+        "- Source A says 'method requires Y parameter', Source B says 'Y parameter is optional'\n"
+        "- Source A: 'Dataset size is critical', Source B: 'Architecture matters more'\n\n"
+        "Return ONLY valid JSON (no markdown, no code blocks):\n"
+        '{"conflicts": [{"topic": "short phrase", "claim_a": "what source A says", '
+        '"source_a": "vector_db|sql_db|web", "claim_b": "what source B says", '
+        '"source_b": "vector_db|sql_db|web", "resolution": "which is more likely correct (one sentence)"}]}\n\n'
+        "If no real contradictions exist, return {\"conflicts\": []}. "
+        "Do NOT invent conflicts or over-interpret differences in terminology."
     ))
-
-    human_content = f"Research query: {state['query']}\n\nMerged evidence:\n{merged[:3000]}\n\n"
-    if extraction.strip() and extraction.strip() not in ("(none)", "NO_PAPERS_EXTRACTED"):
-        human_content += f"Per-paper extraction records:\n{extraction[:2000]}\n\n"
-    if km_nodes:
-        human_content += f"Key concepts from knowledge graph: {', '.join(km_nodes[:25])}"
-
-    resp   = model.invoke([system, HumanMessage(content=human_content)])
-    report = resp.content.strip()
-
+    
+    resp = model.invoke([system, HumanMessage(content=(
+        f"Research findings (first 4000 chars):\n\n{state['merged_context'][:4000]}"
+    ))])
+    
+    raw = resp.content.strip().lstrip("```json").rstrip("```").strip()
+    try:
+        result = json.loads(raw)
+        conflicts = result.get("conflicts", [])[:10]  # Max 10 conflicts
+    except Exception:
+        conflicts = []
+    
+    conflict_count = len(conflicts)
+    
     return {
-        "synthesis_report": report,
-        "messages":         [AIMessage(content=f"[Synthesis] {report[:120]}…")],
-        "activity_log":     [{
-            "agent":  "synthesis",
-            "icon":   "🧵",
-            "title":  "Synthesis Agent — thematic literature review generated",
-            "detail": (
-                "3 sections: Thematic Groups · Methodological Landscape · "
-                f"Disagreements & Open Questions | {len(report):,} characters"
-            ),
+        "conflicts": conflicts,
+        "credibility_map": CREDIBILITY_TIERS,
+        "messages": [AIMessage(content=f"[Conflict] {conflict_count} conflicts identified")],
+        "activity_log": [{
+            "agent": "conflict_detector",
+            "icon": "⚡",
+            "title": f"Conflict Detection — {conflict_count} issues",
+            "detail": f"Identified potential inconsistencies between sources",
             "ts": _stamp(),
         }],
-        "current_agent": "synthesis",
+        "current_agent": "conflict_detector",
     }
 
-
+# ────────────────────────────────────────────────────────────────────────────────
 def router_agent(state: AgentState, model: BaseChatModel) -> dict:
+    # ─ GAP 4 FIX: Include critic feedback if looping (enables intelligent retry)
+    critique_context = ""
+    if state.get("_needs_more"):
+        critique_context = f"\n\nPREVIOUS ATTEMPT FEEDBACK:\n{state.get('critique', 'Insufficient coverage detected.')}\nAdjust source selection strategy to address gaps."
+    
+    # ─ GAP 1 FIX: Include scoping keywords to guide routing
+    keywords_str = ", ".join(state.get("keywords", [])[:8]) or "(none extracted)"
+    sub_questions_count = len(state.get("sub_questions", []))
+    
     system = SystemMessage(content=(
-        "You are a Router Agent. Given a user query, decide which search agents to activate.\n"
+        "You are a Router Agent. Given a user query and refined scoping context, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
         "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
-    # Enrich prompt with Scoping Agent output when available
-    scope_extra = ""
-    if state.get("scoping_summary"):
-        scope_extra = (
-            f"\nScope summary: {state['scoping_summary']}"
-            f"\nSub-questions: {state.get('sub_questions', [])}"
-            f"\nSearch keywords: {state.get('search_keywords', [])}"
-        )
-    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}{scope_extra}")])
-    raw  = resp.content.strip()
-    if raw.startswith("```"):
-        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
+    
+    query_context = f"""Query: {state['query']}
+
+Scoping Context:
+- Key themes/keywords to prioritize: {keywords_str}
+- Research angles: {sub_questions_count} sub-questions identified
+
+Decide which sources would best address these angles.{critique_context}"""
+    
+    resp = model.invoke([system, HumanMessage(content=query_context)])
+    raw  = resp.content.strip().lstrip("```json").rstrip("```").strip()
     try:
         parsed = json.loads(raw)
         agents = parsed.get("agents", ["vector_db", "sql_db"])
@@ -788,7 +1131,7 @@ def web_search(query: str, limit: int = 5) -> list[dict]:
             headers={"User-Agent": "Mozilla/5.0"}
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
-            response_html = resp.read().decode("utf-8", errors="ignore")
+            html_content = resp.read().decode("utf-8", errors="ignore")
     except Exception as e:
         return [{"title": "Search error", "url": "", "snippet": str(e), "content": str(e)}]
 
@@ -796,7 +1139,7 @@ def web_search(query: str, limit: int = 5) -> list[dict]:
     results = []
     blocks = re.findall(
         r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>.*?(?:<a[^>]*class="result__snippet"|<div[^>]*class="result__snippet")[^>]*>(.*?)</',
-        response_html,
+        html_content,
         flags=re.S
     )
 
@@ -851,6 +1194,97 @@ def add_web_results_to_rag(vdb: VectorDBModule, query: str, results: list[dict])
         )
     return total_chunks
 
+def handle_vectordb_search_tool(vdb: VectorDBModule, tool_args: dict) -> str:
+    """
+    Handle VectorDB search tool calls from LLM.
+    
+    Args:
+        vdb: VectorDBModule instance
+        tool_args: dict with keys: query, top_k (optional), filter_source (optional)
+    
+    Returns:
+        JSON string with search results or error
+    """
+    try:
+        query = tool_args.get("query", "").strip()
+        top_k = tool_args.get("top_k", 5)
+        filter_source = tool_args.get("filter_source")
+        
+        if not query:
+            return json.dumps({"error": "Empty query", "results": []})
+        
+        # Execute search
+        docs = vdb.search(query, k=max(1, min(top_k, 20)))  # Clamp k to 1-20
+        
+        # Filter by source if specified
+        if filter_source and docs:
+            docs = [d for d in docs if d.metadata.get("source") == filter_source]
+        
+        # Format results
+        results = []
+        for doc in docs:
+            results.append({
+                "source": doc.metadata.get("source", "unknown"),
+                "content": doc.page_content[:500],  # First 500 chars
+                "metadata": {
+                    "title": doc.metadata.get("title", ""),
+                    "url": doc.metadata.get("url", ""),
+                    "indexed_at": doc.metadata.get("indexed_at", ""),
+                }
+            })
+        
+        return json.dumps({
+            "query": query,
+            "returned": len(results),
+            "filtered_source": filter_source,
+            "results": results,
+        }, ensure_ascii=False, indent=2)
+    
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "results": []
+        })
+
+
+def handle_sqldb_search_tool(tool_args: dict) -> str:
+    """
+    Handle SQL DB search tool calls from LLM.
+    
+    Args:
+        tool_args: dict with keys: query, max_results (optional)
+    
+    Returns:
+        JSON string with search results or error
+    """
+    try:
+        query = tool_args.get("query", "").strip()
+        max_results = tool_args.get("max_results", 10)
+        
+        if not query:
+            return json.dumps({"error": "Empty query", "results": []})
+        
+        # Execute search
+        raw_results = sql_search(query, k=max(1, min(max_results, 20)))
+        
+        # Parse results into structured format
+        results = []
+        for line in raw_results.split("\n"):
+            if line.strip():
+                results.append({"type": "text", "content": line})
+        
+        return json.dumps({
+            "query": query,
+            "returned": len(results),
+            "results": results,
+        }, ensure_ascii=False, indent=2)
+    
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "results": []
+        })
+
 def build_rag_context(vdb: VectorDBModule, query: str, k: int = 5) -> str:
     docs = vdb.search(query, k=k)
     if not docs:
@@ -878,78 +1312,328 @@ def vector_db_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule
             "vector_findings": "(not activated)",
             "messages":        [AIMessage(content="[VectorDB] skipped")],
             "activity_log":    [{
-              "agent": "vector_db", 
-              "icon": "🗂️",
-              "title": "Vector DB — skipped",
-              "detail": "Router did not activate.", 
-              "ts": _stamp()}],
+                "agent": "vector_db",
+                "icon": "🗂️",
+                "title": "Vector DB — skipped",
+                "detail": "Router did not activate.",
+                "ts": _stamp()}],
             "current_agent": "vector_db",
         }
 
-    docs = vdb.search(state["query"], k=6)
-    if not docs:
-        raw_ctx = "(no documents indexed)"
-        sources = []
-    else:
-        raw_ctx = "\n\n---\n".join(
-            f"[{d.metadata.get('source','?')}]\n{d.page_content}" for d in docs
-        )
-        sources = list({d.metadata.get("source", "?") for d in docs})
+    # Build scoping context once — used by BOTH paths
+    keywords_str = ", ".join(state.get("keywords", [])) or "(none)"
+    sub_q_str    = "\n  ".join(state.get("sub_questions", [])[:3]) or "(none)"
 
-    system = SystemMessage(content=(
-        "You are a Vector DB Search Agent. Synthesise the retrieved document chunks into "
-        "structured research notes relevant to the query. Include facts, definitions, relationships."
+    # ── FALLBACK PATH (non-OpenAI models) ────────────────────────────────────
+    if not isinstance(model, ChatOpenAI):
+        docs = vdb.search(state["query"], k=5)
+        if not docs:
+            raw_ctx = "(no documents indexed)"
+            sources = []
+        else:
+            raw_ctx = "\n\n---\n".join(
+                f"[{d.metadata.get('source','?')}]\n{d.page_content}" for d in docs
+            )
+            sources = list({d.metadata.get("source", "?") for d in docs})
+
+        system = SystemMessage(content=(
+            "You are a Vector DB Search Agent. Synthesise the retrieved document chunks into "
+            "structured research notes relevant to the query and scoping keywords."
+        ))
+        resp = model.invoke([system, HumanMessage(content=(
+            f"Query: {state['query']}\n"
+            f"Focus keywords: {keywords_str}\n"
+            f"Research angles:\n  {sub_q_str}\n\n"
+            f"Chunks:\n{raw_ctx}"
+        ))])
+
+        return {
+            "vector_findings": resp.content,
+            "messages":        [AIMessage(content=f"[VectorDB] {resp.content[:120]}…")],
+            "activity_log":    [{
+                "agent": "vector_db", "icon": "🗂️",
+                "title": "Vector DB agent (direct search)",
+                "detail": f"Retrieved {len(docs)} chunks from {len(sources)} source(s)",
+                "ts": _stamp(),
+            }],
+            "current_agent": "vector_db",
+        }
+
+    # ── TOOL-CALLING PATH (ChatOpenAI) ────────────────────────────────────────
+    # FIX: keywords and sub-questions now injected here too
+    system_prompt = SystemMessage(content=(
+        "You are a Vector DB Search Agent. You have access to a database of indexed documents, "
+        "papers, and web search results. Based on the user's query and scoping context, decide:\n"
+        "1. Whether searching the Vector DB would be helpful\n"
+        "2. What search query to use (prioritize scoped keywords if present)\n"
+        "3. How many results to retrieve (1-20)\n"
+        "4. Whether to filter by a specific source type (web_search, arxiv, conference, etc.)\n\n"
+        "Use the search_vectordb tool if you think the Vector DB has relevant information. "
+        "Otherwise, respond explaining why a search is not needed."
     ))
-    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\nChunks:\n{raw_ctx}")])
 
-    return {
-        "vector_findings": resp.content,
-        "messages":        [AIMessage(content=f"[VectorDB] {resp.content[:120]}…")],
-        "activity_log":    [{
-            "agent":  "vector_db", "icon": "🗂️", 
-            "title": "Vector DB agent",
-            "detail": f"Retrieved {len(docs)} chunks from {len(sources)} source(s): {', '.join(sources) or 'none'}",
-            "chunks": [{"source": d.metadata.get("source","?"), "text": d.page_content[:200]+"…"} for d in docs],
-            "ts": _stamp(),
-        }],
-        "current_agent": "vector_db",
-    }
+    # FIX: was using raw state["query"] only — now includes scoping context
+    query_message = HumanMessage(content=(
+        f"User Query: {state['query']}\n\n"
+        f"Scoping keywords (use to refine search): {keywords_str}\n\n"
+        f"Research angles to address:\n  {sub_q_str}\n\n"
+        f"Decide whether and how to search Vector DB for relevant documents."
+    ))
 
+    try:
+        response = model.invoke(
+            [system_prompt, query_message],
+            tools=[SEARCH_VECTORDB_TOOL],
+            tool_choice="auto"
+        )
+
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            docs_found     = []
+            tool_reasoning = []
+
+            for tool_call in response.tool_calls:
+                if tool_call.function.name == "search_vectordb":
+                    try:
+                        tool_args   = json.loads(tool_call.function.arguments)
+                        tool_result = handle_vectordb_search_tool(vdb, tool_args)
+                        result_data = json.loads(tool_result)
+
+                        if result_data.get("results"):
+                            docs_found.extend(result_data["results"])
+                            tool_reasoning.append(
+                                f"Searched '{result_data.get('query')}' "
+                                f"→ {result_data.get('returned')} results"
+                            )
+                    except Exception as e:
+                        tool_reasoning.append(f"Tool error: {e}")
+
+            if docs_found:
+                formatted_docs = "\n\n---\n".join(
+                    f"[{d['source']}] {d['content']}" for d in docs_found[:6]
+                )
+                synthesis_resp = model.invoke([
+                    SystemMessage(content=(
+                        "Synthesise the retrieved VectorDB documents into structured research notes. "
+                        "Preserve source information and organise findings clearly."
+                    )),
+                    HumanMessage(content=(
+                        f"Query: {state['query']}\n"
+                        f"Focus keywords: {keywords_str}\n\n"
+                        f"Documents:\n{formatted_docs}"
+                    ))
+                ])
+                vector_findings = synthesis_resp.content
+            else:
+                vector_findings = "(No relevant documents found in Vector DB)"
+
+            sources = list({d['source'] for d in docs_found})
+
+            return {
+                "vector_findings": vector_findings,
+                "messages":        [AIMessage(content=f"[VectorDB] {len(sources)} source(s), {len(docs_found)} docs")],
+                "activity_log":    [{
+                    "agent": "vector_db", "icon": "🗂️",
+                    "title": "Vector DB agent (tool-driven)",
+                    "detail": f"{'; '.join(tool_reasoning) or 'no results'}",
+                    "docs_found": len(docs_found),
+                    "sources": sources,
+                    "ts": _stamp(),
+                }],
+                "current_agent": "vector_db",
+            }
+
+        else:
+            # LLM decided not to search
+            llm_decision = getattr(response, 'content', str(response))
+            return {
+                "vector_findings": f"(Vector DB search not needed: {llm_decision[:200]})",
+                "messages":        [AIMessage(content="[VectorDB] Skipped (LLM decision)")],
+                "activity_log":    [{
+                    "agent": "vector_db", "icon": "🗂️",
+                    "title": "Vector DB agent (LLM decision)",
+                    "detail": f"No search needed: {llm_decision[:100]}",
+                    "ts": _stamp(),
+                }],
+                "current_agent": "vector_db",
+            }
+
+    except Exception as e:
+        return {
+            "vector_findings": f"(Vector DB error: {str(e)[:100]})",
+            "messages":        [AIMessage(content=f"[VectorDB] Error: {str(e)[:50]}")],
+            "activity_log":    [{
+                "agent": "vector_db", "icon": "🗂️",
+                "title": "Vector DB agent (error)",
+                "detail": f"Tool execution failed: {str(e)[:100]}",
+                "ts": _stamp(),
+            }],
+            "current_agent": "vector_db",
+        }
 
 def sql_db_agent(state: AgentState, model: BaseChatModel) -> dict:
+    """
+    SQL Database Search Agent with LLM-driven decision making.
+    
+    Uses tool calling to allow LLM to decide:
+    - Whether to query the SQL database
+    - What query to execute
+    - How many results to retrieve
+    """
     if "sql_db" not in state.get("active_agents", []):
         return {
             "sql_findings": "(not activated)",
             "messages":     [AIMessage(content="[SQLDB] skipped")],
             "activity_log": [{
               "agent": "sql_db", "icon": "🗄️",
-              "title": "SQL DB — skipped","detail": "Router did not activate.", 
+              "title": "SQL DB — skipped",
+              "detail": "Router did not activate.", 
               "ts": _stamp()}],
             "current_agent": "sql_db",
         }
 
-    raw  = sql_search(state["query"], k=10)
-    rows = [l for l in raw.split("\n") if l.strip()]
-    system = SystemMessage(content=(
-        "You are a SQL Database Agent. Given a query and raw SQL results "
-        "(topics, relationships, facts), extract the most relevant structured information."
-    ))
-    resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\n\nSQL results:\n{raw}")])
+    # Only use tool calling for ChatOpenAI models
+    if not isinstance(model, ChatOpenAI):
+        # Fallback: direct search for non-OpenAI models
+        raw = sql_search(state["query"], k=8)
+        rows = [l for l in raw.split("\n") if l.strip()]
+        # ─ GAP 1: Include keywords for context
+        keywords_str = ", ".join(state.get("keywords", [])) or "(general)"
+        system = SystemMessage(content=(
+            "You are a SQL Database Agent. Extract the most relevant structured information "
+            "from the SQL query results, prioritizing content related to scoping keywords."
+        ))
+        resp = model.invoke([system, HumanMessage(content=f"Query: {state['query']}\nFocus keywords: {keywords_str}\n\nSQL results:\n{raw}")])
+        
+        return {
+            "sql_findings": resp.content,
+            "messages": [AIMessage(content=f"[SQLDB] {resp.content[:120]}…")],
+            "activity_log": [{
+                "agent": "sql_db",
+                "icon": "🗄️",
+                "title": "SQL / DB agent (direct search)",
+                "detail": f"{len(rows)} result(s) found",
+                "ts": _stamp(),
+            }],
+            "current_agent": "sql_db",
+        }
 
-    return {
-        "sql_findings": resp.content,
-        "messages":     [AIMessage(content=f"[SQLDB] {resp.content[:120]}…")],
-        "activity_log": [{
-            "agent": "sql_db", "icon": "🗄️", 
-            "title": "SQL / DB agent",
-            "detail": f"{len(rows)} row(s) matched across topics, relationships, facts tables",
-            "rows": rows[:12], "ts": _stamp(),
-        }],
-        "current_agent": "sql_db",
-    }
+    # LLM-driven search with tool calling (for ChatOpenAI)
+    system_prompt = SystemMessage(content=(
+        "You are a SQL Database Agent. You have access to a database of structured topics, "
+        "relationships, and facts. Based on the user's query and scoping keywords, decide:\n"
+        "1. Whether querying the SQL database would be helpful\n"
+        "2. What search query to use (prioritize scoping keywords if present)\n"
+        "3. How many results to retrieve (1-20)\n\n"
+        "Use the search_sqldb tool if you think the SQL database has relevant structured information. "
+        "Otherwise, respond explaining why a SQL search is not needed."
+    ))
+    
+    # ─ GAP 1 FIX: Inject scoping keywords to refine query
+    keywords_str = ", ".join(state.get("keywords", [])) or "(none)"
+    sub_q_str = "\n  ".join(state.get("sub_questions", [])[:3]) or "(none)"
+    
+    query_context = f"""User Query: {state['query']}
+
+Scoping Keywords (prioritize in search): {keywords_str}
+
+Research angles to address:
+  {sub_q_str}
+
+Decide whether and how to search the SQL database for structured facts."""
+    
+    messages = [
+        system_prompt,
+        HumanMessage(content=query_context)
+    ]
+    
+    try:
+        response = model.invoke(
+            messages,
+            tools=[SEARCH_SQLDB_TOOL],
+            tool_choice="auto"
+        )
+        
+        # Check if LLM called the tool
+        if hasattr(response, 'tool_calls') and response.tool_calls:
+            results_found = []
+            tool_reasoning = []
+            
+            for tool_call in response.tool_calls:
+                if tool_call.function.name == "search_sqldb":
+                    try:
+                        tool_args = json.loads(tool_call.function.arguments)
+                        tool_result = handle_sqldb_search_tool(tool_args)
+                        result_data = json.loads(tool_result)
+                        
+                        if result_data.get("results"):
+                            results_found.extend(result_data["results"])
+                            tool_reasoning.append(
+                                f"Queried for '{result_data.get('query')}' "
+                                f"→ Found {result_data.get('returned')} results"
+                            )
+                    except Exception as e:
+                        tool_reasoning.append(f"Tool error: {e}")
+            
+            # Synthesize findings from tool results
+            if results_found:
+                formatted_results = "\n".join([r['content'] for r in results_found])
+                synthesis_system = SystemMessage(content=(
+                    "Synthesise the SQL database results into structured research notes. "
+                    "Preserve the topic, relationship, and fact distinctions."
+                ))
+                synthesis_resp = model.invoke([
+                    synthesis_system,
+                    HumanMessage(content=f"Query: {state['query']}\n\nDatabase results:\n{formatted_results}")
+                ])
+                sql_findings = synthesis_resp.content
+            else:
+                sql_findings = "(No relevant records found in SQL database)"
+            
+            return {
+                "sql_findings": sql_findings,
+                "messages": [AIMessage(content=f"[SQLDB] Searched {len(results_found)} result(s)")],
+                "activity_log": [{
+                    "agent": "sql_db",
+                    "icon": "🗄️",
+                    "title": "SQL / DB agent (tool-driven)",
+                    "detail": f"LLM searched SQL: {'; '.join(tool_reasoning) or 'no results'}",
+                    "rows": results_found[:12],
+                    "ts": _stamp(),
+                }],
+                "current_agent": "sql_db",
+            }
+        else:
+            # LLM decided NOT to use the tool
+            llm_decision = response.content if hasattr(response, 'content') else str(response)
+            return {
+                "sql_findings": f"(SQL search not needed: {llm_decision[:200]})",
+                "messages": [AIMessage(content=f"[SQLDB] Skipped search (LLM decision)")],
+                "activity_log": [{
+                    "agent": "sql_db",
+                    "icon": "🗄️",
+                    "title": "SQL / DB agent (LLM decision)",
+                    "detail": f"LLM decided no SQL search needed: {llm_decision[:100]}",
+                    "ts": _stamp(),
+                }],
+                "current_agent": "sql_db",
+            }
+    
+    except Exception as e:
+        return {
+            "sql_findings": f"(SQL error: {str(e)[:100]})",
+            "messages": [AIMessage(content=f"[SQLDB] Error: {str(e)[:50]}")],
+            "activity_log": [{
+                "agent": "sql_db",
+                "icon": "🗄️",
+                "title": "SQL / DB agent (error)",
+                "detail": f"Tool execution failed: {str(e)[:100]}",
+                "ts": _stamp(),
+            }],
+            "current_agent": "sql_db",
+        }
 
 # ── 4. Web / arXiv Agent ──────────────────────────────────────────────────────
-# FIX 3: Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv
+# FIX 3: Web agent now queries OpenAlex + Crossref + Semantic Scholar + arXiv + Conference Papers
 def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
     if "web" not in state.get("active_agents", []):
         return {
@@ -966,6 +1650,72 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
     errors       = []   # API failures tracked separately and may be surfaced later in fallback/reporting content
     indexed      = 0
     sources_used = []
+    conference_papers = []
+
+    # Try conference paper search if query mentions conferences
+    if HAS_CONFERENCE_SEARCH:
+        try:
+            # Check if query mentions any conference keywords
+            query_lower = query.lower()
+            conference_keywords = {"neurips", "icml", "iclr", "acl", "emnlp", "naacl", "eacl", "conference", "paper", "arxiv"}
+            mentions_conference = any(kw in query_lower for kw in conference_keywords)
+            
+            if mentions_conference and isinstance(model, ChatOpenAI):
+                # Try to use the conference paper search tool
+                system_prompt = SystemMessage(content=(
+                    "You are a research assistant. If the user is looking for papers from ML/NLP conferences "
+                    "(NeurIPS, ICML, ICLR, ACL, EMNLP, NAACL, EACL), you should use the search_conference_papers tool "
+                    "to find the most relevant papers. Determine which conferences, years, and keywords are most relevant "
+                    "from the user's query, then call the tool accordingly."
+                ))
+                
+                messages = [
+                    system_prompt,
+                    HumanMessage(content=f"Search for papers related to: {query}")
+                ]
+                
+                # Call the model with the tool
+                response = model.invoke(
+                    messages,
+                    tools=[SEARCH_PAPERS_TOOL],
+                    tool_choice="auto"
+                )
+                
+                # Process tool calls if any
+                if hasattr(response, 'tool_calls') and response.tool_calls:
+                    for tool_call in response.tool_calls:
+                        if tool_call.function.name == "search_conference_papers":
+                            try:
+                                tool_args = json.loads(tool_call.function.arguments)
+                                tool_result = handle_conference_paper_tool_call(tool_args)
+                                result_data = json.loads(tool_result)
+                                
+                                if result_data.get("papers"):
+                                    conference_papers = result_data["papers"]
+                                    sources_used.append(f"Conference Papers ({len(conference_papers)})")
+                                    
+                                    # Format and add to results
+                                    for paper in conference_papers[:5]:
+                                        authors = paper.get("authors", "")
+                                        title = paper.get("title", "")
+                                        conference = paper.get("conference", "")
+                                        year = paper.get("year", "")
+                                        results_text.append(
+                                            f"[{conference} {year}] {title}\n"
+                                            f"Authors: {authors}\nURL: {paper.get('url', '')}"
+                                        )
+                                        
+                                        # Index into vector DB
+                                        vdb.add_text(
+                                            f"Title: {title}\nConference: {conference}\nYear: {year}\n"
+                                            f"Authors: {authors}\nAbstract: {paper.get('abstract', '')}",
+                                            {"source": f"{conference}_{year}", "title": title, "url": paper.get("url", "")}
+                                        )
+                                        indexed += 1
+                            except Exception as e:
+                                results_text.append(f"[Conference Paper Search error] {e}")
+        except Exception as e:
+            pass  # Gracefully skip if something goes wrong
 
     # OpenAlex ──────────────────────────────────────────────────────────────
     try:
@@ -1076,7 +1826,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
     system = SystemMessage(content=(
         "You are a Web Research Agent. Summarise the scholarly search results below into "
         "structured research notes relevant to the query. Cite the source for each finding "
-        "(OpenAlex, Crossref, Semantic Scholar, or arXiv)."
+        "(Conference Papers, OpenAlex, Crossref, Semantic Scholar, or arXiv)."
     ))
     resp = model.invoke([system, HumanMessage(
         content=f"Query: {query}\n\nResults:\n{combined}"
@@ -1292,7 +2042,10 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
         "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
-        "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from."
+        "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from.\n\n"
+        "CRITICAL FOR GROUNDING VALIDATION: When stating substantive claims, wrap them in double quotes. "
+        "Example: \"Diffusion models work by iteratively predicting and removing noise\" (source: Vector DB).\n"
+        "This enables automatic citation verification. Include 5-10 quoted key claims to ensure grounding validation works."
     ))
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
@@ -1302,12 +2055,26 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
         f"Thematic synthesis:\n{context_src}\n\n"
         f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
     ))])
+    
+    # ── BLOCK 2: Validate citations against retrieved sources ─────────────────────
+    citation_grounding, grounding_score = validate_citations(
+        resp.content,
+        state["merged_context"],
+        state["extraction_findings"]
+    )
+    
+    grounded_count = sum(1 for v in citation_grounding.values() if v.get("grounded"))
+    total_citations = len(citation_grounding)
+    
     return {
-        "summary":      resp.content,
-        "messages":     [AIMessage(content=f"[Summarizer] {resp.content[:120]}…")],
-        "activity_log": [{
+        "summary":             resp.content,
+        "citation_grounding":  citation_grounding,
+        "grounding_score":     grounding_score,
+        "messages":            [AIMessage(content=f"[Summarizer] {resp.content[:120]}…")],
+        "activity_log":        [{
             "agent": "summarizer", "icon": "✍️", "title": "Summarizer — final answer",
-            "detail": f"{len(resp.content)} characters", "ts": _stamp(),
+            "detail": f"{len(resp.content)} chars · {grounded_count}/{total_citations} citations grounded ({int(grounding_score*100)}%)",
+            "ts": _stamp(),
         }],
         "current_agent": "summarizer",
     }
@@ -1395,9 +2162,47 @@ def experiment_design_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 
 # ── Routing ───────────────────────────────────────────────────────────────────
+
+def _route_to_all_retrievers(state: AgentState) -> list[str]:
+    """
+    Router → Parallel retrieval tier (fan-out to all active retrievers).
+    
+    Returns list of active retriever nodes.
+    If no retrievers are active, routes directly to extraction.
+    Previously cascaded (vector_db → sql_db → web) sequentially.
+    Now all active retrievers run in parallel, then fan-in to extraction.
+    """
+    active = state.get("active_agents", [])
+    
+    # Collect all active retriever nodes
+    targets = []
+    if "vector_db" in active:
+        targets.append("vector_db")
+    if "sql_db" in active:
+        targets.append("sql_db")
+    if "web" in active:
+        targets.append("web")
+    
+    # If no retrievers are active, skip directly to extraction
+    if not targets:
+        return ["reading_extraction"]
+    
+    return targets
+
+
 def _route_critic(state: AgentState) -> str:
+    """
+    Critic loop routing (FIXED: Block 2 Gap).
+    
+    OLD (broken): Looped to orchestrator, which re-merged same findings.
+    NEW (correct): Loops to router with critique feedback, triggering fresh retrieval.
+    
+    This ensures the second pass actually retrieves new or differently-prioritized content.
+    The critique is passed to router to adjust active_agents strategy.
+    """
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
-        return "orchestrator"
+        # Pass critique back to router for fresh retrieval strategy
+        return "router"
     return "summarizer"
 
 
@@ -1407,47 +2212,71 @@ def _route_critic(state: AgentState) -> str:
 
 def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     lm_sc = _llm(cfg, 0.2)   # scoping
-    lm_r  = _llm(cfg, 0.0)   # router
-    lm_s = _llm(cfg, 0.3)
-    lm_e = _llm(cfg, 0.1)
-    lm_o = _llm(cfg, 0.2)
-    lm_m = _llm(cfg, 0.1)
-    lm_c = _llm(cfg, 0.0)
-    lm_sy = _llm(cfg, 0.3)   # synthesis
+    lm_r  = _llm(cfg, 0.0)   # router (deterministic)
+    lm_s  = _llm(cfg, 0.3)   # retrieval agents
+    lm_e  = _llm(cfg, 0.1)   # extraction
+    lm_o  = _llm(cfg, 0.2)   # orchestrator
+    lm_cf = _llm(cfg, 0.0)   # conflict detector (deterministic)
+    lm_m  = _llm(cfg, 0.1)   # knowledge mapper
+    lm_c  = _llm(cfg, 0.0)   # critic (fully deterministic)
     lm_z  = _llm(cfg, 0.5)   # summarizer
-    lm_x = _llm(cfg, 0.4)
+    lm_x  = _llm(cfg, 0.4)   # experiment design
 
     g = StateGraph(AgentState)
-    g.add_node("router",              lambda s: router_agent(s, lm_r))
-    g.add_node("vector_db",           lambda s: vector_db_agent(s, lm_s, vdb))
-    g.add_node("sql_db",              lambda s: sql_db_agent(s, lm_s))
-    g.add_node("web",                 lambda s: web_agent(s, lm_s, vdb))
-    g.add_node("reading_extraction",  lambda s: reading_extraction_agent(s, lm_e))
-    g.add_node("orchestrator",        lambda s: orchestrator_agent(s, lm_o))
-    g.add_node("knowledge_mapper",    lambda s: knowledge_mapper_agent(s, lm_m))
-    g.add_node("critic",              lambda s: critic_agent(s, lm_c))
-    g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
-    g.add_node("experiment_design",   lambda s: experiment_design_agent(s, lm_x))
 
-    g.add_node("scoping",             lambda s: scoping_agent(s, lm_sc))
-    g.add_node("synthesis",           lambda s: synthesis_agent(s, lm_sy))
+    # ── Register all nodes ────────────────────────────────────────────────────
+    g.add_node("scoping",            lambda s: scoping_agent(s, lm_sc))
+    g.add_node("router",             lambda s: router_agent(s, lm_r))
+    g.add_node("vector_db",          lambda s: vector_db_agent(s, lm_s, vdb))
+    g.add_node("sql_db",             lambda s: sql_db_agent(s, lm_s))
+    g.add_node("web",                lambda s: web_agent(s, lm_s, vdb))
+    g.add_node("reading_extraction", lambda s: reading_extraction_agent(s, lm_e))
+    g.add_node("orchestrator",       lambda s: orchestrator_agent(s, lm_o))
+    g.add_node("conflict_detector",  lambda s: conflict_agent(s, lm_cf))   # FIX (c): wired in
+    g.add_node("knowledge_mapper",   lambda s: knowledge_mapper_agent(s, lm_m))
+    g.add_node("critic",             lambda s: critic_agent(s, lm_c))
+    g.add_node("summarizer",         lambda s: summarizer_agent(s, lm_z))
+    g.add_node("experiment_design",  lambda s: experiment_design_agent(s, lm_x))
 
+    # ── Entry point ───────────────────────────────────────────────────────────
     g.set_entry_point("scoping")
-    g.add_edge("scoping",             "router")
-    g.add_edge("router",              "vector_db")
-    g.add_edge("vector_db",           "sql_db")
-    g.add_edge("sql_db",              "web")
-    g.add_edge("web",                 "reading_extraction")
-    g.add_edge("reading_extraction",  "orchestrator")
-    g.add_edge("orchestrator",        "knowledge_mapper")
-    g.add_edge("knowledge_mapper",    "critic")
+    g.add_edge("scoping", "router")
+
+    # ── FIX (c): Parallel fan-out from router ─────────────────────────────────
+    # LangGraph fan-out: add one unconditional edge per retriever target.
+    # All three fire simultaneously; LangGraph waits for all before running
+    # reading_extraction (fan-in is automatic when a node has multiple incoming edges).
+    #
+    # Agents that are not activated skip themselves internally (they check
+    # state["active_agents"] and return immediately if not listed) — so it is
+    # safe to always fan out to all three regardless of router decision.
+    g.add_edge("router", "vector_db")
+    g.add_edge("router", "sql_db")
+    g.add_edge("router", "web")
+
+    # ── Fan-in: all retrievers → extraction ───────────────────────────────────
+    g.add_edge("vector_db",          "reading_extraction")
+    g.add_edge("sql_db",             "reading_extraction")
+    g.add_edge("web",                "reading_extraction")
+
+    # ── Main pipeline ─────────────────────────────────────────────────────────
+    g.add_edge("reading_extraction", "orchestrator")
+    g.add_edge("orchestrator",       "conflict_detector")   # FIX (b): conflict slot
+    g.add_edge("conflict_detector",  "knowledge_mapper")
+    g.add_edge("knowledge_mapper",   "critic")
+
+    # ── Critic loop: routes to router (fresh retrieval) or summarizer ─────────
     g.add_conditional_edges(
-        "critic", _route_critic,
-        {"orchestrator": "orchestrator", "summarizer": "synthesis"},
+        "critic",
+        _route_critic,
+        {"router": "router", "summarizer": "summarizer"},
     )
-    g.add_edge("synthesis",           "summarizer")
-    g.add_edge("summarizer",          "experiment_design")
-    g.add_edge("experiment_design",   END)
+
+    # ── Final pipeline ────────────────────────────────────────────────────────
+    # FIX (a): removed g.add_edge("synthesis", "summarizer") — node never existed
+    g.add_edge("summarizer",         "experiment_design")
+    g.add_edge("experiment_design",  END)
+
     return g.compile()
 
 
@@ -1534,6 +2363,7 @@ code,pre{font-family:'JetBrains Mono',monospace!important}
 h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 [data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
 .agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
+.agent-card.scoping{border-color:#FF6B6B}
 .agent-card.router{border-color:#9B59B6}
 .agent-card.vector_db{border-color:#4A90D9}
 .agent-card.sql_db{border-color:#E67E22}
@@ -1544,8 +2374,6 @@ h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
 .agent-card.critic{border-color:#F39C12}
 .agent-card.summarizer{border-color:#95A5A6}
 .agent-card.experiment_design{border-color:#00BCD4}
-.agent-card.scoping{border-color:#FF6B6B}
-.agent-card.synthesis{border-color:#A29BFE}
 .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
 .agent-detail{font-size:0.78rem;color:#8b949e}
 .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
@@ -1772,10 +2600,52 @@ with tab_web:
         st.success(f"Added web results to RAG in {n} chunk(s).")
 
     if ask_rag:
-        with st.spinner("Retrieving context and calling LLM..."):
-            rag_context = build_rag_context(vdb, web_q, k=5)
-            st.session_state.rag_context_last = rag_context
-            st.session_state.rag_answer = answer_with_rag(cfg, web_q, rag_context)
+        with st.spinner("Processing with collaborative agent pipeline..."):
+            # Use full agent pipeline instead of direct RAG
+            cfg = ProviderConfig(provider=provider, api_key=api_key, model=llm_model, base_url=base_url)
+            app = build_graph(cfg, vdb)
+            
+            # Initialize state with indexed web results
+            full_state = {
+                "messages": [],
+                "query": web_q,
+                "active_agents": ["vector_db", "sql_db"],  # Skip web since already indexed
+                "router_reasoning": "",
+                "vector_findings": "",
+                "sql_findings": "",
+                "web_findings": "",
+                "extraction_findings": "",
+                "activity_log": [],
+                "merged_context": "",
+                "knowledge_map": {},
+                "critique": "",
+                "loop_count": 0,
+                "summary": "",
+                "experiment_plan": "",
+                "current_agent": "",
+                "sub_questions": [],
+                "keywords": [],
+                "scoping_reasoning": "",
+                "synthesis_report": "",
+                "conflicts": [],
+                "credibility_map": {},
+                "citation_grounding": {},
+                "grounding_score": 0.0,
+                "_needs_more": False,
+            }
+            
+            # Run through agent pipeline
+            final_state = None
+            for event in app.stream(full_state.copy()):
+                final_state = event
+            
+            if final_state and isinstance(final_state, dict):
+                # Get the summary from the last state
+                st.session_state.rag_answer = final_state.get("summary", "No answer generated")
+                st.session_state.rag_context_last = final_state.get("merged_context", "")
+            else:
+                st.session_state.rag_answer = "(Agent pipeline did not complete)"
+
 
     if st.session_state.rag_context_last:
         with st.expander("Retrieved RAG Context"):
@@ -1819,17 +2689,20 @@ with tab_research:
             # Each agent returns a partial update - we merge them so nothing is lost
             full_state = {
                 "messages":[], "query": query,
-                # Scoping Agent
-                "sub_questions":[], "search_keywords":[], "scoping_summary":"",
-                # Router + retrieval
+                # ── BLOCK 1: Query Scoping Fields ──
+                "sub_questions":[], "keywords":[], "scoping_reasoning":"",
+                # ──────────────────────────────────
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
                 "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
                 "knowledge_map":{}, "critique":"", "loop_count":0,
-                # Synthesis + summary
-                "synthesis_report":"", "summary":"", "experiment_plan":"",
-                "current_agent":"", "_needs_more": False,
+                # ── BLOCK 2: Citation Grounding Fields ──
+                "citation_grounding":{}, "grounding_score":0.0,
+                # ── BLOCK 3: Conflict Detection Fields ──
+                "synthesis_report":"", "conflicts":[], "credibility_map":{},
+                # ─────────────────────────────────────────
+                "summary":"", "experiment_plan":"", "current_agent":"", "_needs_more":False,
             }
             for event in app.stream(full_state.copy()):
                 for node, state_update in event.items():
@@ -1844,6 +2717,13 @@ with tab_research:
             progress.progress(100, "✅ Done!")
             if full_state and use_cache:
                 cache_save(query, full_state)
+            
+            # ── BLOCK 1 FIX: Persist full_state to session_state so scoping panel survives reruns ──
+            st.session_state.last_result = full_state
+
+        if full_state is None:
+            st.error("Pipeline returned no state. Please try again.")
+            st.stop()
 
         if auto_save_map and full_state.get("knowledge_map", {}).get("nodes"):
             fname = map_save(query, full_state["knowledge_map"])
@@ -1866,6 +2746,22 @@ with tab_research:
         ])
 
         with r_act:
+            # ── BLOCK 1: Display Query Scoping Panel ──────────────────────────────────
+            st.subheader("🔍 Query Understanding")
+            sub_q = full_state.get("sub_questions", [])
+            keywords = full_state.get("keywords", [])
+            if sub_q or keywords:
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    st.markdown("**🎯 Sub-Questions Identified**")
+                    for i, q in enumerate(sub_q[:5], 1):
+                        st.caption(f"{i}. {q}")
+                with sc2:
+                    st.markdown("**📌 Key Themes**")
+                    kw_badges = " ".join([f"`{k}`" for k in keywords[:8]])
+                    st.markdown(kw_badges)
+                st.divider()
+            
             st.subheader("What each agent did")
             badge = {
                 "vector_db":          '<span class="src-badge bv">Vector DB</span>',
@@ -1899,6 +2795,92 @@ with tab_research:
                             st.code(row, language="text")
 
         with r_ans:
+            # ── BLOCK 4: Export Button ──────────────────────────────────────────────────
+            if full_state.get("summary"):
+                export_col1, export_col2, export_col3 = st.columns([2, 1, 1])
+                
+                with export_col1:
+                    # Generate export
+                    zip_bytes, zip_filename = create_export_zip(query, full_state)
+                    
+                    st.download_button(
+                        label="📥 Export Review (.zip)",
+                        data=zip_bytes,
+                        file_name=zip_filename,
+                        mime="application/zip",
+                        help="Download Markdown review + BibTeX citations"
+                    )
+                
+                with export_col2:
+                    md_bytes = generate_markdown_report(
+                        query=query,
+                        sub_questions=full_state.get("sub_questions", []),
+                        keywords=full_state.get("keywords", []),
+                        summary=full_state.get("summary", ""),
+                        experiment_plan=full_state.get("experiment_plan", ""),
+                        extraction_findings=full_state.get("extraction_findings", ""),
+                        knowledge_map=full_state.get("knowledge_map", {}),
+                    ).encode('utf-8')
+                    
+                    st.download_button(
+                        label="📄 Markdown Only",
+                        data=md_bytes,
+                        file_name=f"review_{_hash(query)}.md",
+                        mime="text/markdown",
+                        help="Download the review as .md file"
+                    )
+                
+                with export_col3:
+                    bibtex_content, _ = extract_bibtex_entries(
+                        extraction_findings=full_state.get("extraction_findings", ""),
+                        web_findings=full_state.get("web_findings", ""),
+                    )
+                    bib_bytes = bibtex_content.encode('utf-8')
+                    
+                    st.download_button(
+                        label="📚 BibTeX Only",
+                        data=bib_bytes,
+                        file_name=f"citations_{_hash(query)}.bib",
+                        mime="text/plain",
+                        help="Download citations as .bib file"
+                    )
+                
+                st.divider()
+            
+            # ── BLOCK 2: Display Citation Grounding Badge ────────────────────────────
+            grounding = full_state.get("citation_grounding", {})
+            grounding_score = full_state.get("grounding_score", 0.0)
+            
+            if grounding:
+                grounded_count = sum(1 for v in grounding.values() if v.get("grounded"))
+                total = len(grounding)
+                
+                # Color bar based on grounding percentage
+                color = "🟢" if grounding_score >= 0.8 else "🟡" if grounding_score >= 0.6 else "🔴"
+                
+                mc1, mc2, mc3 = st.columns([2, 1, 1])
+                with mc1:
+                    st.markdown(f"### {color} Citation Grounding: {grounded_count}/{total} ({int(grounding_score*100)}%)")
+                with mc2:
+                    if grounding_score >= 0.8:
+                        st.success("Well grounded")
+                    elif grounding_score >= 0.6:
+                        st.warning("Partially grounded")
+                    else:
+                        st.error("Low grounding")
+                
+                # Show grounding details
+                with st.expander("📋 Citation Details"):
+                    for citation, info in list(grounding.items())[:15]:
+                        status = "✅" if info.get("grounded") else "⚠️"
+                        source = info.get("source", "none")
+                        st.markdown(f"{status} **{citation[:80]}...**")
+                        st.caption(f"Source: `{source}`")
+                        if info.get("evidence"):
+                            st.caption(f"Evidence: _{info['evidence'][:100]}..._")
+                
+                st.divider()
+            
             st.markdown(full_state.get("summary", ""))
 
         with r_exp:
