@@ -1,7 +1,10 @@
 # Evaluation suite — install in addition to requirements.txt:
 #   pip install -r requirements-eval.txt
+# or use the project's uv eval extra:
+#   uv sync --extra eval
 #
-# Not needed to run the Streamlit app.
+# Eval-only dependencies such as tiktoken live here rather than in
+# requirements.txt. Not needed to run the Streamlit app.
 
 -r requirements.txt
 

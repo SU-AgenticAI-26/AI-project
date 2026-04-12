@@ -4,8 +4,8 @@ eval_perf.py — Performance profiling: per-agent latency and token consumption.
 Wraps the LangGraph agent functions with timing and token-counting decorators,
 then runs each test query and reports a per-agent breakdown.
 
-No additional pip installs needed beyond tiktoken (already in requirements.txt).
-If tiktoken is not installed: pip install tiktoken
+Requires the eval dependencies (includes tiktoken):
+  pip install -r requirements-eval.txt   OR   uv sync --extra eval
 
 Metrics reported:
   - wall_s:           Wall-clock time per agent call

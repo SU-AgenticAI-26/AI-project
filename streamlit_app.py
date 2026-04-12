@@ -1227,12 +1227,13 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
     # Pass that mapping to the LLM so nodes can be attributed to the correct source.
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
-        "The context labels each claim with its origin: [VectorDB], [SQL], or [Web]. "
+        "The context labels each claim with its origin: [VectorDB], [SQL], [Web], or [Extraction]. "
         "Use those labels to set each node's \"source\" field:\n"
-        "  [VectorDB] → \"vector_db\"\n"
-        "  [SQL]      → \"sql_db\"\n"
-        "  [Web]      → \"web\"\n"
-        "  no label   → \"merged\"\n\n"
+        "  [VectorDB]   → \"vector_db\"\n"
+        "  [SQL]        → \"sql_db\"\n"
+        "  [Web]        → \"web\"\n"
+        "  [Extraction] → \"merged\"\n"
+        "  no label     → \"merged\"\n\n"
         "Return ONLY valid JSON (no markdown, no extra text):\n"
         '{"nodes": [{"id":"str","label":"str","type":"concept","source":"vector_db"}],'
         '"edges": [{"source":"str","target":"str","relation":"str","weight":0.5}]}\n'
@@ -1266,7 +1267,7 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
 def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     nodes = state['knowledge_map'].get('nodes', [])
     edges = state['knowledge_map'].get('edges', [])
-    types = {n.get('type', '') for n in nodes}
+    types = {n.get('type') for n in nodes if isinstance(n, dict) and n.get('type')}
     system = SystemMessage(content=(
         "You are a Critic Agent reviewing a knowledge graph. "
         "Respond with needs_more=true only if ANY of these structural problems exist:\n"
@@ -1280,7 +1281,7 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
         f"Node count: {len(nodes)}\n"
         f"Edge count: {len(edges)}\n"
         f"Distinct node types: {sorted(types)}\n"
-        f"Node labels: {[n['label'] for n in nodes]}"
+        f"Node labels: {[n.get('label', '') for n in nodes if isinstance(n, dict)]}"
     ))])
     raw = resp.content.strip()
     if raw.startswith("```"):
