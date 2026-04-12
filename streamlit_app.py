@@ -203,39 +203,47 @@ SEARCH_SQLDB_TOOL = {
 class AgentState(TypedDict):
     messages:              Annotated[List, operator.add]
     query:                 str
-    # ──── Block 1: Query Scoping ────
-    sub_questions:         List[str]
-    keywords:              List[str]
+
+    # ── Scoping ───────────────────────────────────────────────────────────────
+    sub_questions:         List[str]      # 3-5 decomposed questions
+    keywords:              List[str]      # 4-8 key themes
     scoping_reasoning:     str
-    # ────────────────────────────────
+
+    # ── Router ────────────────────────────────────────────────────────────────
     active_agents:         List[str]
     router_reasoning:      str
+
+    # ── Retrieval ─────────────────────────────────────────────────────────────
     vector_findings:       str
     sql_findings:          str
     web_findings:          str
+
+    # ── Extraction + merge ────────────────────────────────────────────────────
     extraction_findings:   str
-    activity_log:          Annotated[List, operator.add]
     merged_context:        str
+    synthesis_report:      str            # optional thematic synthesis
+
+    # ── Knowledge graph ───────────────────────────────────────────────────────
     knowledge_map:         dict
+
+    # ── Critic loop ───────────────────────────────────────────────────────────
     critique:              str
-    loop_count:            int
-    summary:               str
-    # ──── Block 2: Citation Grounding ────
-    citation_grounding:    dict  # {citation: {grounded: bool, source: str, evidence: str}}
-    grounding_score:       float  # 0.0-1.0
-    # ──── Conflict Detection ────
-    conflicts:             List[dict]  # [{topic, claim_a, source_a, claim_b, source_b, resolution}]
-    credibility_map:       dict  # {source: {label, score}}
-    # ─────────────────────────────────────
-    experiment_plan:       str
-    current_agent:         str
     _needs_more:           bool
-    # ── Scoping Agent fields ──────────────────────────────────────────────────
-    sub_questions:         List[str]
-    search_keywords:       List[str]
-    scoping_summary:       str
-    # ── Synthesis Agent field ─────────────────────────────────────────────────
-    synthesis_report:      str
+    loop_count:            int
+
+    # ── Conflict detection (Block 3) ──────────────────────────────────────────
+    conflicts:             List[dict]     # [{topic, claim_a, source_a, claim_b, source_b, resolution}]
+    credibility_map:       dict           # {source: {label, score}}
+
+    # ── Final outputs ─────────────────────────────────────────────────────────
+    summary:               str
+    citation_grounding:    dict           # {citation: {grounded, source, evidence}}
+    grounding_score:       float          # 0.0-1.0
+    experiment_plan:       str
+
+    # ── Metadata ──────────────────────────────────────────────────────────────
+    activity_log:          Annotated[List, operator.add]
+    current_agent:         str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -913,133 +921,71 @@ def scoping_agent(state: AgentState, model: BaseChatModel) -> dict:
 def validate_citations(summary: str, merged_context: str, extraction_findings: str) -> tuple[dict, float]:
     """
     Validate that citations in summary actually appear in retrieved context.
-    Returns (grounding_map, score) where score is 0.0–1.0.
-    
-    grounding_map: {citation_snippet: {grounded: bool, source: 'merged'|'extraction', evidence: text_excerpt}}
-    score: fraction of citations grounded in source text
+    Returns (grounding_map, score) where score is 0.0-1.0.
     """
     grounding_map = {}
-    
-    # Extract potential citations: quotes, parentheses, AND bracketed numeric citations [1]
-    # Patterns: "claim", (claim), or [1], [2], [3] for numeric references
+
+    # Extract potential citations from three patterns
     citation_patterns = [
-        r'"([^"]{20,150})"',  # "quoted claims"
-        r'\(([^)]{20,150})\)',  # (parenthetical claims)
+        r'"([^"]{20,150})"',      # "quoted claims"
+        r'\(([^)]{20,150})\)',    # (parenthetical claims)
     ]
-    
     citations = []
     for pattern in citation_patterns:
         citations.extend(re.findall(pattern, summary))
-    
-    # For numeric citations [1], [2], etc, extract the surrounding sentence
-    numeric_pattern = r'\[(\d+)\]'
-    for match in re.finditer(numeric_pattern, summary):
-        idx = match.start()
-        # Find sentence boundaries (period or end of string)
+
+    # Numeric citations [1], [2] — extract surrounding sentence as the claim
+    for match in re.finditer(r'\[(\d+)\]', summary):
+        idx        = match.start()
         sent_start = summary.rfind('.', 0, idx) + 1
-        sent_end = summary.find('.', idx)
+        sent_end   = summary.find('.', idx)
         if sent_end == -1:
             sent_end = len(summary)
         sentence = summary[sent_start:sent_end].strip()[:150]
-        if len(sentence.split()) >= 3:  # Only if substantive
+        if len(sentence.split()) >= 3:
             citations.append(sentence)
-    
-    citations = list(set(citations))[:15]  # Max 15 unique citations, deduplicate
-    
-    context_text = merged_context + "\n" + extraction_findings
-    context_lower = context_text.lower()
-    
+
+    citations      = list(set(citations))[:15]   # deduplicate, cap at 15
+    context_text   = merged_context + "\n" + extraction_findings
+    context_lower  = context_text.lower()
     grounded_count = 0
+
     for cit in citations:
         cit_lower = cit.lower()
-        
-        # Check if significant portion appears in context
-        words = cit_lower.split()
-        if len(words) < 3:  # Skip very short phrases
+        words     = cit_lower.split()
+        if len(words) < 3:
             continue
-            
-        # Check for exact phrase or significant word overlap
-        found_in_merged = cit_lower in merged_context.lower()
+
+        found_in_merged     = cit_lower in merged_context.lower()
         found_in_extraction = cit_lower in extraction_findings.lower()
-        
-        # Fallback: check if >60% of content words appear in context
+
+        # Fallback: >60% content-word overlap
         if not (found_in_merged or found_in_extraction):
             content_words = [w for w in words if len(w) > 3]
             if content_words:
                 matching = sum(1 for w in content_words if w in context_lower)
                 if matching >= len(content_words) * 0.6:
                     found_in_merged = True
-        
+
         is_grounded = found_in_merged or found_in_extraction
         if is_grounded:
             grounded_count += 1
-            # Find evidence snippet
-            for line in context_text.split('\n'):
-                if any(w in line.lower() for w in words[:3]):
-                    evidence = line.strip()[:150]
-                    break
-            else:
-                evidence = ""
+            evidence = next(
+                (line.strip()[:150] for line in context_text.split('\n')
+                 if any(w in line.lower() for w in words[:3])),
+                ""
+            )
         else:
             evidence = ""
-        
+
         grounding_map[cit[:100]] = {
             "grounded": is_grounded,
-            "source": "merged" if found_in_merged else ("extraction" if found_in_extraction else "none"),
+            "source":   "merged" if found_in_merged else (
+                        "extraction" if found_in_extraction else "none"),
             "evidence": evidence,
         }
-    
-    # Calculate score (0.0–1.0)
+
     score = grounded_count / len(citations) if citations else 1.0
-    
-    return grounding_map, score
-    
-    context_text = merged_context + "\n" + extraction_findings
-    context_lower = context_text.lower()
-    
-    grounded_count = 0
-    for cit in citations:
-        cit_lower = cit.lower()
-        
-        # Check if significant portion appears in context
-        words = cit_lower.split()
-        if len(words) < 3:  # Skip very short phrases
-            continue
-            
-        # Check for exact phrase or significant word overlap
-        found_in_merged = cit_lower in merged_context.lower()
-        found_in_extraction = cit_lower in extraction_findings.lower()
-        
-        # Fallback: check if >60% of content words appear in context
-        if not (found_in_merged or found_in_extraction):
-            content_words = [w for w in words if len(w) > 3]
-            if content_words:
-                matching = sum(1 for w in content_words if w in context_lower)
-                if matching >= len(content_words) * 0.6:
-                    found_in_merged = True
-        
-        is_grounded = found_in_merged or found_in_extraction
-        if is_grounded:
-            grounded_count += 1
-            # Find evidence snippet
-            for line in context_text.split('\n'):
-                if any(w in line.lower() for w in words[:3]):
-                    evidence = line.strip()[:150]
-                    break
-            else:
-                evidence = ""
-        else:
-            evidence = ""
-        
-        grounding_map[cit[:100]] = {
-            "grounded": is_grounded,
-            "source": "merged" if found_in_merged else ("extraction" if found_in_extraction else "none"),
-            "evidence": evidence,
-        }
-    
-    # Calculate score (0.0–1.0)
-    score = grounded_count / len(citations) if citations else 1.0
-    
     return grounding_map, score
 
 # ╭─ CONFLICT DETECTION ────────────────────────────────────────────────────────
@@ -2266,73 +2212,71 @@ def _route_critic(state: AgentState) -> str:
 
 def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
     lm_sc = _llm(cfg, 0.2)   # scoping
-    lm_r  = _llm(cfg, 0.0)   # router
-    lm_s = _llm(cfg, 0.3)
-    lm_e = _llm(cfg, 0.1)
-    lm_o = _llm(cfg, 0.2)
-    lm_m = _llm(cfg, 0.1)
-    lm_c = _llm(cfg, 0.0)
-    lm_sy = _llm(cfg, 0.3)   # synthesis
+    lm_r  = _llm(cfg, 0.0)   # router (deterministic)
+    lm_s  = _llm(cfg, 0.3)   # retrieval agents
+    lm_e  = _llm(cfg, 0.1)   # extraction
+    lm_o  = _llm(cfg, 0.2)   # orchestrator
+    lm_cf = _llm(cfg, 0.0)   # conflict detector (deterministic)
+    lm_m  = _llm(cfg, 0.1)   # knowledge mapper
+    lm_c  = _llm(cfg, 0.0)   # critic (fully deterministic)
     lm_z  = _llm(cfg, 0.5)   # summarizer
-    lm_x = _llm(cfg, 0.4)
+    lm_x  = _llm(cfg, 0.4)   # experiment design
 
     g = StateGraph(AgentState)
-    
-    # ── BLOCK 1: Add scoping agent as entry point (query understanding visibility) ──
-    g.add_node("scoping",             lambda s: scoping_agent(s, lm_r))
-    
-    g.add_node("router",              lambda s: router_agent(s, lm_r))
-    g.add_node("vector_db",           lambda s: vector_db_agent(s, lm_s, vdb))
-    g.add_node("sql_db",              lambda s: sql_db_agent(s, lm_s))
-    g.add_node("web",                 lambda s: web_agent(s, lm_s, vdb))
-    g.add_node("reading_extraction",  lambda s: reading_extraction_agent(s, lm_e))
-    g.add_node("orchestrator",        lambda s: orchestrator_agent(s, lm_o))
-    g.add_node("knowledge_mapper",    lambda s: knowledge_mapper_agent(s, lm_m))
-    g.add_node("critic",              lambda s: critic_agent(s, lm_c))
-    g.add_node("summarizer",          lambda s: summarizer_agent(s, lm_z))
-    g.add_node("experiment_design",   lambda s: experiment_design_agent(s, lm_x))
 
+    # ── Register all nodes ────────────────────────────────────────────────────
+    g.add_node("scoping",            lambda s: scoping_agent(s, lm_sc))
+    g.add_node("router",             lambda s: router_agent(s, lm_r))
+    g.add_node("vector_db",          lambda s: vector_db_agent(s, lm_s, vdb))
+    g.add_node("sql_db",             lambda s: sql_db_agent(s, lm_s))
+    g.add_node("web",                lambda s: web_agent(s, lm_s, vdb))
+    g.add_node("reading_extraction", lambda s: reading_extraction_agent(s, lm_e))
+    g.add_node("orchestrator",       lambda s: orchestrator_agent(s, lm_o))
+    g.add_node("conflict_detector",  lambda s: conflict_agent(s, lm_cf))   # FIX (c): wired in
+    g.add_node("knowledge_mapper",   lambda s: knowledge_mapper_agent(s, lm_m))
+    g.add_node("critic",             lambda s: critic_agent(s, lm_c))
+    g.add_node("summarizer",         lambda s: summarizer_agent(s, lm_z))
+    g.add_node("experiment_design",  lambda s: experiment_design_agent(s, lm_x))
+
+    # ── Entry point ───────────────────────────────────────────────────────────
     g.set_entry_point("scoping")
-    
-    # Scoping always routes directly to router (no branching)
     g.add_edge("scoping", "router")
-    
-    # ─ PARALLELISM OPTIMIZATION (Issue 1) ─
-    # Router fans out to ALL active retrievers in parallel (not cascading)
-    # This replaces the old cascading conditional_edges logic.
-    # Each retriever runs independently; all three feed into extraction (fan-in).
+
+    # ── FIX (c): Parallel fan-out from router ─────────────────────────────────
+    # LangGraph fan-out: add one unconditional edge per retriever target.
+    # All three fire simultaneously; LangGraph waits for all before running
+    # reading_extraction (fan-in is automatic when a node has multiple incoming edges).
+    #
+    # Agents that are not activated skip themselves internally (they check
+    # state["active_agents"] and return immediately if not listed) — so it is
+    # safe to always fan out to all three regardless of router decision.
+    g.add_edge("router", "vector_db")
+    g.add_edge("router", "sql_db")
+    g.add_edge("router", "web")
+
+    # ── Fan-in: all retrievers → extraction ───────────────────────────────────
+    g.add_edge("vector_db",          "reading_extraction")
+    g.add_edge("sql_db",             "reading_extraction")
+    g.add_edge("web",                "reading_extraction")
+
+    # ── Main pipeline ─────────────────────────────────────────────────────────
+    g.add_edge("reading_extraction", "orchestrator")
+    g.add_edge("orchestrator",       "conflict_detector")   # FIX (b): conflict slot
+    g.add_edge("conflict_detector",  "knowledge_mapper")
+    g.add_edge("knowledge_mapper",   "critic")
+
+    # ── Critic loop: routes to router (fresh retrieval) or summarizer ─────────
     g.add_conditional_edges(
-        "router",
-        _route_to_all_retrievers,
-        {
-            "vector_db": "vector_db",
-            "sql_db": "sql_db",
-            "web": "web",
-            "reading_extraction": "reading_extraction",
-        },
-    )
-    
-    # Parallel retrieval tier: each retriever feeds into extraction (fan-in)
-    # LangGraph automatically waits for all incoming edges before executing extraction.
-    g.add_edge("vector_db",  "reading_extraction")
-    g.add_edge("sql_db",     "reading_extraction")
-    g.add_edge("web",        "reading_extraction")
-    
-    # Downstream pipeline
-    g.add_edge("reading_extraction",  "orchestrator")
-    g.add_edge("orchestrator",        "knowledge_mapper")
-    g.add_edge("knowledge_mapper",    "critic")
-    
-    # ─ CRITIC LOOP FIX (Issue 2: Block 2 Gap) ─
-    # OLD: Looped to orchestrator → re-merged same findings (ineffective)
-    # NEW: Loops to router → triggers fresh retrieval with critique feedback
-    g.add_conditional_edges(
-        "critic", _route_critic,
+        "critic",
+        _route_critic,
         {"router": "router", "summarizer": "summarizer"},
     )
-    g.add_edge("synthesis",           "summarizer")
-    g.add_edge("summarizer",          "experiment_design")
-    g.add_edge("experiment_design",   END)
+
+    # ── Final pipeline ────────────────────────────────────────────────────────
+    # FIX (a): removed g.add_edge("synthesis", "summarizer") — node never existed
+    g.add_edge("summarizer",         "experiment_design")
+    g.add_edge("experiment_design",  END)
+
     return g.compile()
 
 
@@ -2409,38 +2353,38 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-    st.markdown("""
-    <style>
-    @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;600;800&display=swap');
-    html,[class*="css"]{font-family:'Outfit',sans-serif}
-    code,pre{font-family:'JetBrains Mono',monospace!important}
-    [data-testid="stSidebar"]{background:#0d1117!important}
-    [data-testid="stSidebar"] *{color:#c9d1d9!important}
-    h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
-    [data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
-    .agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
-    .agent-card.scoping{border-color:#FF6B6B}
-    .agent-card.router{border-color:#9B59B6}
-    .agent-card.vector_db{border-color:#4A90D9}
-    .agent-card.sql_db{border-color:#E67E22}
-    .agent-card.web{border-color:#2ECC71}
-    .agent-card.reading_extraction{border-color:#27AE60}
-    .agent-card.orchestrator{border-color:#E74C3C}
-    .agent-card.knowledge_mapper{border-color:#1ABC9C}
-    .agent-card.critic{border-color:#F39C12}
-    .agent-card.summarizer{border-color:#95A5A6}
-    .agent-card.experiment_design{border-color:#00BCD4}
-    .agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
-    .agent-detail{font-size:0.78rem;color:#8b949e}
-    .src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
-    .bv{background:#1a3a5c;color:#4A90D9}
-    .bs{background:#4a2010;color:#E67E22}
-    .bw{background:#0f3d20;color:#2ECC71}
-    .be{background:#0d2e1a;color:#27AE60}
-    .bm{background:#2d1a4a;color:#9B59B6}
-    .bx{background:#002d33;color:#00BCD4}
-    </style>
-    """, unsafe_allow_html=True)
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;600;800&display=swap');
+html,[class*="css"]{font-family:'Outfit',sans-serif}
+code,pre{font-family:'JetBrains Mono',monospace!important}
+[data-testid="stSidebar"]{background:#0d1117!important}
+[data-testid="stSidebar"] *{color:#c9d1d9!important}
+h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
+[data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
+.agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
+.agent-card.scoping{border-color:#FF6B6B}
+.agent-card.router{border-color:#9B59B6}
+.agent-card.vector_db{border-color:#4A90D9}
+.agent-card.sql_db{border-color:#E67E22}
+.agent-card.web{border-color:#2ECC71}
+.agent-card.reading_extraction{border-color:#27AE60}
+.agent-card.orchestrator{border-color:#E74C3C}
+.agent-card.knowledge_mapper{border-color:#1ABC9C}
+.agent-card.critic{border-color:#F39C12}
+.agent-card.summarizer{border-color:#95A5A6}
+.agent-card.experiment_design{border-color:#00BCD4}
+.agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
+.agent-detail{font-size:0.78rem;color:#8b949e}
+.src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
+.bv{background:#1a3a5c;color:#4A90D9}
+.bs{background:#4a2010;color:#E67E22}
+.bw{background:#0f3d20;color:#2ECC71}
+.be{background:#0d2e1a;color:#27AE60}
+.bm{background:#2d1a4a;color:#9B59B6}
+.bx{background:#002d33;color:#00BCD4}
+</style>
+""", unsafe_allow_html=True)
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 init_sql_db()
@@ -2679,6 +2623,15 @@ with tab_web:
                 "summary": "",
                 "experiment_plan": "",
                 "current_agent": "",
+                "sub_questions": [],
+                "keywords": [],
+                "scoping_reasoning": "",
+                "synthesis_report": "",
+                "conflicts": [],
+                "credibility_map": {},
+                "citation_grounding": {},
+                "grounding_score": 0.0,
+                "_needs_more": False,
             }
             
             # Run through agent pipeline
@@ -2746,8 +2699,10 @@ with tab_research:
                 "knowledge_map":{}, "critique":"", "loop_count":0,
                 # ── BLOCK 2: Citation Grounding Fields ──
                 "citation_grounding":{}, "grounding_score":0.0,
-                # ───────────────────────────────────────
-                "summary":"", "experiment_plan":"", "current_agent":"",
+                # ── BLOCK 3: Conflict Detection Fields ──
+                "synthesis_report":"", "conflicts":[], "credibility_map":{},
+                # ─────────────────────────────────────────
+                "summary":"", "experiment_plan":"", "current_agent":"", "_needs_more":False,
             }
             for event in app.stream(full_state.copy()):
                 for node, state_update in event.items():
