@@ -2,9 +2,24 @@
 secrets.json
 *.key
 *.txt
+# Re-allow pip requirements files (overrides *.txt above)
+!requirements*.txt
 nasakey.txt
 sskey.txt
 semantic_scholar_key.txt
+
+# Runtime application data — generated at runtime, not source
+collab_rag_data/cache/
+collab_rag_data/sessions/
+collab_rag_data/knowledge_maps/
+collab_rag_data/vectorstore/
+
+# Evaluation outputs — generated, not source
+eval_results/
+
+# Binary / generated artefacts
+eval_suite.zip
+*.pdf
 
 # Python
 __pycache__/

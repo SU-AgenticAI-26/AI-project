@@ -1,0 +1,13 @@
+# Evaluation suite — install in addition to requirements.txt:
+#   pip install -r requirements-eval.txt
+#
+# Not needed to run the Streamlit app.
+
+-r requirements.txt
+
+# ── LLM-as-judge evaluation frameworks ───────────────────────────────────────
+ragas
+deepeval
+
+# ── Token counting (eval_provider.py cost estimates) ─────────────────────────
+tiktoken>=0.5.0

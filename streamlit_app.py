@@ -1223,13 +1223,22 @@ def orchestrator_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 # ── 6. Knowledge Mapper ───────────────────────────────────────────────────────
 def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
+    # The Orchestrator labels each claim inline: [VectorDB], [SQL], [Web].
+    # Pass that mapping to the LLM so nodes can be attributed to the correct source.
     system = SystemMessage(content=(
         "You are a Knowledge Mapping Agent. Extract a knowledge graph from the merged context.\n"
-        "Return ONLY valid JSON:\n"
-        '{"nodes": [{"id":"str","label":"str","type":"concept|entity|fact|process",'
-        '"source":"vector_db|sql_db|web|merged"}],'
-        '"edges": [{"source":"str","target":"str","relation":"str","weight":0.1}]}\n'
-        "Include 12–20 nodes. No text outside JSON."
+        "The context labels each claim with its origin: [VectorDB], [SQL], or [Web]. "
+        "Use those labels to set each node's \"source\" field:\n"
+        "  [VectorDB] → \"vector_db\"\n"
+        "  [SQL]      → \"sql_db\"\n"
+        "  [Web]      → \"web\"\n"
+        "  no label   → \"merged\"\n\n"
+        "Return ONLY valid JSON (no markdown, no extra text):\n"
+        '{"nodes": [{"id":"str","label":"str","type":"concept","source":"vector_db"}],'
+        '"edges": [{"source":"str","target":"str","relation":"str","weight":0.5}]}\n'
+        "\"type\" must be exactly one of: concept, entity, fact, process.\n"
+        "\"source\" must be exactly one of: vector_db, sql_db, web, merged.\n"
+        "Include 12–20 nodes."
     ))
     resp = model.invoke([system, HumanMessage(
         content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"
@@ -1255,16 +1264,23 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
 
 # ── 7. Critic ─────────────────────────────────────────────────────────────────
 def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
+    nodes = state['knowledge_map'].get('nodes', [])
+    edges = state['knowledge_map'].get('edges', [])
+    types = {n.get('type', '') for n in nodes}
     system = SystemMessage(content=(
-        "You are a Critic Agent. If the knowledge map has fewer than 8 nodes OR "
-        "key source diversity is missing, respond: "
-        '{\"needs_more\": true, \"feedback\": \"specific gaps\"}. '
-        'Otherwise: {\"needs_more\": false, \"feedback\": \"\"}. Only JSON.'
+        "You are a Critic Agent reviewing a knowledge graph. "
+        "Respond with needs_more=true only if ANY of these structural problems exist:\n"
+        "  1. Fewer than 8 nodes (graph is too sparse)\n"
+        "  2. Fewer than 4 edges (almost no relationships captured)\n"
+        "  3. Fewer than 2 distinct node types (lacks conceptual variety)\n"
+        "Otherwise respond needs_more=false. "
+        'Only JSON: {"needs_more": bool, "feedback": "str"}'
     ))
     resp = model.invoke([system, HumanMessage(content=(
-        f"Nodes: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}\n"
-        f"Sources: {list({n.get('source','?') for n in state['knowledge_map'].get('nodes',[])})}\n"
-        f"Edges: {len(state['knowledge_map'].get('edges',[]))}"
+        f"Node count: {len(nodes)}\n"
+        f"Edge count: {len(edges)}\n"
+        f"Distinct node types: {sorted(types)}\n"
+        f"Node labels: {[n['label'] for n in nodes]}"
     ))])
     raw = resp.content.strip()
     if raw.startswith("```"):
