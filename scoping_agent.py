@@ -146,8 +146,10 @@ def mock_router_agent(state: AgentState, model: ChatOpenAI) -> dict:
         f"Keywords: {state.get('search_keywords', [])}"
     )
 
-    resp  = model.invoke([system, HumanMessage(content=context)])
-    raw   = resp.content.strip().lstrip("```json").rstrip("```").strip()
+    resp = model.invoke([system, HumanMessage(content=context)])
+    raw  = resp.content.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
 
     try:
         parsed = json.loads(raw)

@@ -60,7 +60,7 @@ import zipfile
 import io
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, List, Optional, TypedDict
 
@@ -229,6 +229,13 @@ class AgentState(TypedDict):
     # ─────────────────────────────────────
     experiment_plan:       str
     current_agent:         str
+    _needs_more:           bool
+    # ── Scoping Agent fields ──────────────────────────────────────────────────
+    sub_questions:         List[str]
+    search_keywords:       List[str]
+    scoping_summary:       str
+    # ── Synthesis Agent field ─────────────────────────────────────────────────
+    synthesis_report:      str
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -236,7 +243,7 @@ class AgentState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _stamp() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 def _hash(q: str) -> str:
     return hashlib.sha256(q.strip().lower().encode()).hexdigest()[:16]
@@ -255,7 +262,7 @@ def cache_load(query: str) -> Optional[dict]:
     if not p.exists():
         return None
     raw = json.loads(p.read_text())
-    if datetime.utcnow() - datetime.fromisoformat(raw["ts"]) > timedelta(days=CACHE_TTL_DAYS):
+    if datetime.now(timezone.utc) - datetime.fromisoformat(raw["ts"]).replace(tzinfo=timezone.utc) > timedelta(days=CACHE_TTL_DAYS):
         p.unlink(missing_ok=True)
         return None
     return raw["payload"]
@@ -273,7 +280,7 @@ def cache_list() -> list[dict]:
 # ── Knowledge Maps ─────────────────────────────────────────────────────────────
 
 def map_save(query: str, km: dict) -> str:
-    ts   = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     name = f"{ts}_{_hash(query)}.json"
     (MAPS_DIR / name).write_text(
         json.dumps({"query": query, "saved_at": _stamp(), "map": km}, indent=2)
@@ -596,27 +603,46 @@ def init_sql_db() -> None:
 def sql_search(query: str, k: int = 8) -> str:
     con   = sqlite3.connect(SQL_DB_PATH)
     cur   = con.cursor()
-    words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3]
+    words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3][:5]
+
+    if not words:
+        con.close()
+        return "(no SQL results)"
+
     results = []
-    for word in words[:5]:
-        for row in cur.execute(
-            "SELECT title,category,summary FROM topics WHERE "
-            "LOWER(title) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(summary) LIKE ?",
-            (f"%{word}%", f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[TOPIC] {row[0]} ({row[1]}): {row[2]}")
-        for row in cur.execute(
-            "SELECT from_topic,relation_type,to_topic FROM relationships WHERE "
-            "LOWER(from_topic) LIKE ? OR LOWER(to_topic) LIKE ?",
-            (f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[REL] {row[0]} —[{row[1]}]→ {row[2]}")
-        for row in cur.execute(
-            "SELECT subject,predicate,object,source FROM facts WHERE "
-            "LOWER(subject) LIKE ? OR LOWER(object) LIKE ?",
-            (f"%{word}%", f"%{word}%"),
-        ).fetchall():
-            results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
+    like = [f"%{w}%" for w in words]
+
+    # One query per table, all keywords combined with OR — avoids N×3 round-trips.
+    topic_clause = " OR ".join(
+        ["LOWER(title) LIKE ? OR LOWER(keywords) LIKE ? OR LOWER(summary) LIKE ?"] * len(words)
+    )
+    topic_params = [p for w in like for p in (w, w, w)]
+    for row in cur.execute(
+        f"SELECT title,category,summary FROM topics WHERE {topic_clause}",
+        topic_params,
+    ).fetchall():
+        results.append(f"[TOPIC] {row[0]} ({row[1]}): {row[2]}")
+
+    rel_clause = " OR ".join(
+        ["LOWER(from_topic) LIKE ? OR LOWER(to_topic) LIKE ?"] * len(words)
+    )
+    rel_params = [p for w in like for p in (w, w)]
+    for row in cur.execute(
+        f"SELECT from_topic,relation_type,to_topic FROM relationships WHERE {rel_clause}",
+        rel_params,
+    ).fetchall():
+        results.append(f"[REL] {row[0]} —[{row[1]}]→ {row[2]}")
+
+    fact_clause = " OR ".join(
+        ["LOWER(subject) LIKE ? OR LOWER(object) LIKE ?"] * len(words)
+    )
+    fact_params = [p for w in like for p in (w, w)]
+    for row in cur.execute(
+        f"SELECT subject,predicate,object,source FROM facts WHERE {fact_clause}",
+        fact_params,
+    ).fetchall():
+        results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
+
     con.close()
     seen, unique = set(), []
     for r in results:
@@ -695,6 +721,8 @@ class VectorDBModule:
         return self._store.index.ntotal if self._store else 0
 
     def sources(self) -> list[str]:
+        if not DOCS_DIR.exists():
+            return []
         return [p.name for p in DOCS_DIR.iterdir() if p.is_file()]
 
     # FIX 1: Re-index saved docs on startup 
@@ -704,7 +732,8 @@ class VectorDBModule:
     def reindex_saved_docs(self) -> int:
         if self.count() > 0:
             return 0  # index already has data so skip
-          
+        if not DOCS_DIR.exists():
+            return 0
         count = 0
         for p in DOCS_DIR.iterdir():
             if p.suffix in (".txt", ".md"):
@@ -737,7 +766,6 @@ def index_arxiv_documents(query: str, vdb: VectorDBModule, limit: int = 10) -> i
     except Exception:
         return 0
 
-    import xml.etree.ElementTree as ET
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     try:
         root    = ET.fromstring(xml)
@@ -817,7 +845,7 @@ def _embeddings(cfg: ProviderConfig):
             google_api_key=cfg.api_key, model="models/text-embedding-004"
         )
     else:  # Claude or Local — use a free local model via sentence-transformers
-        from langchain_community.embeddings import HuggingFaceEmbeddings  # type: ignore
+        from langchain_community.embeddings import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
@@ -1673,6 +1701,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
 
     query        = state["query"]
     results_text = []
+    errors       = []   # API failures tracked separately and may be surfaced later in fallback/reporting content
     indexed      = 0
     sources_used = []
     conference_papers = []
@@ -1759,7 +1788,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("OpenAlex")
     except Exception as e:
-        results_text.append(f"[OpenAlex error] {e}")
+        errors.append(f"OpenAlex: {e}")
 
     # ── Crossref ──────────────────────────────────────────────────────────────
     try:
@@ -1778,7 +1807,7 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("Crossref")
     except Exception as e:
-        results_text.append(f"[Crossref error] {e}")
+        errors.append(f"Crossref: {e}")
 
     # Semantic Scholar ──────────────────────────────────────────────────────
     try:
@@ -1786,12 +1815,12 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
         headers = {"x-api-key": ss_key} if ss_key else {}
         r = requests.get(
             "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query, 
+            params={"query": query,
                     "limit": 5,
                     "fields": "title,year,citationCount,authors"},
             headers=headers, timeout=10
         )
-      
+
         if r.ok:
             for paper in r.json().get("data", []):
                 title   = paper.get("title", "No title")
@@ -1806,28 +1835,28 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
                 indexed += 1
             sources_used.append("Semantic Scholar")
     except Exception as e:
-        results_text.append(f"[Semantic Scholar error] {e}")
+        errors.append(f"Semantic Scholar: {e}")
 
     # arXiv ─────────────────────────────────────────────────────────────────
     try:
         encoded = urllib.parse.quote(query)
         url = (f"http://export.arxiv.org/api/query"
                f"?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance")
-      
+
         with urllib.request.urlopen(url, timeout=15) as resp:
             xml = resp.read().decode("utf-8")
-          
+
         ns      = {"atom": "http://www.w3.org/2005/Atom"}
         root    = ET.fromstring(xml)
         entries = root.findall("atom:entry", ns)
-      
+
         for entry in entries:
             title   = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
             summary = (entry.findtext("atom:summary", "", ns) or "").strip()[:400]
             eid     = (entry.findtext("atom:id",      "", ns) or "").strip()
             authors = [a.findtext("atom:name","",ns) for a in entry.findall("atom:author",ns)]
             results_text.append(f"[arXiv] {title} — {', '.join(authors[:3])}\n{eid}")
-          
+
             # Index into vector DB
             vdb.add_text(
                 f"Title: {title}\nAuthors: {', '.join(authors)}\nAbstract: {summary}",
@@ -1835,11 +1864,19 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
             )
             indexed += 1
         sources_used.append("arXiv")
-      
-    except Exception as e:
-        results_text.append(f"[arXiv error] {e}")
 
-    combined = "\n\n---\n".join(results_text) if results_text else "(no results)"
+    except Exception as e:
+        errors.append(f"arXiv: {e}")
+
+    # Build content for the LLM — errors are noted but never treated as findings.
+    if results_text:
+        combined = "\n\n---\n".join(results_text)
+        if errors:
+            combined += f"\n\n(Note: the following sources failed and returned no results: {'; '.join(errors)})"
+    elif errors:
+        combined = f"(All sources failed to return results. Errors: {'; '.join(errors)})"
+    else:
+        combined = "(no results)"
     system = SystemMessage(content=(
         "You are a Web Research Agent. Summarise the scholarly search results below into "
         "structured research notes relevant to the query. Cite the source for each finding "
@@ -1869,7 +1906,7 @@ _EMPTY_PLACEHOLDER = {"", "(none)", "(not activated)", "(no SQL results)"}
 def _has_content(s: str) -> bool:
     return s.strip() not in _EMPTY_PLACEHOLDER
 
-def reading_extraction_agent(state: AgentState, model: ChatOpenAI) -> dict:
+def reading_extraction_agent(state: AgentState, model: BaseChatModel) -> dict:
     vf = state.get("vector_findings", "")
     sf = state.get("sql_findings", "")
     wf = state.get("web_findings", "")
@@ -2033,7 +2070,9 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
         f"Sources: {list({n.get('source','?') for n in state['knowledge_map'].get('nodes',[])})}\n"
         f"Edges: {len(state['knowledge_map'].get('edges',[]))}"
     ))])
-    raw = resp.content.strip().lstrip("```json").rstrip("```").strip()
+    raw = resp.content.strip()
+    if raw.startswith("```"):
+        raw = "\n".join(raw.split("\n")[1:]).rstrip("`").strip()
     try:
         result = json.loads(raw)
     except Exception:
@@ -2062,9 +2101,12 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
         "Example: \"Diffusion models work by iteratively predicting and removing noise\" (source: Vector DB).\n"
         "This enables automatic citation verification. Include 5-10 quoted key claims to ensure grounding validation works."
     ))
+    # Prefer synthesis_report over raw merged_context when available
+    synthesis = state.get("synthesis_report", "")
+    context_src = synthesis if synthesis and synthesis != "(no content to synthesise)" else state.get("merged_context", "")
     resp = model.invoke([system, HumanMessage(content=(
         f"Query: {state['query']}\n\n"
-        f"Merged context:\n{state['merged_context']}\n\n"
+        f"Thematic synthesis:\n{context_src}\n\n"
         f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
     ))])
     
@@ -2223,13 +2265,15 @@ def _route_critic(state: AgentState) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
-    lm_r = _llm(cfg, 0.0)
+    lm_sc = _llm(cfg, 0.2)   # scoping
+    lm_r  = _llm(cfg, 0.0)   # router
     lm_s = _llm(cfg, 0.3)
     lm_e = _llm(cfg, 0.1)
     lm_o = _llm(cfg, 0.2)
     lm_m = _llm(cfg, 0.1)
     lm_c = _llm(cfg, 0.0)
-    lm_z = _llm(cfg, 0.5)
+    lm_sy = _llm(cfg, 0.3)   # synthesis
+    lm_z  = _llm(cfg, 0.5)   # summarizer
     lm_x = _llm(cfg, 0.4)
 
     g = StateGraph(AgentState)
@@ -2286,6 +2330,7 @@ def build_graph(cfg: ProviderConfig, vdb: VectorDBModule):
         "critic", _route_critic,
         {"router": "router", "summarizer": "summarizer"},
     )
+    g.add_edge("synthesis",           "summarizer")
     g.add_edge("summarizer",          "experiment_design")
     g.add_edge("experiment_design",   END)
     return g.compile()
@@ -2344,28 +2389,25 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
         except Exception:
             pass
     with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w") as f:
-        net.save_graph(f.name)
-        html = Path(f.name).read_text()
-        Path(f.name).unlink(missing_ok=True)
+        tmp_path = Path(f.name)
+    try:
+        net.save_graph(str(tmp_path))
+        html = tmp_path.read_text()
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return html
 
 
 
-def main() -> None:
-    # Create data directories on first run
-    for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
-        _d.mkdir(parents=True, exist_ok=True)
+for _d in [VECTOR_DIR, DOCS_DIR, MAPS_DIR, CACHE_DIR, SESSIONS_DIR]:
+    _d.mkdir(parents=True, exist_ok=True)
 
-    # ══════════════════════════════════════════════════════════════════════════════
-    # STREAMLIT UI
-    # ══════════════════════════════════════════════════════════════════════════════
-
-    st.set_page_config(
-        page_title="Collaborative RAG",
-        page_icon="🤝",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
+st.set_page_config(
+    page_title="Collaborative RAG",
+    page_icon="🤝",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
     st.markdown("""
     <style>
@@ -2400,68 +2442,11 @@ def main() -> None:
     </style>
     """, unsafe_allow_html=True)
 
-    # ── Init ──────────────────────────────────────────────────────────────────────
-    init_sql_db()
-
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
-    if "turns" not in st.session_state:
-        st.session_state.turns = []
-    if "vdb" not in st.session_state:
-        st.session_state.vdb = None
-
-    # ── Sidebar ───────────────────────────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("## 🤝 Collaborative RAG")
-        st.divider()
-
-        # API key — check env first, allow override
-        env_key = os.environ.get("OPENAI_API_KEY", "")
-        api_key = st.text_input("OpenAI API Key", value=env_key, type="password", placeholder="sk-…", key="sidebar_api_key")
-        if not api_key:
-            st.warning("Enter your OpenAI API key to continue.")
-st.set_page_config(
-    page_title="Collaborative RAG",
-    page_icon="🤝",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Outfit:wght@400;600;800&display=swap');
-html,[class*="css"]{font-family:'Outfit',sans-serif}
-code,pre{font-family:'JetBrains Mono',monospace!important}
-[data-testid="stSidebar"]{background:#0d1117!important}
-[data-testid="stSidebar"] *{color:#c9d1d9!important}
-h1,h2,h3{font-weight:800!important;letter-spacing:-0.02em}
-[data-testid="stMetric"]{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 16px}
-.agent-card{border-left:3px solid;padding:10px 14px;margin-bottom:10px;border-radius:0 6px 6px 0;background:#161b22}
-.agent-card.router{border-color:#9B59B6}
-.agent-card.vector_db{border-color:#4A90D9}
-.agent-card.sql_db{border-color:#E67E22}
-.agent-card.web{border-color:#2ECC71}
-.agent-card.orchestrator{border-color:#E74C3C}
-.agent-card.knowledge_mapper{border-color:#1ABC9C}
-.agent-card.critic{border-color:#F39C12}
-.agent-card.summarizer{border-color:#95A5A6}
-.agent-card.experiment_design{border-color:#00BCD4}
-.agent-title{font-weight:600;font-size:0.88rem;margin-bottom:3px}
-.agent-detail{font-size:0.78rem;color:#8b949e}
-.src-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:0.68rem;font-family:'JetBrains Mono',monospace;letter-spacing:.04em;margin:0 3px}
-.bv{background:#1a3a5c;color:#4A90D9}
-.bs{background:#4a2010;color:#E67E22}
-.bw{background:#0f3d20;color:#2ECC71}
-.bm{background:#2d1a4a;color:#9B59B6}
-.bx{background:#002d33;color:#00BCD4}
-</style>
-""", unsafe_allow_html=True)
-
 # ── Init ──────────────────────────────────────────────────────────────────────
 init_sql_db()
 
 if "session_id" not in st.session_state:
-    st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+    st.session_state.session_id = datetime.now(timezone.utc).strftime("sess_%Y%m%d_%H%M%S")
 if "turns" not in st.session_state:
     st.session_state.turns = []
 if "vdb" not in st.session_state:
@@ -2741,10 +2726,10 @@ with tab_research:
             app      = build_graph(cfg, vdb)
             progress = st.progress(0, "Starting…")
             pct_map  = {
-                "router": 10, "vector_db": 25, "sql_db": 38, "web": 50,
-                "reading_extraction": 60, "orchestrator": 69,
-                "knowledge_mapper": 78, "critic": 87, "summarizer": 93,
-                "experiment_design": 97,
+                "scoping": 5, "router": 12, "vector_db": 24, "sql_db": 36, "web": 47,
+                "reading_extraction": 57, "orchestrator": 66,
+                "knowledge_mapper": 74, "critic": 82, "synthesis": 89,
+                "summarizer": 94, "experiment_design": 98,
             }
 
             # Accumulate state across ALL agents properly
@@ -2987,14 +2972,15 @@ with tab_research:
                 ("🗄️ SQL / DB",             "sql_findings",        "bs"),
                 ("🌐 Web",                  "web_findings",        "bw"),
                 ("📖 Reading / Extraction", "extraction_findings", "be"),
+                    ("🧵 Synthesis",           "synthesis_report",     "bm"),
             ]:
                 with st.expander(f"{label} findings"):
                     st.markdown(full_state.get(key, ""))
 
         with r_log:
             av = {
-                "[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
-                "[ReadingExtraction]":"📖",
+                "[Scoping]":"🔭","[Router]":"🔀","[VectorDB]":"🗂️","[SQLDB]":"🗄️","[Web]":"🌐",
+                "[ReadingExtraction]":"📖","[Synthesis]":"🧵",
                 "[Orchestrator]":"🤝","[KnowledgeMapper]":"🗺️",
                 "[Critic]":"🧐","[Summarizer]":"✍️","[ExperimentDesign]":"🧪",
             }
@@ -3047,7 +3033,7 @@ with tab_sessions:
             st.success("Saved!")
         if st.button("🆕 New session"):
             session_save(st.session_state.session_id, st.session_state.turns)
-            st.session_state.session_id = datetime.utcnow().strftime("sess_%Y%m%d_%H%M%S")
+            st.session_state.session_id = datetime.now(timezone.utc).strftime("sess_%Y%m%d_%H%M%S")
             st.session_state.turns = []
             st.rerun()
         st.divider()
@@ -3083,7 +3069,7 @@ with tab_cache:
     filt_c = st.text_input("Filter", key="cache_filt")
     shown_c = [e for e in entries if not filt_c or filt_c.lower() in e["query"].lower()]
     for e in shown_c:
-        age   = datetime.utcnow() - datetime.fromisoformat(e["ts"])
+        age   = datetime.now(timezone.utc) - datetime.fromisoformat(e["ts"]).replace(tzinfo=timezone.utc)
         age_s = f"{age.days}d {age.seconds//3600}h ago" if age.days else f"{age.seconds//3600}h {(age.seconds%3600)//60}m ago"
         with st.expander(f"🗃️ {e['query'][:75]}…  ·  {age_s}"):
             pl = cache_load(e["query"])
@@ -3102,7 +3088,3 @@ with tab_cache:
         for p in CACHE_DIR.glob("*.json"):
             p.unlink()
         st.success("Cache cleared.")
-
-
-if __name__ == "__main__":
-    main()

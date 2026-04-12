@@ -26,8 +26,22 @@ def _patch_imports():
     """Stub out third-party packages that may be absent in the test environment."""
     mocks = {}
 
-    # streamlit — only the module-level attribute access needs to exist
-    mocks["streamlit"] = MagicMock()
+    # streamlit — configure return values so module-level UI code doesn't
+    # execute conditional branches during import.
+    st_mock = MagicMock()
+    st_mock.button.return_value = False
+    st_mock.form_submit_button.return_value = False
+    st_mock.text_input.return_value = ""
+    st_mock.text_area.return_value = ""
+    st_mock.number_input.return_value = 5
+    st_mock.checkbox.return_value = False
+    st_mock.file_uploader.return_value = None
+    st_mock.selectbox.return_value = "OpenAI"
+    # st.tabs / st.columns must return the right number of context managers
+    st_mock.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
+    st_mock.columns.side_effect = lambda n: [MagicMock() for _ in (range(n) if isinstance(n, int) else n)]
+    st_mock.session_state.__contains__ = lambda self, key: False
+    mocks["streamlit"] = st_mock
 
     # pyvis
     pyvis_mod  = types.ModuleType("pyvis")
@@ -48,18 +62,22 @@ def _patch_imports():
             self.page_content = page_content
             self.metadata = metadata or {}
 
-    lc_core      = types.ModuleType("langchain_core")
-    lc_core_docs = types.ModuleType("langchain_core.documents")
-    lc_core_msgs = types.ModuleType("langchain_core.messages")
-    lc_core_docs.Document      = _Doc
-    lc_core_msgs.AIMessage     = _Msg
-    lc_core_msgs.HumanMessage  = _Msg
-    lc_core_msgs.SystemMessage = _Msg
-    lc_core.documents = lc_core_docs
-    lc_core.messages  = lc_core_msgs
-    mocks["langchain_core"]          = lc_core
-    mocks["langchain_core.documents"] = lc_core_docs
-    mocks["langchain_core.messages"]  = lc_core_msgs
+    lc_core       = types.ModuleType("langchain_core")
+    lc_core_docs  = types.ModuleType("langchain_core.documents")
+    lc_core_msgs  = types.ModuleType("langchain_core.messages")
+    lc_core_llms  = types.ModuleType("langchain_core.language_models")
+    lc_core_docs.Document       = _Doc
+    lc_core_msgs.AIMessage      = _Msg
+    lc_core_msgs.HumanMessage   = _Msg
+    lc_core_msgs.SystemMessage  = _Msg
+    lc_core_llms.BaseChatModel  = MagicMock
+    lc_core.documents           = lc_core_docs
+    lc_core.messages            = lc_core_msgs
+    lc_core.language_models     = lc_core_llms
+    mocks["langchain_core"]                    = lc_core
+    mocks["langchain_core.documents"]          = lc_core_docs
+    mocks["langchain_core.messages"]           = lc_core_msgs
+    mocks["langchain_core.language_models"]    = lc_core_llms
 
     # langchain / openai stubs
     for mod in [
@@ -67,10 +85,14 @@ def _patch_imports():
         "langchain_community",
         "langchain_community.vectorstores",
         "langchain_community.vectorstores.FAISS",
+        "langchain_community.embeddings",
         "langchain_text_splitters",
         "faiss",
     ]:
         mocks[mod] = MagicMock()
+    # Make FAISS.load_local raise so VectorDBModule._load sets _store=None
+    # and VectorDBModule.count() reliably returns 0 (an int) during import.
+    mocks["langchain_community.vectorstores"].FAISS.load_local.side_effect = Exception("mock")
 
     # langgraph
     langgraph_mod   = types.ModuleType("langgraph")
@@ -124,7 +146,9 @@ def _make_state(**overrides) -> app.AgentState:
         "critique":            "",
         "loop_count":          0,
         "summary":             "",
+        "experiment_plan":     "",
         "current_agent":       "",
+        "_needs_more":         False,
     }
     base.update(overrides)
     return base
@@ -156,7 +180,7 @@ class TestReadingExtractionSkipLogic(unittest.TestCase):
         result = app.reading_extraction_agent(state, model)
 
         model.invoke.assert_not_called()
-        self.assertIn("no content", result["extraction_findings"])
+        self.assertEqual(result["extraction_findings"], "(none)")
         self.assertEqual(result["current_agent"], "reading_extraction")
 
     def test_skip_when_all_not_activated(self):
@@ -170,7 +194,7 @@ class TestReadingExtractionSkipLogic(unittest.TestCase):
         result = app.reading_extraction_agent(state, model)
 
         model.invoke.assert_not_called()
-        self.assertIn("no content", result["extraction_findings"])
+        self.assertEqual(result["extraction_findings"], "(none)")
 
     def test_skip_when_sql_only_no_results(self):
         """Agent should skip when sql returned '(no SQL results)' and others empty."""
