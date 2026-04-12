@@ -368,18 +368,24 @@ def search_conference_papers(
     acl_confs = [c for c in conferences if c.upper() in ACL_CONFERENCES]
 
     all_results = []
+    truncated = False
 
-    if or_confs:
-        all_results.extend(search_openreview(or_confs, years, keywords, search_in))
+    if or_confs and len(all_results) < max_results:
+        remaining = max_results - len(all_results)
+        openreview_results = search_openreview(or_confs, years, keywords, search_in)
+        if len(openreview_results) > remaining:
+            truncated = True
+        all_results.extend(openreview_results[:remaining])
 
-    if acl_confs:
+    if acl_confs and len(all_results) < max_results:
+        remaining = max_results - len(all_results)
         acl_venues = [c.lower() for c in acl_confs]
-        all_results.extend(search_acl_anthology(acl_venues, years, keywords, search_in))
-
-    # Truncate to max_results total
-    truncated = len(all_results) > max_results
-    all_results = all_results[:max_results]
-
+        acl_results = search_acl_anthology(acl_venues, years, keywords, search_in)
+        if len(acl_results) > remaining:
+            truncated = True
+        all_results.extend(acl_results[:remaining])
+    elif acl_confs and len(all_results) >= max_results:
+        truncated = True
     return {
         "total_found": len(all_results) + (100 if truncated else 0),  # Rough estimate if truncated
         "returned": len(all_results),
