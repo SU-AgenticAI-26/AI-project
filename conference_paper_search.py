@@ -271,7 +271,7 @@ def search_openreview(conferences, years, keywords, search_in):
 # ACL ANTHOLOGY SEARCH
 # ──────────────────────────────────────────────────────────────────────────────
 
-def search_acl_anthology(venues, years, keywords, search_in):
+def search_acl_anthology(venues, years, keywords, search_in, max_results=None):
     """Search ACL Anthology (ACL, EMNLP, NAACL, EACL, COLING)."""
     try:
         from acl_anthology import Anthology
@@ -295,6 +295,9 @@ def search_acl_anthology(venues, years, keywords, search_in):
     matched = 0
     
     for paper in anthology.papers():
+        if max_results is not None and matched >= max_results:
+            break
+
         full_id = paper.full_id  # e.g. "2024.acl-long.42"
         parts = full_id.split(".")
         if len(parts) < 2:
@@ -380,10 +383,10 @@ def search_conference_papers(
     if acl_confs and len(all_results) < max_results:
         remaining = max_results - len(all_results)
         acl_venues = [c.lower() for c in acl_confs]
-        acl_results = search_acl_anthology(acl_venues, years, keywords, search_in)
-        if len(acl_results) > remaining:
+        acl_results = search_acl_anthology(acl_venues, years, keywords, search_in, max_results=remaining)
+        if len(acl_results) >= remaining:
             truncated = True
-        all_results.extend(acl_results[:remaining])
+        all_results.extend(acl_results)
     elif acl_confs and len(all_results) >= max_results:
         truncated = True
     return {
