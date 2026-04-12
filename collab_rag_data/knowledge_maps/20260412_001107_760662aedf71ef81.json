@@ -1,0 +1,220 @@
+{
+  "query": "give me latest research on multimodal architectures",
+  "saved_at": "2026-04-12T00:11:07.108764",
+  "map": {
+    "nodes": [
+      {
+        "id": "Metaverse Applications",
+        "label": "Metaverse Applications",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "AI in Academia",
+        "label": "AI in Academia",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Sentiment Analysis Techniques",
+        "label": "Sentiment Analysis Techniques",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Generative AI Capabilities",
+        "label": "Generative AI Capabilities",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Human Behavior Simulation",
+        "label": "Human Behavior Simulation",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Deception Detection",
+        "label": "Deception Detection",
+        "type": "concept",
+        "source": "extraction"
+      },
+      {
+        "id": "Astronomical Data Processing",
+        "label": "Astronomical Data Processing",
+        "type": "concept",
+        "source": "extraction"
+      },
+      {
+        "id": "Sarcasm Detection",
+        "label": "Sarcasm Detection",
+        "type": "concept",
+        "source": "extraction"
+      },
+      {
+        "id": "Medical Imaging Techniques",
+        "label": "Medical Imaging Techniques",
+        "type": "concept",
+        "source": "extraction"
+      },
+      {
+        "id": "Multimodal Architectures",
+        "label": "Multimodal Architectures",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "GPT-4",
+        "label": "GPT-4",
+        "type": "entity",
+        "source": "web"
+      },
+      {
+        "id": "Facial Affect Recognition",
+        "label": "Facial Affect Recognition",
+        "type": "process",
+        "source": "extraction"
+      },
+      {
+        "id": "Liver Segmentation",
+        "label": "Liver Segmentation",
+        "type": "process",
+        "source": "extraction"
+      },
+      {
+        "id": "Vision-Language Models",
+        "label": "Vision-Language Models",
+        "type": "entity",
+        "source": "extraction"
+      },
+      {
+        "id": "Machine Learning",
+        "label": "Machine Learning",
+        "type": "concept",
+        "source": "merged"
+      },
+      {
+        "id": "Open Challenges",
+        "label": "Open Challenges",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Educational Tools",
+        "label": "Educational Tools",
+        "type": "concept",
+        "source": "web"
+      },
+      {
+        "id": "Library Services",
+        "label": "Library Services",
+        "type": "concept",
+        "source": "web"
+      }
+    ],
+    "edges": [
+      {
+        "source": "Multimodal Architectures",
+        "target": "Metaverse Applications",
+        "relation": "applies to",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "AI in Academia",
+        "relation": "enhances",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Sentiment Analysis Techniques",
+        "relation": "improves",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Generative AI Capabilities",
+        "relation": "utilizes",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Human Behavior Simulation",
+        "relation": "supports",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Deception Detection",
+        "relation": "involves",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Astronomical Data Processing",
+        "relation": "facilitates",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Sarcasm Detection",
+        "relation": "enhances",
+        "weight": 0.1
+      },
+      {
+        "source": "Multimodal Architectures",
+        "target": "Medical Imaging Techniques",
+        "relation": "applies to",
+        "weight": 0.1
+      },
+      {
+        "source": "GPT-4",
+        "target": "Generative AI Capabilities",
+        "relation": "demonstrates",
+        "weight": 0.1
+      },
+      {
+        "source": "Facial Affect Recognition",
+        "target": "Deception Detection",
+        "relation": "improves",
+        "weight": 0.1
+      },
+      {
+        "source": "Liver Segmentation",
+        "target": "Medical Imaging Techniques",
+        "relation": "utilizes",
+        "weight": 0.1
+      },
+      {
+        "source": "Vision-Language Models",
+        "target": "Sarcasm Detection",
+        "relation": "evaluates",
+        "weight": 0.1
+      },
+      {
+        "source": "Machine Learning",
+        "target": "Astronomical Data Processing",
+        "relation": "enhances",
+        "weight": 0.1
+      },
+      {
+        "source": "Open Challenges",
+        "target": "Metaverse Applications",
+        "relation": "identifies",
+        "weight": 0.1
+      },
+      {
+        "source": "Educational Tools",
+        "target": "AI in Academia",
+        "relation": "improves",
+        "weight": 0.1
+      },
+      {
+        "source": "Library Services",
+        "target": "AI in Academia",
+        "relation": "enhances",
+        "weight": 0.1
+      }
+    ]
+  }
+}
