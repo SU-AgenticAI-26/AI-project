@@ -51,7 +51,7 @@ Web Agent activated?
 Knowledge map quality?
 ├─ ≥8 nodes + diverse sources? → needs_more = False → Summarize
 └─ <8 nodes OR single source? → needs_more = True
-   └─ loop_count < 2? → LOOP back to Orchestrator
+   └─ loop_count < 2? → LOOP to Router for fresh retrieval
    └─ loop_count ≥ 2? → Force summarization (even if incomplete)
 ```
 
