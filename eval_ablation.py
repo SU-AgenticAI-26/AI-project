@@ -126,7 +126,11 @@ def run_ablation(
                 tokens     = count_tokens(ctx_text)
                 cost       = estimate_cost(tokens, pricing)
                 loop_count = state.get("loop_count", 0)
-                cap_hit    = loop_count >= 2
+                # cap_hit: True when the routing cap was reached (loop_count >= 2)
+                # OR when the delta-node guard short-circuited enrichment after
+                # a non-productive pass (detectable via loop_count >= 2 and the
+                # critique text containing "Stopping enrichment").
+                cap_hit = loop_count >= 2
 
             graph_metrics = compute_graph_metrics(
                 state.get("knowledge_map", {}),

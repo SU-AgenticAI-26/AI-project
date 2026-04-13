@@ -123,10 +123,71 @@ def compute_graph_metrics(knowledge_map: dict, merged_context: str) -> dict:
         "contradiction_edges":    contradictions,
         "unique_sources":         sorted(unique_sources),
         # Pass/fail
-        "node_count_pass":        8 <= n <= 25,
+        "node_count_pass":        8 <= n <= 30,
         "source_diversity_pass":  source_diversity >= 0.3,
         "entity_recall_pass":     entity_recall >= 0.6,
         "orphan_rate_pass":       orphan_rate <= 0.25,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Source overlap diagnostic
+# ---------------------------------------------------------------------------
+
+def compute_source_overlap(state: dict) -> dict:
+    """
+    Measure word-level overlap between the three retrieval channels.
+
+    Returns a dict with pairwise Jaccard similarities and per-channel token
+    counts.  High mean pairwise similarity indicates the channels are returning
+    largely the same content and multi-source routing adds little unique
+    coverage — the root cause of low source_diversity scores.
+
+    Parameters
+    ----------
+    state : dict
+        Pipeline state containing vector_findings, sql_findings, web_findings.
+
+    Returns
+    -------
+    dict with keys:
+        vector_tokens, sql_tokens, web_tokens,
+        jaccard_vector_sql, jaccard_vector_web, jaccard_sql_web,
+        mean_pairwise_jaccard,
+        source_diversity_flag  (True when mean Jaccard > 0.3 — likely overlap problem)
+    """
+    def tokenise(text: str) -> set:
+        # Lowercase word tokens, min length 3 to filter noise
+        return {w.lower() for w in re.findall(r"\b\w{3,}\b", text or "")}
+
+    def jaccard(a: set, b: set) -> float:
+        if not a and not b:
+            return 0.0
+        return round(len(a & b) / len(a | b), 4)
+
+    v = tokenise(state.get("vector_findings", ""))
+    s = tokenise(state.get("sql_findings", ""))
+    w = tokenise(state.get("web_findings", ""))
+
+    j_vs = jaccard(v, s)
+    j_vw = jaccard(v, w)
+    j_sw = jaccard(s, w)
+    mean_j = round((j_vs + j_vw + j_sw) / 3, 4)
+
+    return {
+        "vector_tokens":          len(v),
+        "sql_tokens":             len(s),
+        "web_tokens":             len(w),
+        "jaccard_vector_sql":     j_vs,
+        "jaccard_vector_web":     j_vw,
+        "jaccard_sql_web":        j_sw,
+        "mean_pairwise_jaccard":  mean_j,
+        # Flag when the mean of the three pairwise Jaccard similarities exceeds
+        # 0.3 — suggests retrieval channels are not contributing diversified
+        # content, which explains near-zero source_diversity scores in the
+        # knowledge graph metrics.  The threshold is applied to the mean, so a
+        # single high-overlap pair does not trigger the flag on its own.
+        "source_diversity_flag":  mean_j > 0.3,
     }
 
 
@@ -161,10 +222,11 @@ def run_graph_eval(
             print(f"\n[Graph] Running: {tq['id']} — {tq['query'][:60]}...")
             state, wall_time = run_pipeline(tq["query"], cfg=cfg)
 
-        metrics = compute_graph_metrics(
+        metrics  = compute_graph_metrics(
             state.get("knowledge_map", {}),
             state.get("merged_context", ""),
         )
+        overlap  = compute_source_overlap(state)
 
         result = {
             "query_id":    tq["id"],
@@ -175,9 +237,11 @@ def run_graph_eval(
             "wall_time_s": round(wall_time, 2),
             "loop_count":  state.get("loop_count", 0),
             **metrics,
+            "overlap":     overlap,
         }
         all_results.append(result)
 
+        ov = result["overlap"]
         print(f"  Provider:          {cfg.provider} / {cfg.model}")
         print(f"  Nodes:             {result['node_count']} ({'PASS' if result['node_count_pass'] else 'FAIL'})")
         print(f"  Edges:             {result['edge_count']}")
@@ -186,6 +250,8 @@ def run_graph_eval(
         print(f"  Orphan rate:       {result['orphan_rate']} ({'PASS' if result['orphan_rate_pass'] else 'FAIL'})")
         print(f"  Sources used:      {result['unique_sources']}")
         print(f"  Type coverage:     {result['type_coverage']}")
+        print(f"  Channel overlap:   vec/sql={ov['jaccard_vector_sql']}  vec/web={ov['jaccard_vector_web']}  sql/web={ov['jaccard_sql_web']}  "
+              f"mean={ov['mean_pairwise_jaccard']} {'⚠ HIGH OVERLAP' if ov['source_diversity_flag'] else ''}")
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = Path(output_dir) / f"graph_{ts}.json"

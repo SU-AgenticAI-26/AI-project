@@ -88,6 +88,7 @@ INITIAL_STATE_TEMPLATE: dict = {
     "critique":           "",
     "_needs_more":        False,
     "loop_count":         0,
+    "_prev_node_count":   0,
     # Conflict detection
     "conflicts":          [],
     "credibility_map":    {},
