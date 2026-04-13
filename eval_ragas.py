@@ -71,8 +71,9 @@ async def evaluate_single(
     )
     dataset = EvaluationDataset(samples=[sample])
 
-    # Generous timeout for local/slow judge models; avoids silent nan scores.
-    run_cfg = RunConfig(timeout=300, max_retries=1, max_wait=10)
+    # Generous timeout and retries for local/slow judge models.
+    # max_retries=1 was too low: a single parse failure caused faithfulness=NaN.
+    run_cfg = RunConfig(timeout=300, max_retries=3, max_wait=30)
 
     def _run_ragas_evaluation():
         result = evaluate(
@@ -83,15 +84,27 @@ async def evaluate_single(
                 LLMContextPrecisionWithoutReference(llm=ragas_llm),
             ],
             run_config=run_cfg,
+            raise_exceptions=False,
+            show_progress=False,
         )
         df = result.to_pandas()
         return df.iloc[0]
 
     row = await asyncio.to_thread(_run_ragas_evaluation)
+
+    def _safe_score(val, default=None):
+        """Return float or None; guards against NaN from failed LLM calls."""
+        import math
+        try:
+            f = float(val)
+            return None if math.isnan(f) else round(f, 4)
+        except (TypeError, ValueError):
+            return default
+
     return {
-        "faithfulness":       round(float(row.get("faithfulness", 0)), 4),
-        "response_relevancy": round(float(row.get("response_relevancy", 0)), 4),
-        "context_precision":  round(float(row.get("llm_context_precision_without_reference", 0)), 4),
+        "faithfulness":       _safe_score(row.get("faithfulness")),
+        "response_relevancy": _safe_score(row.get("response_relevancy")),
+        "context_precision":  _safe_score(row.get("llm_context_precision_without_reference")),
     }
 
 

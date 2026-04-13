@@ -24,8 +24,8 @@ def main():
         sys.exit(1)
 
     # Check Python version
-    if sys.version_info < (3, 8):
-        print("❌ Error: Python 3.8+ required")
+    if sys.version_info < (3, 11):
+        print("❌ Error: Python 3.11+ required")
         sys.exit(1)
 
     print("✅ Python version:", sys.version.split()[0])

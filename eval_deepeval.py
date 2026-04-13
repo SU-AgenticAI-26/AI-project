@@ -73,8 +73,7 @@ def make_thematic_coherence_metric(cfg: EvalConfig) -> GEval:
         ],
         threshold=0.65,
         model=cfg.deepeval_model(),
-        include_reason=True,
-    )
+    )  # include_reason removed in deepeval 3.x; reason is still set on .reason after measure()
 
 
 def make_router_metric() -> ToolCorrectnessMetric:

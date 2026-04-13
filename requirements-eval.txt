@@ -1,0 +1,24 @@
+# Evaluation suite — install in addition to requirements.txt:
+#   pip install -r requirements-eval.txt
+# or use the project's uv eval extra:
+#   uv sync --extra eval
+#
+# Eval-only dependencies such as tiktoken live here rather than in
+# requirements.txt. Not needed to run the Streamlit app.
+
+-r requirements.txt
+
+# ── LLM-as-judge evaluation frameworks ───────────────────────────────────────
+# eval_provider.py imports from ragas.llms.base and ragas.embeddings.base,
+# which require ragas 0.4+.  Cap at <0.5 to avoid breaking API changes.
+ragas>=0.4,<0.5
+# deepeval 1.x pins grpcio==1.63.x which has no Python 3.14 wheels.
+# deepeval 2+ ships with grpcio>=1.68 which has cp314 wheels.
+deepeval>=2
+# UpTrain: response/context quality metrics (eval_uptrain.py)
+# rouge_score is a required transitive dep that uptrain lazy-loads at runtime.
+uptrain>=0.6.0
+rouge_score
+
+# ── Token counting (eval_provider.py cost estimates) ─────────────────────────
+tiktoken>=0.5.0
