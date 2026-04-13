@@ -46,7 +46,7 @@ def _patch_imports():
     # st.tabs / st.columns must return the right number of context managers
     st_mock.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
     st_mock.columns.side_effect = lambda n: [MagicMock() for _ in (range(n) if isinstance(n, int) else n)]
-    st_mock.session_state.__contains__ = lambda self, key: False
+    st_mock.session_state.__contains__ = MagicMock(return_value=False)
     mocks["streamlit"] = st_mock
 
     # pyvis

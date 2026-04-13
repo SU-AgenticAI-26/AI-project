@@ -39,7 +39,12 @@ if "_shims_installed" not in sys.modules:
     _st.selectbox.return_value            = "OpenAI"
     _st.tabs.side_effect    = lambda labels: [MagicMock() for _ in labels]
     _st.columns.side_effect = lambda n: [MagicMock() for _ in (range(n) if isinstance(n, int) else n)]
-    _st.session_state.__contains__ = lambda self, key: False
+    # __contains__ must be set on the *type*, not the instance — Python looks up
+    # special methods on the type for `in` / `not in` expressions, so an
+    # instance-level assignment is silently ignored.  Configuring the return
+    # value on the MagicMock used as session_state ensures that guards such as
+    # `if "session_id" not in st.session_state:` evaluate correctly in tests.
+    _st.session_state.__contains__ = MagicMock(return_value=False)
     _mocks["streamlit"] = _st
 
     # ── pyvis ──────────────────────────────────────────────────────────────────
@@ -129,4 +134,7 @@ if "_shims_installed" not in sys.modules:
 
     # Sentinel: signals to _patch_imports() in both test files that shims are
     # already installed and they should skip their own patching logic.
-    sys.modules["_shims_installed"] = object()  # type: ignore[assignment]
+    # Use a ModuleType rather than a plain object() — sys.modules values are
+    # expected to behave like modules (have __name__, __spec__, etc.) and some
+    # tooling will break if it encounters a bare object() here.
+    sys.modules["_shims_installed"] = types.ModuleType("_shims_installed")
