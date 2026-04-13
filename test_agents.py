@@ -139,6 +139,7 @@ def _make_state(**overrides) -> app.AgentState:
         "knowledge_map":       {},
         "critique":            "",
         "loop_count":          0,
+        "_prev_node_count":    0,
         "summary":             "",
         "experiment_plan":     "",
         "current_agent":       "",
@@ -481,51 +482,78 @@ class TestKnowledgeMapperAgent(unittest.TestCase):
 
 _NEEDS_MORE_JSON  = json.dumps({"needs_more": True,  "feedback": "too few nodes"})
 _APPROVED_JSON    = json.dumps({"needs_more": False, "feedback": ""})
+
+# Structural FAIL: only 1 edge (need ≥ 4) and 1 node type (need ≥ 2).
+# critic_agent is purely structural — LLM output is not consulted.
 _KM_WITH_NODES = {
     "nodes": [{"id": str(i), "label": f"node{i}", "type": "concept", "source": "web"}
               for i in range(10)],
     "edges": [{"source": "0", "target": "1", "relation": "r", "weight": 0.5}],
 }
 
+# Structural PASS: ≥ 8 nodes, ≥ 4 edges, ≥ 2 distinct types.
+_KM_STRUCTURAL_PASS = {
+    "nodes": [
+        *[{"id": str(i),   "label": f"concept{i}", "type": "concept", "source": "web"}
+          for i in range(5)],
+        *[{"id": str(i+5), "label": f"entity{i}",  "type": "entity",  "source": "vector_db"}
+          for i in range(5)],
+    ],
+    "edges": [
+        {"source": "0", "target": "1", "relation": "related", "weight": 0.5},
+        {"source": "1", "target": "2", "relation": "extends", "weight": 0.5},
+        {"source": "2", "target": "3", "relation": "uses",    "weight": 0.5},
+        {"source": "3", "target": "4", "relation": "enables", "weight": 0.5},
+    ],
+}
+
 
 class TestCriticAgent(unittest.TestCase):
+    # critic_agent is purely structural — it never calls the LLM.
+    # The mock_llm argument is accepted by the function signature but not used.
 
-    def test_needs_more_true_when_json_says_so(self):
+    def test_needs_more_true_when_structural_check_fails(self):
+        """Graph with too few edges / types triggers _needs_more=True."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
         result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
         self.assertTrue(result["_needs_more"])
 
-    def test_needs_more_false_when_json_says_so(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
+    def test_needs_more_false_when_structural_check_passes(self):
+        """Graph meeting all structural thresholds produces _needs_more=False."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertFalse(result["_needs_more"])
 
-    def test_feedback_stored_in_critique(self):
+    def test_feedback_contains_structural_failure_reason(self):
+        """Critique text names which structural checks failed."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
         result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
-        self.assertEqual(result["critique"], "too few nodes")
+        self.assertIn("Needs enrichment", result["critique"])
+        # _KM_WITH_NODES has 1 edge and 1 type — both thresholds fail.
+        self.assertIn("edge", result["critique"])
+        self.assertIn("type", result["critique"])
 
     def test_loop_count_incremented(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES, loop_count=1)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS, loop_count=1)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["loop_count"], 2)
 
     def test_loop_count_starts_from_zero(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES, loop_count=0)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS, loop_count=0)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["loop_count"], 1)
 
-    def test_fallback_on_invalid_json(self):
-        """Critic defaults to needs_more=False on malformed LLM output."""
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
-        result = app.critic_agent(state, _mock_llm("definitely not json"))
+    def test_structural_pass_always_approves_regardless_of_llm_content(self):
+        """LLM output is irrelevant; a structurally sound graph always passes."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
         self.assertFalse(result["_needs_more"])
-        self.assertEqual(result["critique"], "")
+        self.assertIn("meets structural requirements", result["critique"])
 
-    def test_strips_markdown_fences(self):
-        fenced = f"```json\n{_NEEDS_MORE_JSON}\n```"
+    def test_structural_fail_always_requests_enrichment(self):
+        """LLM output is irrelevant; a structurally deficient graph always fails."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
-        result = app.critic_agent(state, _mock_llm(fenced))
+        result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertTrue(result["_needs_more"])
 
     def test_activity_log_title_reflects_needs_more(self):
@@ -535,15 +563,80 @@ class TestCriticAgent(unittest.TestCase):
         self.assertIn("enrich", title)
 
     def test_activity_log_title_reflects_approved(self):
-        state   = _make_state(knowledge_map=_KM_WITH_NODES)
+        state   = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result  = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         title   = result["activity_log"][0]["title"].lower()
         self.assertIn("approv", title)
 
     def test_current_agent_set(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["current_agent"], "critic")
+
+    def test_prev_node_count_updated(self):
+        """_prev_node_count in returned state reflects the current graph size."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
+        result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
+        self.assertEqual(result["_prev_node_count"], len(_KM_STRUCTURAL_PASS["nodes"]))
+
+    # ── Delta-node guard ──────────────────────────────────────────────────────
+
+    def test_delta_guard_suppresses_needs_more_when_graph_did_not_grow(self):
+        """
+        If an enrichment pass already ran (loop_count >= 1) and the graph grew
+        by fewer than 2 nodes, _needs_more must be forced False even when the
+        structural checks would otherwise request more enrichment.
+        """
+        # _KM_WITH_NODES has structural failures (edges < 4, types < 2).
+        # Simulate that the graph had the same number of nodes before the pass.
+        n = len(_KM_WITH_NODES["nodes"])  # 10
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,           # one enrichment pass already ran
+            _prev_node_count=n,     # graph didn't grow at all
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertFalse(result["_needs_more"])
+
+    def test_delta_guard_critique_explains_stop_reason(self):
+        """When delta guard fires, the critique records why enrichment stopped."""
+        n = len(_KM_WITH_NODES["nodes"])
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,
+            _prev_node_count=n,
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertIn("Stopping enrichment", result["critique"])
+
+    def test_delta_guard_does_not_fire_on_first_pass(self):
+        """
+        Delta guard requires loop_count >= 1. On the first critic pass
+        (loop_count=0), structural failures should still set _needs_more=True.
+        """
+        n = len(_KM_WITH_NODES["nodes"])
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=0,           # first pass — guard must not fire
+            _prev_node_count=n,
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertTrue(result["_needs_more"])
+
+    def test_delta_guard_allows_enrichment_when_graph_grew(self):
+        """
+        When the graph grew by >= 2 nodes after an enrichment pass, the delta
+        guard does not suppress _needs_more even if loop_count >= 1.
+        """
+        n = len(_KM_WITH_NODES["nodes"])  # 10
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,
+            _prev_node_count=n - 3,   # graph grew by 3 — above threshold
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        # structural checks still fail (edges < 4, types < 2) and delta is ok
+        self.assertTrue(result["_needs_more"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -667,13 +760,13 @@ class TestExperimentDesignAgent(unittest.TestCase):
 
 class TestRouteCritic(unittest.TestCase):
 
-    def test_routes_to_orchestrator_when_needs_more_and_loop_zero(self):
+    def test_routes_to_router_when_needs_more_and_loop_zero(self):
         state = _make_state(_needs_more=True, loop_count=0)
-        self.assertEqual(app._route_critic(state), "orchestrator")
+        self.assertEqual(app._route_critic(state), "router")
 
-    def test_routes_to_orchestrator_when_needs_more_and_loop_one(self):
+    def test_routes_to_router_when_needs_more_and_loop_one(self):
         state = _make_state(_needs_more=True, loop_count=1)
-        self.assertEqual(app._route_critic(state), "orchestrator")
+        self.assertEqual(app._route_critic(state), "router")
 
     def test_routes_to_summarizer_when_loop_count_reaches_limit(self):
         """At loop_count >= 2 the critic must stop looping regardless of needs_more."""

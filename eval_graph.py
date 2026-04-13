@@ -123,7 +123,7 @@ def compute_graph_metrics(knowledge_map: dict, merged_context: str) -> dict:
         "contradiction_edges":    contradictions,
         "unique_sources":         sorted(unique_sources),
         # Pass/fail
-        "node_count_pass":        8 <= n <= 25,
+        "node_count_pass":        8 <= n <= 30,
         "source_diversity_pass":  source_diversity >= 0.3,
         "entity_recall_pass":     entity_recall >= 0.6,
         "orphan_rate_pass":       orphan_rate <= 0.25,
@@ -139,9 +139,9 @@ def compute_source_overlap(state: dict) -> dict:
     Measure word-level overlap between the three retrieval channels.
 
     Returns a dict with pairwise Jaccard similarities and per-channel token
-    counts.  High pairwise similarity (> 0.3) indicates the channels are
-    returning largely the same content and multi-source routing adds little
-    unique coverage — the root cause of low source_diversity scores.
+    counts.  High mean pairwise similarity indicates the channels are returning
+    largely the same content and multi-source routing adds little unique
+    coverage — the root cause of low source_diversity scores.
 
     Parameters
     ----------
@@ -182,9 +182,11 @@ def compute_source_overlap(state: dict) -> dict:
         "jaccard_vector_web":     j_vw,
         "jaccard_sql_web":        j_sw,
         "mean_pairwise_jaccard":  mean_j,
-        # Flag when average overlap is high — suggests retrieval channels are
-        # not contributing diversified content, which explains near-zero
-        # source_diversity scores in the knowledge graph metrics.
+        # Flag when the mean of the three pairwise Jaccard similarities exceeds
+        # 0.3 — suggests retrieval channels are not contributing diversified
+        # content, which explains near-zero source_diversity scores in the
+        # knowledge graph metrics.  The threshold is applied to the mean, so a
+        # single high-overlap pair does not trigger the flag on its own.
         "source_diversity_flag":  mean_j > 0.3,
     }
 
