@@ -65,20 +65,40 @@ TEST_QUERIES: list[dict] = [
 # ---------------------------------------------------------------------------
 
 INITIAL_STATE_TEMPLATE: dict = {
-    "messages":         [],
-    "query":            "",
-    "active_agents":    [],
-    "router_reasoning": "",
-    "vector_findings":  "",
-    "sql_findings":     "",
-    "web_findings":     "",
-    "activity_log":     [],
-    "merged_context":   "",
-    "knowledge_map":    {},
-    "critique":         "",
-    "loop_count":       0,
-    "summary":          "",
-    "current_agent":    "",
+    "messages":           [],
+    "query":              "",
+    # Scoping
+    "sub_questions":      [],
+    "keywords":           [],
+    "scoping_reasoning":  "",
+    # Router
+    "active_agents":      [],
+    "router_reasoning":   "",
+    # Retrieval
+    "vector_findings":    "",
+    "sql_findings":       "",
+    "web_findings":       "",
+    # Extraction + merge
+    "extraction_findings": "",
+    "merged_context":     "",
+    "synthesis_report":   "",
+    # Knowledge graph
+    "knowledge_map":      {},
+    # Critic loop
+    "critique":           "",
+    "_needs_more":        False,
+    "loop_count":         0,
+    # Conflict detection
+    "conflicts":          [],
+    "credibility_map":    {},
+    # Final outputs
+    "summary":            "",
+    "citation_grounding": {},
+    "grounding_score":    0.0,
+    "experiment_plan":    "",
+    # Metadata
+    "activity_log":       [],
+    "current_agent":      "",
 }
 
 
@@ -244,42 +264,60 @@ def run_pipeline(
 
 
 def _rebuild_graph(app_cfg, vdb, router_fn=None, critic_fn=None):
-    """Rebuild the LangGraph with patched agent functions for ablation."""
+    """Rebuild the LangGraph with patched agent functions for ablation.
+
+    Mirrors the full build_graph topology so ablation results are comparable
+    to production runs (parallel retrieval fan-out, all agent nodes present).
+    """
     import streamlit_app as _sa
     from langgraph.graph import END, StateGraph
 
-    lm_r = _sa._llm(app_cfg, 0.0)
-    lm_s = _sa._llm(app_cfg, 0.3)
-    lm_o = _sa._llm(app_cfg, 0.2)
-    lm_m = _sa._llm(app_cfg, 0.1)
-    lm_c = _sa._llm(app_cfg, 0.0)
-    lm_z = _sa._llm(app_cfg, 0.5)
+    lm_sc = _sa._llm(app_cfg, 0.2)
+    lm_r  = _sa._llm(app_cfg, 0.0)
+    lm_s  = _sa._llm(app_cfg, 0.3)
+    lm_e  = _sa._llm(app_cfg, 0.1)
+    lm_o  = _sa._llm(app_cfg, 0.2)
+    lm_cf = _sa._llm(app_cfg, 0.0)
+    lm_m  = _sa._llm(app_cfg, 0.1)
+    lm_c  = _sa._llm(app_cfg, 0.0)
+    lm_z  = _sa._llm(app_cfg, 0.5)
+    lm_x  = _sa._llm(app_cfg, 0.3)
 
     router = router_fn if router_fn else lambda s: _sa.router_agent(s, lm_r)
     critic = critic_fn if critic_fn else lambda s: _sa.critic_agent(s, lm_c)
 
     g = StateGraph(_sa.AgentState)
-    g.add_node("router",           router)
-    g.add_node("vector_db",        lambda s: _sa.vector_db_agent(s, lm_s, vdb))
-    g.add_node("sql_db",           lambda s: _sa.sql_db_agent(s, lm_s))
-    g.add_node("web",              lambda s: _sa.web_agent(s, lm_s, vdb))
-    g.add_node("orchestrator",     lambda s: _sa.orchestrator_agent(s, lm_o))
-    g.add_node("knowledge_mapper", lambda s: _sa.knowledge_mapper_agent(s, lm_m))
-    g.add_node("critic",           critic)
-    g.add_node("summarizer",       lambda s: _sa.summarizer_agent(s, lm_z))
+    g.add_node("scoping",            lambda s: _sa.scoping_agent(s, lm_sc))
+    g.add_node("router",             router)
+    g.add_node("vector_db",          lambda s: _sa.vector_db_agent(s, lm_s, vdb))
+    g.add_node("sql_db",             lambda s: _sa.sql_db_agent(s, lm_s))
+    g.add_node("web",                lambda s: _sa.web_agent(s, lm_s, vdb))
+    g.add_node("reading_extraction", lambda s: _sa.reading_extraction_agent(s, lm_e))
+    g.add_node("orchestrator",       lambda s: _sa.orchestrator_agent(s, lm_o))
+    g.add_node("conflict_detector",  lambda s: _sa.conflict_agent(s, lm_cf))
+    g.add_node("knowledge_mapper",   lambda s: _sa.knowledge_mapper_agent(s, lm_m))
+    g.add_node("critic",             critic)
+    g.add_node("summarizer",         lambda s: _sa.summarizer_agent(s, lm_z))
+    g.add_node("experiment_design",  lambda s: _sa.experiment_design_agent(s, lm_x))
 
-    g.set_entry_point("router")
-    g.add_edge("router",           "vector_db")
-    g.add_edge("vector_db",        "sql_db")
-    g.add_edge("sql_db",           "web")
-    g.add_edge("web",              "orchestrator")
-    g.add_edge("orchestrator",     "knowledge_mapper")
-    g.add_edge("knowledge_mapper", "critic")
+    g.set_entry_point("scoping")
+    g.add_edge("scoping",            "router")
+    g.add_edge("router",             "vector_db")
+    g.add_edge("router",             "sql_db")
+    g.add_edge("router",             "web")
+    g.add_edge("vector_db",          "reading_extraction")
+    g.add_edge("sql_db",             "reading_extraction")
+    g.add_edge("web",                "reading_extraction")
+    g.add_edge("reading_extraction", "orchestrator")
+    g.add_edge("orchestrator",       "conflict_detector")
+    g.add_edge("conflict_detector",  "knowledge_mapper")
+    g.add_edge("knowledge_mapper",   "critic")
     g.add_conditional_edges(
         "critic", _sa._route_critic,
-        {"orchestrator": "orchestrator", "summarizer": "summarizer"},
+        {"router": "router", "summarizer": "summarizer"},
     )
-    g.add_edge("summarizer", END)
+    g.add_edge("summarizer",         "experiment_design")
+    g.add_edge("experiment_design",  END)
     return g.compile()
 
 

@@ -24,7 +24,7 @@ Usage:
     # Only specific queries
     python run_eval.py --query-ids q1_rag q2_federated
 
-Available modules: ragas, deepeval, graph, perf, baseline, ablation
+Available modules: ragas, deepeval, uptrain, agentbench, graph, perf, baseline, ablation
 """
 
 from __future__ import annotations
@@ -58,17 +58,68 @@ from eval_provider import EvalConfig, add_provider_args, cfg_from_args
 
 
 PASS_THRESHOLDS = {
-    "faithfulness":       0.75,
-    "response_relevancy": 0.75,
-    "context_precision":  0.70,
-    "entity_recall":      0.60,
-    "router_score":       0.80,
-    "coherence_score":    0.65,
-    "node_count_min":     8,
-    "node_count_max":     25,
-    "source_diversity":   0.30,
-    "cap_hit_rate_max":   0.30,
+    "faithfulness":          0.75,
+    "response_relevancy":    0.75,
+    "context_precision":     0.70,
+    "entity_recall":         0.60,
+    "router_score":          0.80,
+    "coherence_score":       0.65,
+    "node_count_min":        8,
+    "node_count_max":        25,
+    "source_diversity":      0.30,
+    "cap_hit_rate_max":      0.30,
+    # UpTrain
+    "response_relevance":    0.75,
+    "response_completeness": 0.70,
+    "context_relevance":     0.65,
+    "response_conciseness":  0.60,
+    # AgentBench
+    "task_success":          0.70,
+    "channel_f1":            0.75,
+    "iteration_efficiency":  0.70,
+    "kg_density":            0.60,
 }
+
+
+# ---------------------------------------------------------------------------
+# Pipeline disk-cache helpers
+# ---------------------------------------------------------------------------
+
+def _pipeline_cache_path(cfg: EvalConfig, output_dir: str) -> Path:
+    """Return the auto-named pipeline cache file for this provider/model combo."""
+    model_slug = (cfg.model or "default").replace("/", "-").replace(":", "-")
+    return Path(output_dir) / f"pipeline_cache_{cfg.provider}_{model_slug}.json"
+
+
+def _load_pipeline_cache(path: Path) -> dict:
+    """
+    Load pipeline results from a previously saved JSON cache.
+
+    Returns a dict mapping query_id -> (state, wall_time), or {} if the
+    file doesn't exist or can't be parsed.
+    """
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+        return {qid: (entry["state"], entry["wall_time"]) for qid, entry in raw.items()}
+    except Exception as exc:
+        print(f"  WARNING: Could not load pipeline cache from {path}: {exc}")
+        return {}
+
+
+def _save_pipeline_cache(path: Path, cache: dict) -> None:
+    """
+    Write the current pipeline cache to disk.
+
+    LangChain message objects are excluded (they aren't JSON-serialisable and
+    aren't needed by any eval module).
+    """
+    serialisable = {}
+    for qid, (state, wall_time) in cache.items():
+        safe_state = {k: v for k, v in state.items() if k != "messages"}
+        serialisable[qid] = {"state": safe_state, "wall_time": wall_time}
+    path.write_text(json.dumps(serialisable, indent=2, default=str))
 
 
 def check_pass(results: list[dict], metric: str, threshold: float) -> tuple[float | None, bool | None]:
@@ -84,6 +135,7 @@ def run_full_eval(
     query_ids: list[str] | None,
     output_dir: str,
     cfg: EvalConfig,
+    rerun_pipelines: bool = False,
 ):
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     summary = {
@@ -103,27 +155,49 @@ def run_full_eval(
         kwargs["query_ids"] = query_ids
 
     # ------------------------------------------------------------------
-    # Shared pipeline cache — ragas, deepeval, and graph all need the same
-    # full pipeline results. Pre-run them once here and pass the cache so
-    # each module skips redundant pipeline invocations.
+    # Shared pipeline cache — ragas, deepeval, graph, uptrain, and agentbench
+    # all need the same full pipeline results.  Pre-run them once here and
+    # pass the cache so each module skips redundant pipeline invocations.
+    #
+    # Results are also persisted to a JSON file so that interrupted runs can
+    # be resumed without re-running the expensive LangGraph pipeline steps.
     # ------------------------------------------------------------------
-    _cache_consumers = {"ragas", "deepeval", "graph"}
+    _cache_consumers = {"ragas", "deepeval", "graph", "uptrain", "agentbench"}
     pipeline_cache: dict = {}
-    if len(set(modules) & _cache_consumers) > 1:
+    if set(modules) & _cache_consumers:
         from test_queries import TEST_QUERIES, run_pipeline
         _queries_to_cache = [
             q for q in TEST_QUERIES
             if query_ids is None or q["id"] in query_ids
         ]
-        print("\n" + "="*60)
-        print("PRE-RUNNING PIPELINES (shared across ragas / deepeval / graph)")
-        print("="*60)
-        for tq in _queries_to_cache:
-            print(f"  [{tq['id']}] {tq['query'][:70]}...")
-            state, wall_time = run_pipeline(tq["query"], cfg=cfg)
-            pipeline_cache[tq["id"]] = (state, wall_time)
-            print(f"  Done in {wall_time:.1f}s  "
-                  f"nodes={len(state.get('knowledge_map', {}).get('nodes', []))}")
+
+        disk_cache_path = _pipeline_cache_path(cfg, output_dir)
+
+        # Load whatever has already been computed in a previous run.
+        if not rerun_pipelines:
+            pipeline_cache = _load_pipeline_cache(disk_cache_path)
+            if pipeline_cache:
+                cached_ids = sorted(pipeline_cache.keys())
+                print(f"\n[Pipeline cache] Loaded {len(pipeline_cache)} cached "
+                      f"result(s) from {disk_cache_path}: {cached_ids}")
+
+        missing = [q for q in _queries_to_cache if q["id"] not in pipeline_cache]
+        if missing:
+            print("\n" + "="*60)
+            print("PRE-RUNNING PIPELINES (shared across eval modules)")
+            print("="*60)
+            for tq in missing:
+                print(f"  [{tq['id']}] {tq['query'][:70]}...")
+                state, wall_time = run_pipeline(tq["query"], cfg=cfg)
+                pipeline_cache[tq["id"]] = (state, wall_time)
+                print(f"  Done in {wall_time:.1f}s  "
+                      f"nodes={len(state.get('knowledge_map', {}).get('nodes', []))}")
+                # Save incrementally so a crash mid-run doesn't lose earlier results.
+                _save_pipeline_cache(disk_cache_path, pipeline_cache)
+                print(f"  Saved to {disk_cache_path}")
+        else:
+            print(f"\n[Pipeline cache] All {len(_queries_to_cache)} queries already "
+                  f"cached — skipping pipeline runs.")
 
     # --- Baseline ---
     if "baseline" in modules:
@@ -208,6 +282,38 @@ def run_full_eval(
             "pass": cap_rate is not None and cap_rate <= PASS_THRESHOLDS["cap_hit_rate_max"],
         }
 
+    # --- UpTrain ---
+    if "uptrain" in modules:
+        print("\n" + "="*60)
+        print("MODULE: UpTrain")
+        print("="*60)
+        from eval_uptrain import run_uptrain_eval
+        uptrain_results = run_uptrain_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+        summary["results"]["uptrain"] = uptrain_results
+
+        for metric in ["response_relevance", "response_completeness",
+                        "context_relevance", "response_conciseness"]:
+            mean, passed = check_pass(uptrain_results, metric, PASS_THRESHOLDS.get(metric, 0))
+            summary["pass_fail"][f"uptrain_{metric}"] = {
+                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
+            }
+
+    # --- AgentBench ---
+    if "agentbench" in modules:
+        print("\n" + "="*60)
+        print("MODULE: AgentBench")
+        print("="*60)
+        from eval_agentbench import run_agentbench_eval
+        ab_kwargs = {k: v for k, v in kwargs.items()}
+        ab_results = run_agentbench_eval(**ab_kwargs, pipeline_cache=pipeline_cache or None)
+        summary["results"]["agentbench"] = ab_results
+
+        for metric in ["task_success", "channel_f1", "iteration_efficiency", "kg_density"]:
+            mean, passed = check_pass(ab_results, metric, PASS_THRESHOLDS.get(metric, 0))
+            summary["pass_fail"][f"agentbench_{metric}"] = {
+                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
+            }
+
     # --- Ablation ---
     if "ablation" in modules:
         print("\n" + "="*60)
@@ -245,7 +351,7 @@ def run_full_eval(
 
 
 if __name__ == "__main__":
-    ALL_MODULES = ["ragas", "deepeval", "graph", "perf", "baseline", "ablation"]
+    ALL_MODULES = ["ragas", "deepeval", "uptrain", "agentbench", "graph", "perf", "baseline", "ablation"]
 
     parser = argparse.ArgumentParser(description="Run full evaluation suite")
     parser.add_argument("--quick",      action="store_true",
@@ -255,6 +361,9 @@ if __name__ == "__main__":
     parser.add_argument("--query-ids",  nargs="*",
                         help="Subset of query IDs")
     parser.add_argument("--output-dir", default="eval_results")
+    parser.add_argument("--rerun-pipelines", action="store_true",
+                        dest="rerun_pipelines",
+                        help="Ignore disk pipeline cache and re-run all pipelines")
     add_provider_args(parser)
     args = parser.parse_args()
 
@@ -279,4 +388,5 @@ if __name__ == "__main__":
         query_ids=query_ids,
         output_dir=args.output_dir,
         cfg=cfg,
+        rerun_pipelines=args.rerun_pipelines,
     )
