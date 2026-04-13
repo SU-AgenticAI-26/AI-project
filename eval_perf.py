@@ -57,22 +57,30 @@ def build_instrumented_graph(cfg: EvalConfig, vdb, perf_log: list[dict]):
     app_cfg = cfg.pipeline_app_cfg()
     pricing = cfg.pricing()
 
-    lm_r = _sa._llm(app_cfg, 0.0)
-    lm_s = _sa._llm(app_cfg, 0.3)
-    lm_o = _sa._llm(app_cfg, 0.2)
-    lm_m = _sa._llm(app_cfg, 0.1)
-    lm_c = _sa._llm(app_cfg, 0.0)
-    lm_z = _sa._llm(app_cfg, 0.5)
+    lm_sc = _sa._llm(app_cfg, 0.2)   # scoping
+    lm_r  = _sa._llm(app_cfg, 0.0)   # router
+    lm_s  = _sa._llm(app_cfg, 0.3)   # retrieval agents
+    lm_e  = _sa._llm(app_cfg, 0.1)   # reading_extraction
+    lm_o  = _sa._llm(app_cfg, 0.2)   # orchestrator
+    lm_cf = _sa._llm(app_cfg, 0.0)   # conflict_detector
+    lm_m  = _sa._llm(app_cfg, 0.1)   # knowledge_mapper
+    lm_c  = _sa._llm(app_cfg, 0.0)   # critic
+    lm_z  = _sa._llm(app_cfg, 0.5)   # summarizer
+    lm_x  = _sa._llm(app_cfg, 0.4)   # experiment_design
 
     agent_fns = {
-        "router":           lambda s: _sa.router_agent(s, lm_r),
-        "vector_db":        lambda s: _sa.vector_db_agent(s, lm_s, vdb),
-        "sql_db":           lambda s: _sa.sql_db_agent(s, lm_s),
-        "web":              lambda s: _sa.web_agent(s, lm_s, vdb),
-        "orchestrator":     lambda s: _sa.orchestrator_agent(s, lm_o),
-        "knowledge_mapper": lambda s: _sa.knowledge_mapper_agent(s, lm_m),
-        "critic":           lambda s: _sa.critic_agent(s, lm_c),
-        "summarizer":       lambda s: _sa.summarizer_agent(s, lm_z),
+        "scoping":            lambda s: _sa.scoping_agent(s, lm_sc),
+        "router":             lambda s: _sa.router_agent(s, lm_r),
+        "vector_db":          lambda s: _sa.vector_db_agent(s, lm_s, vdb),
+        "sql_db":             lambda s: _sa.sql_db_agent(s, lm_s),
+        "web":                lambda s: _sa.web_agent(s, lm_s, vdb),
+        "reading_extraction": lambda s: _sa.reading_extraction_agent(s, lm_e),
+        "orchestrator":       lambda s: _sa.orchestrator_agent(s, lm_o),
+        "conflict_detector":  lambda s: _sa.conflict_agent(s, lm_cf),
+        "knowledge_mapper":   lambda s: _sa.knowledge_mapper_agent(s, lm_m),
+        "critic":             lambda s: _sa.critic_agent(s, lm_c),
+        "summarizer":         lambda s: _sa.summarizer_agent(s, lm_z),
+        "experiment_design":  lambda s: _sa.experiment_design_agent(s, lm_x),
     }
 
     def _make_timed(name: str, fn: Callable) -> Callable:
@@ -82,7 +90,8 @@ def build_instrumented_graph(cfg: EvalConfig, vdb, perf_log: list[dict]):
                 state.get("merged_context", "") +
                 state.get("vector_findings", "") +
                 state.get("sql_findings", "") +
-                state.get("web_findings", "")
+                state.get("web_findings", "") +
+                state.get("extraction_findings", "")
             )
             prompt_tokens = count_tokens(ctx)
             t0 = time.perf_counter()
@@ -103,18 +112,26 @@ def build_instrumented_graph(cfg: EvalConfig, vdb, perf_log: list[dict]):
     for name, fn in agent_fns.items():
         g.add_node(name, _make_timed(name, fn))
 
-    g.set_entry_point("router")
-    g.add_edge("router",           "vector_db")
-    g.add_edge("vector_db",        "sql_db")
-    g.add_edge("sql_db",           "web")
-    g.add_edge("web",              "orchestrator")
-    g.add_edge("orchestrator",     "knowledge_mapper")
-    g.add_edge("knowledge_mapper", "critic")
+    # Mirror the real build_graph topology exactly so perf numbers reflect
+    # production behaviour (parallel retrieval fan-out, all agent nodes).
+    g.set_entry_point("scoping")
+    g.add_edge("scoping",            "router")
+    g.add_edge("router",             "vector_db")
+    g.add_edge("router",             "sql_db")
+    g.add_edge("router",             "web")
+    g.add_edge("vector_db",          "reading_extraction")
+    g.add_edge("sql_db",             "reading_extraction")
+    g.add_edge("web",                "reading_extraction")
+    g.add_edge("reading_extraction", "orchestrator")
+    g.add_edge("orchestrator",       "conflict_detector")
+    g.add_edge("conflict_detector",  "knowledge_mapper")
+    g.add_edge("knowledge_mapper",   "critic")
     g.add_conditional_edges(
         "critic", _sa._route_critic,
-        {"orchestrator": "orchestrator", "summarizer": "summarizer"},
+        {"router": "router", "summarizer": "summarizer"},
     )
-    g.add_edge("summarizer", END)
+    g.add_edge("summarizer",         "experiment_design")
+    g.add_edge("experiment_design",  END)
     return g.compile()
 
 

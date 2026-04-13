@@ -243,7 +243,7 @@ class AgentState(TypedDict):
 
     # ── Metadata ──────────────────────────────────────────────────────────────
     activity_log:          Annotated[List, operator.add]
-    current_agent:         str
+    current_agent:         Annotated[str, lambda _old, new: new]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2072,8 +2072,8 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     # ── BLOCK 2: Validate citations against retrieved sources ─────────────────────
     citation_grounding, grounding_score = validate_citations(
         resp.content,
-        state["merged_context"],
-        state["extraction_findings"]
+        state.get("merged_context", ""),
+        state.get("extraction_findings", ""),
     )
     
     grounded_count = sum(1 for v in citation_grounding.values() if v.get("grounded"))

@@ -221,11 +221,12 @@ class EvalConfig:
         """
         Return a RAGAS-compatible embeddings object.
 
-        For OpenAI: uses ragas.embeddings.OpenAIEmbeddings with an AsyncOpenAI
-        client (native RAGAS 0.4+ API).
-        For all other providers (including local): uses HuggingFaceEmbeddings
-        wrapped with ragas.embeddings.base.LangchainEmbeddingsWrapper, avoiding
-        any dependency on an OpenAI API key.
+        All providers go through LangchainEmbeddingsWrapper so that metrics
+        like ResponseRelevancy (which internally call embed_query / embed_documents)
+        work correctly.  The native RagasOpenAIEmbeddings exposes embed_text /
+        embed_texts instead and breaks ResponseRelevancy in ragas 0.4.x.
+        For OpenAI: wraps langchain_openai.OpenAIEmbeddings.
+        For all other providers (including local): wraps HuggingFaceEmbeddings.
 
         Both ragas.llms.LangchainLLMWrapper and ragas.embeddings.LangchainEmbeddingsWrapper
         are DeprecationHelpers (not the real classes) in ragas 0.4+; always import
@@ -237,14 +238,19 @@ class EvalConfig:
         if hasattr(self, "_ragas_emb_cache"):
             return self._ragas_emb_cache
 
+        # Always go through LangchainEmbeddingsWrapper so that metrics like
+        # ResponseRelevancy (which call embed_query / embed_documents) work
+        # regardless of provider.  RagasOpenAIEmbeddings exposes a different
+        # interface (embed_text / embed_texts) that breaks ResponseRelevancy.
+        from ragas.embeddings.base import LangchainEmbeddingsWrapper
+
         p = self._jp()
         if p == "openai":
-            from openai import AsyncOpenAI
-            from ragas.embeddings import OpenAIEmbeddings as RagasOpenAIEmbeddings
-            client = AsyncOpenAI(api_key=self._jk())
-            emb = RagasOpenAIEmbeddings(client=client)
+            from langchain_openai import OpenAIEmbeddings
+            emb = LangchainEmbeddingsWrapper(
+                OpenAIEmbeddings(api_key=self._jk())
+            )
         else:
-            from ragas.embeddings.base import LangchainEmbeddingsWrapper
             try:
                 from langchain_huggingface import HuggingFaceEmbeddings
             except ImportError:
