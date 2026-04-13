@@ -230,6 +230,7 @@ class AgentState(TypedDict):
     critique:              str
     _needs_more:           bool
     loop_count:            int
+    _prev_node_count:      int   # node count after previous enrichment pass (for delta check)
 
     # ── Conflict detection (Block 3) ──────────────────────────────────────────
     conflicts:             List[dict]     # [{topic, claim_a, source_a, claim_b, source_b, resolution}]
@@ -1982,14 +1983,17 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
         "  [VectorDB]   → \"vector_db\"\n"
         "  [SQL]        → \"sql_db\"\n"
         "  [Web]        → \"web\"\n"
-        "  [Extraction] → \"merged\"\n"
+        "  [Extraction] → use the most recently preceding [VectorDB], [SQL], or [Web] label "
+        "in the context; fall back to \"merged\" only when a concept genuinely spans multiple sources.\n"
         "  no label     → \"merged\"\n\n"
+        "Prefer specific source labels (vector_db, sql_db, web) over \"merged\" wherever traceable. "
+        "\"merged\" should be used sparingly — only for cross-source synthesis nodes.\n\n"
         "Return ONLY valid JSON (no markdown, no extra text):\n"
         '{"nodes": [{"id":"str","label":"str","type":"concept","source":"vector_db"}],'
         '"edges": [{"source":"str","target":"str","relation":"str","weight":0.5}]}\n'
         "\"type\" must be exactly one of: concept, entity, fact, process.\n"
         "\"source\" must be exactly one of: vector_db, sql_db, web, merged.\n"
-        "Include 12–20 nodes."
+        "Include 12–30 nodes."
     ))
     resp = model.invoke([system, HumanMessage(
         content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"
@@ -2027,9 +2031,10 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 
     # All three criteria are structural facts — compute deterministically in Python
     # rather than asking an LLM, which adds latency/tokens and can misparse output.
+    n = len(nodes)
     failures = []
-    if len(nodes) < 8:
-        failures.append(f"only {len(nodes)} nodes (need ≥ 8)")
+    if n < 8:
+        failures.append(f"only {n} nodes (need ≥ 8)")
     if len(edges) < 4:
         failures.append(f"only {len(edges)} edges (need ≥ 4)")
     if len(types) < 2:
@@ -2038,10 +2043,23 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     needs = bool(failures)
     feedback = "Needs enrichment: " + "; ".join(failures) if failures else "Graph meets structural requirements."
 
+    # Delta-node guard: if an enrichment pass already ran and the graph didn't
+    # grow by at least 2 nodes, suppress further looping to avoid wasted passes.
+    # This catches the case where the critic keeps flagging but retrieval returns
+    # the same content, producing no meaningful graph improvement.
+    prev_n = state.get("_prev_node_count", 0)
+    if needs and state.get("loop_count", 0) >= 1 and (n - prev_n) < 2:
+        needs = False
+        feedback = (
+            f"Stopping enrichment: graph grew by only {n - prev_n} node(s) "
+            f"after previous pass (threshold: 2). Original issue: {feedback}"
+        )
+
     return {
-        "critique":    feedback,
-        "_needs_more": needs,
-        "loop_count":  state.get("loop_count", 0) + 1,
+        "critique":         feedback,
+        "_needs_more":      needs,
+        "_prev_node_count": n,
+        "loop_count":       state.get("loop_count", 0) + 1,
         "messages":    [AIMessage(content=f"[Critic] needs_more={needs}")],
         "activity_log": [{
             "agent": "critic", "icon": "🧐",
@@ -2645,8 +2663,9 @@ with tab_web:
                 "citation_grounding": {},
                 "grounding_score": 0.0,
                 "_needs_more": False,
+                "_prev_node_count": 0,
             }
-            
+
             # Run through agent pipeline
             final_state = None
             for event in app.stream(full_state.copy()):
@@ -2709,7 +2728,7 @@ with tab_research:
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
                 "extraction_findings":"",
                 "activity_log":[], "merged_context":"",
-                "knowledge_map":{}, "critique":"", "loop_count":0,
+                "knowledge_map":{}, "critique":"", "loop_count":0, "_prev_node_count":0,
                 # ── BLOCK 2: Citation Grounding Fields ──
                 "citation_grounding":{}, "grounding_score":0.0,
                 # ── BLOCK 3: Conflict Detection Fields ──
