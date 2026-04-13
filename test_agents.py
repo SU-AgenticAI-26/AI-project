@@ -25,8 +25,11 @@ from unittest.mock import MagicMock, patch
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _patch_imports() -> None:
-    if "streamlit_app" in sys.modules:
-        return  # already patched by another test module in this session
+    # conftest.py installs all shims before any test module is collected and
+    # sets this sentinel.  Return immediately so we never overwrite the correct
+    # stubs (especially the langchain_openai ModuleType stub for ChatOpenAI).
+    if "_shims_installed" in sys.modules or "streamlit_app" in sys.modules:
+        return
 
     mocks: dict = {}
 

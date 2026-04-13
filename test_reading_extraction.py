@@ -24,6 +24,12 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 def _patch_imports():
     """Stub out third-party packages that may be absent in the test environment."""
+    # conftest.py installs all shims (including the correctly-typed ChatOpenAI
+    # sentinel class) before any test module is collected and sets this sentinel.
+    # Return immediately to avoid overwriting those stubs with a flat MagicMock,
+    # which would make isinstance(model, ChatOpenAI) raise TypeError.
+    if "_shims_installed" in sys.modules or "streamlit_app" in sys.modules:
+        return
     mocks = {}
 
     # streamlit — configure return values so module-level UI code doesn't
