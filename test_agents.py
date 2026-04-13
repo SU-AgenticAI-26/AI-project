@@ -82,8 +82,18 @@ def _patch_imports() -> None:
     mocks["langchain_core.messages"]        = lc_core_msgs
     mocks["langchain_core.language_models"] = lc_core_llms
 
+    # langchain_openai: ChatOpenAI must be a real class (not a MagicMock instance)
+    # so that isinstance(model, ChatOpenAI) works without raising TypeError.
+    # MagicMock models are not instances of _ChatOpenAI, so isinstance() returns
+    # False and agents correctly take the non-tool-calling fallback path — which
+    # is exactly the code path covered by these tests.
+    langchain_openai_mod = types.ModuleType("langchain_openai")
+    class _ChatOpenAI: pass  # sentinel — never instantiated in tests
+    langchain_openai_mod.ChatOpenAI       = _ChatOpenAI
+    langchain_openai_mod.OpenAIEmbeddings = MagicMock()
+    mocks["langchain_openai"] = langchain_openai_mod
+
     for mod in [
-        "langchain_openai",
         "langchain_community",
         "langchain_community.vectorstores",
         "langchain_community.vectorstores.FAISS",
@@ -298,12 +308,15 @@ class TestSqlDbAgent(unittest.TestCase):
         self.assertEqual(result["sql_findings"], "SQL_RESPONSE")
 
     def test_activity_log_structure(self):
+        # Tests run the non-tool-calling fallback path (model is MagicMock, not
+        # ChatOpenAI).  That path does not include a "rows" key in the log entry;
+        # "rows" is only present in the tool-driven (OpenAI) path.
         state  = _make_state(active_agents=["sql_db"])
         result = app.sql_db_agent(state, _mock_llm("r"))
         entry  = result["activity_log"][0]
         self.assertEqual(entry["agent"], "sql_db")
         self.assertEqual(entry["icon"], "🗄️")
-        self.assertIn("rows", entry)
+        self.assertIn("detail", entry)
 
     def test_llm_receives_query_in_prompt(self):
         model = _mock_llm("r")
