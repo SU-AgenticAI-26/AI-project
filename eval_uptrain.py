@@ -35,7 +35,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 
-from test_queries import TEST_QUERIES, run_pipeline, split_context_into_chunks
+from test_queries import TEST_QUERIES, run_pipeline
 from eval_provider import EvalConfig, add_provider_args, cfg_from_args
 
 try:
@@ -70,14 +70,23 @@ def _make_uptrain_settings(cfg: EvalConfig) -> Settings:
     using the supplied API key, rather than routing traffic through UpTrain's
     hosted cloud service (which requires a separate account and times out
     without one).
+
+    For --judge-provider local, UpTrain's OpenAI client is pointed at the
+    base URL supplied via --judge-base-url so that evaluation calls go to the
+    local OpenAI-compatible server instead of api.openai.com.
     """
     p = cfg._jp()
     k = cfg._jk()
     m = cfg._jm()
+    base_url = cfg._jb()   # None unless --judge-base-url was set
 
     if p == "local":
         # Local OpenAI-compatible server — key is ignored by most servers.
-        return Settings(openai_api_key="EMPTY", evaluate_locally=True, model=m)
+        # Pass openai_api_base so UpTrain routes requests to the local endpoint.
+        kwargs: dict = dict(openai_api_key="EMPTY", evaluate_locally=True, model=m)
+        if base_url:
+            kwargs["openai_api_base"] = base_url
+        return Settings(**kwargs)
 
     # openai / gemini / claude — all evaluated locally via the OpenAI client
     # that UpTrain bundles.  Non-OpenAI providers work if their API is

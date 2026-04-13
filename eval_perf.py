@@ -66,7 +66,7 @@ def build_instrumented_graph(cfg: EvalConfig, vdb, perf_log: list[dict]):
     lm_m  = _sa._llm(app_cfg, 0.1)   # knowledge_mapper
     lm_c  = _sa._llm(app_cfg, 0.0)   # critic
     lm_z  = _sa._llm(app_cfg, 0.5)   # summarizer
-    lm_x  = _sa._llm(app_cfg, 0.3)   # experiment_design
+    lm_x  = _sa._llm(app_cfg, 0.4)   # experiment_design
 
     agent_fns = {
         "scoping":            lambda s: _sa.scoping_agent(s, lm_sc),

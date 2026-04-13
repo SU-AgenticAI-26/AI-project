@@ -281,7 +281,7 @@ def _rebuild_graph(app_cfg, vdb, router_fn=None, critic_fn=None):
     lm_m  = _sa._llm(app_cfg, 0.1)
     lm_c  = _sa._llm(app_cfg, 0.0)
     lm_z  = _sa._llm(app_cfg, 0.5)
-    lm_x  = _sa._llm(app_cfg, 0.3)
+    lm_x  = _sa._llm(app_cfg, 0.4)
 
     router = router_fn if router_fn else lambda s: _sa.router_agent(s, lm_r)
     critic = critic_fn if critic_fn else lambda s: _sa.critic_agent(s, lm_c)
