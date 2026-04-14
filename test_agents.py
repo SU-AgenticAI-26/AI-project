@@ -12,9 +12,7 @@ are mocked.
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,95 +23,10 @@ from unittest.mock import MagicMock, patch
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _patch_imports() -> None:
-    if "streamlit_app" in sys.modules:
-        return  # already patched by another test module in this session
-
-    mocks: dict = {}
-
-    # streamlit
-    st_mock = MagicMock()
-    st_mock.button.return_value = False
-    st_mock.form_submit_button.return_value = False
-    st_mock.text_input.return_value = ""
-    st_mock.text_area.return_value = ""
-    st_mock.number_input.return_value = 5
-    st_mock.checkbox.return_value = False
-    st_mock.file_uploader.return_value = None
-    st_mock.selectbox.return_value = "OpenAI"
-    st_mock.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
-    st_mock.columns.side_effect = (
-        lambda n: [MagicMock() for _ in (range(n) if isinstance(n, int) else n)]
-    )
-    st_mock.session_state.__contains__ = lambda self, key: False
-    mocks["streamlit"] = st_mock
-
-    # pyvis
-    pyvis_mod = types.ModuleType("pyvis")
-    pyvis_net = types.ModuleType("pyvis.network")
-    pyvis_net.Network = MagicMock()
-    pyvis_mod.network = pyvis_net
-    mocks["pyvis"] = pyvis_mod
-    mocks["pyvis.network"] = pyvis_net
-
-    # langchain_core
-    class _Msg:
-        def __init__(self, content: str = "", **_kw):
-            self.content = content
-
-    class _Doc:
-        def __init__(self, page_content: str = "", metadata: dict | None = None, **_kw):
-            self.page_content = page_content
-            self.metadata = metadata or {}
-
-    lc_core      = types.ModuleType("langchain_core")
-    lc_core_docs = types.ModuleType("langchain_core.documents")
-    lc_core_msgs = types.ModuleType("langchain_core.messages")
-    lc_core_llms = types.ModuleType("langchain_core.language_models")
-    lc_core_docs.Document      = _Doc
-    lc_core_msgs.AIMessage     = _Msg
-    lc_core_msgs.HumanMessage  = _Msg
-    lc_core_msgs.SystemMessage = _Msg
-    lc_core_llms.BaseChatModel = MagicMock
-    lc_core.documents          = lc_core_docs
-    lc_core.messages           = lc_core_msgs
-    lc_core.language_models    = lc_core_llms
-    mocks["langchain_core"]                 = lc_core
-    mocks["langchain_core.documents"]       = lc_core_docs
-    mocks["langchain_core.messages"]        = lc_core_msgs
-    mocks["langchain_core.language_models"] = lc_core_llms
-
-    for mod in [
-        "langchain_openai",
-        "langchain_community",
-        "langchain_community.vectorstores",
-        "langchain_community.vectorstores.FAISS",
-        "langchain_community.embeddings",
-        "langchain_text_splitters",
-        "faiss",
-    ]:
-        mocks[mod] = MagicMock()
-    mocks["langchain_community.vectorstores"].FAISS.load_local.side_effect = Exception("mock")
-
-    # langgraph
-    langgraph_mod   = types.ModuleType("langgraph")
-    langgraph_graph = types.ModuleType("langgraph.graph")
-    langgraph_graph.END = "END"
-
-    class _FakeStateGraph:
-        def __init__(self, *a, **kw): pass
-        def add_node(self, *a, **kw): pass
-        def add_edge(self, *a, **kw): pass
-        def add_conditional_edges(self, *a, **kw): pass
-        def set_entry_point(self, *a, **kw): pass
-        def compile(self): return MagicMock()
-
-    langgraph_graph.StateGraph = _FakeStateGraph
-    langgraph_mod.graph = langgraph_graph
-    mocks["langgraph"] = langgraph_mod
-    mocks["langgraph.graph"] = langgraph_graph
-
-    for key, val in mocks.items():
-        sys.modules[key] = val
+    # All shims are installed by conftest.py, which pytest loads before any
+    # test module is collected.  This function is kept as a call-site marker
+    # but is a no-op for normal pytest runs.
+    pass
 
 
 _patch_imports()
@@ -298,12 +211,15 @@ class TestSqlDbAgent(unittest.TestCase):
         self.assertEqual(result["sql_findings"], "SQL_RESPONSE")
 
     def test_activity_log_structure(self):
+        # Tests run the non-tool-calling fallback path (model is MagicMock, not
+        # ChatOpenAI).  That path does not include a "rows" key in the log entry;
+        # "rows" is only present in the tool-driven (OpenAI) path.
         state  = _make_state(active_agents=["sql_db"])
         result = app.sql_db_agent(state, _mock_llm("r"))
         entry  = result["activity_log"][0]
         self.assertEqual(entry["agent"], "sql_db")
         self.assertEqual(entry["icon"], "🗄️")
-        self.assertIn("rows", entry)
+        self.assertIn("detail", entry)
 
     def test_llm_receives_query_in_prompt(self):
         model = _mock_llm("r")
