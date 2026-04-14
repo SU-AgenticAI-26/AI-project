@@ -41,6 +41,14 @@ except ImportError as e:
 
 
 # ---------------------------------------------------------------------------
+# Thresholds — single source of truth used by metric constructors,
+# pass/fail checks, and the printed header.
+# ---------------------------------------------------------------------------
+
+_ROUTER_THRESHOLD    = 0.80
+_COHERENCE_THRESHOLD = 0.65
+
+# ---------------------------------------------------------------------------
 # Metric definitions
 # ---------------------------------------------------------------------------
 
@@ -71,14 +79,14 @@ def make_thematic_coherence_metric(cfg: EvalConfig) -> GEval:
             LLMTestCaseParams.ACTUAL_OUTPUT,
             LLMTestCaseParams.RETRIEVAL_CONTEXT,
         ],
-        threshold=0.65,
+        threshold=_COHERENCE_THRESHOLD,
         model=cfg.deepeval_model(),
     )  # include_reason removed in deepeval 3.x; reason is still set on .reason after measure()
 
 
 def make_router_metric() -> ToolCorrectnessMetric:
     return ToolCorrectnessMetric(
-        threshold=0.8,
+        threshold=_ROUTER_THRESHOLD,
         include_reason=True,
     )
 
@@ -86,6 +94,40 @@ def make_router_metric() -> ToolCorrectnessMetric:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+def _print_header() -> None:
+    print("""\
+╔══════════════════════════════════════════════════════════════════╗
+║                    DeepEval Evaluation Framework                 ║
+╠══════════════════════════════════════════════════════════════════╣
+║  What it is:                                                     ║
+║    DeepEval is an open-source LLM testing framework with         ║
+║    built-in agentic metrics. It evaluates whether the Router     ║
+║    selected the right tools (channels) and whether the final     ║
+║    summary synthesises across sources rather than listing them.  ║
+║                                                                  ║
+║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
+║    router_score      ToolCorrectnessMetric: did the Router        ║
+║  (channel routing)  activate the expected retrieval channels     ║
+║                     for this query type? Scored by exact set     ║
+║                     overlap between activated and expected tools. ║
+║    coherence_score   GEval (ThematicCoherence): does the summary ║
+║  (synthesis quality) organise findings by research theme rather  ║
+║                     than source-by-source? Checks for cross-     ║
+║                     source synthesis and identified tensions.    ║
+║                                                                  ║
+║  How to read the output:                                         ║
+║    Each query prints both metric scores with PASS/FAIL flags     ║
+║    and a human-readable reason from the judge LLM explaining     ║
+║    why that score was assigned. The aggregate section shows      ║
+║    mean scores and pass rates across all queries.                ║
+║    coherence_score is None when the pipeline returned no summary ║
+║    or context for that query.                                    ║
+╚══════════════════════════════════════════════════════════════════╝""")
+    print(f"  PASS thresholds (≥ to PASS):")
+    print(f"    router_score:    {_ROUTER_THRESHOLD}")
+    print(f"    coherence_score: {_COHERENCE_THRESHOLD}")
+
 
 def run_deepeval_eval(
     query_ids: list[str] | None = None,
@@ -96,6 +138,8 @@ def run_deepeval_eval(
     # Legacy kwarg kept for backwards compatibility
     api_key: str | None = None,
 ) -> list[dict]:
+    _print_header()
+
     if cfg is None:
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not key:
@@ -164,10 +208,10 @@ def run_deepeval_eval(
             "expected_channels": tq["expected_channels"],
             "router_score":      router_score,
             "router_reason":     router_reason,
-            "router_pass":       router_score >= 0.8,
+            "router_pass":       router_score >= _ROUTER_THRESHOLD,
             "coherence_score":   coherence_score,
             "coherence_reason":  coherence_reason,
-            "coherence_pass":    (coherence_score or 0) >= 0.65,
+            "coherence_pass":    (coherence_score or 0) >= _COHERENCE_THRESHOLD,
             "loop_count":        state.get("loop_count", 0),
         }
 

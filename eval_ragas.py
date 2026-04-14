@@ -138,6 +138,44 @@ def evaluate_entity_recall(
 # Runner
 # ---------------------------------------------------------------------------
 
+def _print_header() -> None:
+    print("""\
+╔══════════════════════════════════════════════════════════════════╗
+║                      RAGAS Evaluation Framework                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║  What it is:                                                     ║
+║    RAGAS (Retrieval-Augmented Generation Assessment) is an       ║
+║    open-source framework for evaluating RAG pipelines. It uses   ║
+║    a judge LLM to score faithfulness and relevance, and an       ║
+║    embedding model to measure semantic alignment. All queries    ║
+║    are evaluated concurrently to reduce wall-clock time.         ║
+║                                                                  ║
+║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
+║    faithfulness        Are all claims in the summary grounded    ║
+║                        in the retrieved context? Penalises       ║
+║                        hallucinated or unsupported statements.   ║
+║    response_relevancy  Does the summary directly and completely  ║
+║                        address the research query?               ║
+║    context_precision   Is the retrieved context focused on the   ║
+║                        query, or does it contain noise?          ║
+║    entity_recall       Fraction of knowledge-graph node labels   ║
+║                        that appear in the merged context         ║
+║                        (lightweight string-match proxy).         ║
+║                                                                  ║
+║  PASS thresholds:                                                ║
+║    faithfulness ≥ 0.75  |  response_relevancy ≥ 0.75            ║
+║    context_precision ≥ 0.70  |  entity_recall ≥ 0.60            ║
+║                                                                  ║
+║  How to read the output:                                         ║
+║    Phase 1 runs (or reuses cached) pipeline results for all      ║
+║    queries. Phase 2 evaluates them concurrently via RAGAS.       ║
+║    Phase 3 prints per-query scores and a final aggregate table.  ║
+║    A score of None means the RAGAS judge call failed or returned ║
+║    NaN (often a timeout or JSON-parse error from the judge LLM). ║
+╚══════════════════════════════════════════════════════════════════╝
+""")
+
+
 def run_ragas_eval(
     query_ids: list[str] | None = None,
     output_dir: str = "eval_results",
@@ -148,6 +186,8 @@ def run_ragas_eval(
     # Legacy kwarg kept for backwards compatibility
     api_key: str | None = None,
 ) -> list[dict]:
+    _print_header()
+
     if cfg is None:
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not key:
@@ -244,7 +284,7 @@ def run_ragas_eval(
 
         # Pass/fail flags
         result["faithfulness_pass"]      = (result["faithfulness"] or 0) >= 0.75
-        result["relevancy_pass"]         = (result["response_relevancy"] or 0) >= 0.75
+        result["response_relevancy_pass"] = (result["response_relevancy"] or 0) >= 0.75
         result["context_precision_pass"] = (result["context_precision"] or 0) >= 0.70
         result["entity_recall_pass"]     = result["entity_recall"] >= 0.60
 
