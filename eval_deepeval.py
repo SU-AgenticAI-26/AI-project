@@ -87,6 +87,41 @@ def make_router_metric() -> ToolCorrectnessMetric:
 # Runner
 # ---------------------------------------------------------------------------
 
+def _print_header() -> None:
+    print("""
+╔══════════════════════════════════════════════════════════════════╗
+║                    DeepEval Evaluation Framework                 ║
+╠══════════════════════════════════════════════════════════════════╣
+║  What it is:                                                     ║
+║    DeepEval is an open-source LLM testing framework with         ║
+║    built-in agentic metrics. It evaluates whether the Router     ║
+║    selected the right tools (channels) and whether the final     ║
+║    summary synthesises across sources rather than listing them.  ║
+║                                                                  ║
+║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
+║    router_score      ToolCorrectnessMetric: did the Router        ║
+║  (channel routing)  activate the expected retrieval channels     ║
+║                     for this query type? Scored by exact set     ║
+║                     overlap between activated and expected tools. ║
+║    coherence_score   GEval (ThematicCoherence): does the summary ║
+║  (synthesis quality) organise findings by research theme rather  ║
+║                     than source-by-source? Checks for cross-     ║
+║                     source synthesis and identified tensions.    ║
+║                                                                  ║
+║  PASS thresholds:                                                ║
+║    router_score ≥ 0.80  |  coherence_score ≥ 0.65               ║
+║                                                                  ║
+║  How to read the output:                                         ║
+║    Each query prints both metric scores with PASS/FAIL flags     ║
+║    and a human-readable reason from the judge LLM explaining     ║
+║    why that score was assigned. The aggregate section shows      ║
+║    mean scores and pass rates across all queries.                ║
+║    coherence_score is None when the pipeline returned no summary ║
+║    or context for that query.                                    ║
+╚══════════════════════════════════════════════════════════════════╝
+""")
+
+
 def run_deepeval_eval(
     query_ids: list[str] | None = None,
     output_dir: str = "eval_results",
@@ -96,6 +131,8 @@ def run_deepeval_eval(
     # Legacy kwarg kept for backwards compatibility
     api_key: str | None = None,
 ) -> list[dict]:
+    _print_header()
+
     if cfg is None:
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not key:
