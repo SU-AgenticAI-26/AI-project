@@ -407,7 +407,7 @@ _KM_WITH_NODES = {
     "edges": [{"source": "0", "target": "1", "relation": "r", "weight": 0.5}],
 }
 
-# Structural PASS: ≥ 8 nodes, ≥ 4 edges, ≥ 2 distinct types.
+# Structural PASS: ≥ 5 nodes, ≥ 4 edges, ≥ 2 distinct types.
 _KM_STRUCTURAL_PASS = {
     "nodes": [
         *[{"id": str(i),   "label": f"concept{i}", "type": "concept", "source": "web"}
@@ -500,7 +500,7 @@ class TestCriticAgent(unittest.TestCase):
     def test_delta_guard_suppresses_needs_more_when_graph_did_not_grow(self):
         """
         If an enrichment pass already ran (loop_count >= 1) and the graph grew
-        by fewer than 2 nodes, _needs_more must be forced False even when the
+        by fewer than 4 nodes, _needs_more must be forced False even when the
         structural checks would otherwise request more enrichment.
         """
         # _KM_WITH_NODES has structural failures (edges < 4, types < 2).
@@ -541,14 +541,14 @@ class TestCriticAgent(unittest.TestCase):
 
     def test_delta_guard_allows_enrichment_when_graph_grew(self):
         """
-        When the graph grew by >= 2 nodes after an enrichment pass, the delta
+        When the graph grew by >= 4 nodes after an enrichment pass, the delta
         guard does not suppress _needs_more even if loop_count >= 1.
         """
         n = len(_KM_WITH_NODES["nodes"])  # 10
         state = _make_state(
             knowledge_map=_KM_WITH_NODES,
             loop_count=1,
-            _prev_node_count=n - 3,   # graph grew by 3 — above threshold
+            _prev_node_count=n - 5,   # graph grew by 5 — above threshold of 4
         )
         result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
         # structural checks still fail (edges < 4, types < 2) and delta is ok
