@@ -211,7 +211,7 @@ def _judge_task_success(
 # ---------------------------------------------------------------------------
 
 def _print_header() -> None:
-    print("""
+    print("""\
 ╔══════════════════════════════════════════════════════════════════╗
 ║                  AgentBench Evaluation Framework                 ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -238,18 +238,16 @@ def _print_header() -> None:
 ║                         1.0 in ideal range [8, 25]; tapers to    ║
 ║                         0.0 below 8 or above 50 nodes.           ║
 ║                                                                  ║
-║  PASS thresholds:                                                ║
-║    task_success ≥ 0.70  |  channel_f1 ≥ 0.75                    ║
-║    iteration_efficiency ≥ 0.70  |  kg_density ≥ 0.60            ║
-║                                                                  ║
 ║  How to read the output:                                         ║
 ║    Each query shows per-metric scores with a PASS/FAIL flag.     ║
 ║    The aggregate table breaks results down by difficulty bucket  ║
 ║    (easy / medium / hard), mirroring the original AgentBench     ║
 ║    per-task-category reporting style.                            ║
 ║    task_success is None when --no-llm-judge is used.            ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
+╚══════════════════════════════════════════════════════════════════╝""")
+    print("  PASS thresholds (≥ to PASS):")
+    for metric, threshold in THRESHOLDS.items():
+        print(f"    {metric}: {threshold}")
 
 
 def run_agentbench_eval(

@@ -163,7 +163,7 @@ def _evaluate_query(
 # ---------------------------------------------------------------------------
 
 def _print_header() -> None:
-    print("""
+    print("""\
 ╔══════════════════════════════════════════════════════════════════╗
 ║                    UpTrain Evaluation Framework                  ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -183,19 +183,16 @@ def _print_header() -> None:
 ║    response_conciseness  Is the summary free of irrelevant       ║
 ║                          padding or off-topic content?           ║
 ║                                                                  ║
-║  PASS thresholds (aligned with RAGAS for cross-framework         ║
-║  comparability):                                                 ║
-║    response_relevance ≥ 0.75  |  response_completeness ≥ 0.70   ║
-║    context_relevance ≥ 0.65   |  response_conciseness ≥ 0.60    ║
-║                                                                  ║
 ║  How to read the output:                                         ║
 ║    Each query prints a score and PASS/FAIL for every metric.     ║
 ║    The aggregate section shows the mean score and pass rate      ║
 ║    across all queries, with the threshold listed for reference.  ║
 ║    A score of None means the pipeline returned an empty summary  ║
 ║    or context for that query and evaluation was skipped.         ║
-╚══════════════════════════════════════════════════════════════════╝
-""")
+╚══════════════════════════════════════════════════════════════════╝""")
+    print("  PASS thresholds (aligned with RAGAS, ≥ to PASS):")
+    for metric, threshold in THRESHOLDS.items():
+        print(f"    {metric}: {threshold}")
 
 
 def run_uptrain_eval(

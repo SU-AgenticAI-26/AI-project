@@ -139,7 +139,7 @@ def evaluate_entity_recall(
 # ---------------------------------------------------------------------------
 
 def _print_header() -> None:
-    print("""
+    print("""\
 ╔══════════════════════════════════════════════════════════════════╗
 ║                      RAGAS Evaluation Framework                  ║
 ╠══════════════════════════════════════════════════════════════════╣
@@ -284,7 +284,7 @@ def run_ragas_eval(
 
         # Pass/fail flags
         result["faithfulness_pass"]      = (result["faithfulness"] or 0) >= 0.75
-        result["relevancy_pass"]         = (result["response_relevancy"] or 0) >= 0.75
+        result["response_relevancy_pass"] = (result["response_relevancy"] or 0) >= 0.75
         result["context_precision_pass"] = (result["context_precision"] or 0) >= 0.70
         result["entity_recall_pass"]     = result["entity_recall"] >= 0.60
 
