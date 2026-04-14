@@ -2089,9 +2089,11 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
         "3. Keep the answer focused and direct. Omit preamble, meta-commentary about the pipeline, "
         "and source-listing that doesn't add substance.\n\n"
         "CITATION RULES — for grounding validation:\n"
-        "When stating substantive claims, wrap them in double quotes and append the source tag. "
-        "Example: \"Diffusion models work by iteratively predicting and removing noise\" [Vector DB].\n"
-        "Include 5–10 quoted key claims spread across themes."
+        "When stating substantive claims, wrap them in double quotes and append one of these source tags: "
+        "[VectorDB], [SQL], [Web], or [Extraction]. Example: "
+        "\"Diffusion models work by iteratively predicting and removing noise\" [VectorDB].\n"
+        "Include 5–10 quoted key claims spread across themes. Keep each quoted claim between 20 and "
+        "150 characters so it can be validated."
     ))
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
