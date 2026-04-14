@@ -2031,10 +2031,15 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 
     # All three criteria are structural facts — compute deterministically in Python
     # rather than asking an LLM, which adds latency/tokens and can misparse output.
+    #
+    # Thresholds are intentionally conservative (nodes ≥ 5, not 8) so that a
+    # healthy first-pass graph doesn't trigger a costly enrichment loop.
+    # The delta-node guard (≥ 4 new nodes) is the primary brake on over-looping:
+    # if retrieval can't meaningfully grow the graph, looping wastes wall-time.
     n = len(nodes)
     failures = []
-    if n < 8:
-        failures.append(f"only {n} nodes (need ≥ 8)")
+    if n < 5:
+        failures.append(f"only {n} nodes (need ≥ 5)")
     if len(edges) < 4:
         failures.append(f"only {len(edges)} edges (need ≥ 4)")
     if len(types) < 2:
@@ -2044,15 +2049,15 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     feedback = "Needs enrichment: " + "; ".join(failures) if failures else "Graph meets structural requirements."
 
     # Delta-node guard: if an enrichment pass already ran and the graph didn't
-    # grow by at least 2 nodes, suppress further looping to avoid wasted passes.
-    # This catches the case where the critic keeps flagging but retrieval returns
-    # the same content, producing no meaningful graph improvement.
+    # grow by at least 4 nodes, suppress further looping to avoid wasted passes.
+    # Raised from 2 → 4: marginal growth (1–3 nodes) doesn't justify another
+    # full retrieval round-trip, as the ablation shows no_critic recall ≥ full recall.
     prev_n = state.get("_prev_node_count", 0)
-    if needs and state.get("loop_count", 0) >= 1 and (n - prev_n) < 2:
+    if needs and state.get("loop_count", 0) >= 1 and (n - prev_n) < 4:
         needs = False
         feedback = (
             f"Stopping enrichment: graph grew by only {n - prev_n} node(s) "
-            f"after previous pass (threshold: 2). Original issue: {feedback}"
+            f"after previous pass (threshold: 4). Original issue: {feedback}"
         )
 
     return {
@@ -2072,11 +2077,21 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 # ── 8. Summarizer ─────────────────────────────────────────────────────────────
 def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
-        "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
-        "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from.\n\n"
-        "CRITICAL FOR GROUNDING VALIDATION: When stating substantive claims, wrap them in double quotes. "
-        "Example: \"Diffusion models work by iteratively predicting and removing noise\" (source: Vector DB).\n"
-        "This enables automatic citation verification. Include 5-10 quoted key claims to ensure grounding validation works."
+        "You are a Summarizer Agent. Write a concise, thematically-organised answer that directly "
+        "addresses the research query.\n\n"
+        "STRUCTURE RULES — you MUST follow these:\n"
+        "1. Organise your answer by RESEARCH THEME, not by source. Do NOT write 'Source A says… "
+        "Source B says…'. Instead, group findings under 2–4 theme headings that emerge from the "
+        "evidence (e.g. '## Approaches', '## Key Challenges', '## Open Questions').\n"
+        "2. Within each theme, synthesise findings from MULTIPLE sources into unified statements. "
+        "Where sources agree, state the consensus. Where they disagree or tension exists, surface "
+        "the conflict explicitly (e.g. 'While X proposes …, Y argues …').\n"
+        "3. Keep the answer focused and direct. Omit preamble, meta-commentary about the pipeline, "
+        "and source-listing that doesn't add substance.\n\n"
+        "CITATION RULES — for grounding validation:\n"
+        "When stating substantive claims, wrap them in double quotes and append the source tag. "
+        "Example: \"Diffusion models work by iteratively predicting and removing noise\" [Vector DB].\n"
+        "Include 5–10 quoted key claims spread across themes."
     ))
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
