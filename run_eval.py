@@ -24,7 +24,13 @@ Usage:
     # Only specific queries
     python run_eval.py --query-ids q1_rag q2_federated
 
-Available modules: ragas, deepeval, uptrain, agentbench, graph, perf, baseline, ablation
+    # Reset all cached state before running (clean slate)
+    python run_eval.py --clean
+
+    # Inspect what --clean would remove without deleting anything
+    python run_eval.py --clean --dry-run
+
+Available modules: ragas, deepeval, uptrain, agentbench, graph, perf, baseline, ablation, citation
 """
 
 from __future__ import annotations
@@ -81,6 +87,59 @@ PASS_THRESHOLDS = {
     # Citation
     "citation_accuracy":     0.75,
 }
+
+
+# ---------------------------------------------------------------------------
+# Clean / reset helpers
+# ---------------------------------------------------------------------------
+
+_APP_DATA_ROOT = Path("collab_rag_data")
+
+def clean_eval_state(output_dir: str, dry_run: bool = False) -> None:
+    """
+    Delete all state that can influence eval results between sessions:
+
+      1. Pipeline cache JSON(s) — stale LLM outputs reused by --rerun-pipelines
+      2. App query cache        — collab_rag_data/cache/*.json (20-day TTL)
+      3. FAISS vector indices   — collab_rag_data/vectorstore/**/index.{faiss,pkl}
+                                  (grows with interactive app use; biases vector_db_agent)
+
+    Timestamped eval output files (ragas_*.json, summary_*.json, …) and the SQL
+    knowledge.db are left untouched — they don't affect future pipeline runs.
+    """
+    targets: list[Path] = []
+
+    # 1. Pipeline cache files in output_dir and repo root
+    for pattern in (
+        Path(output_dir).glob("pipeline_cache_*.json"),
+        Path(".").glob("pipeline_cache_*.json"),
+    ):
+        targets.extend(pattern)
+
+    # 2. App query cache
+    targets.extend((_APP_DATA_ROOT / "cache").glob("*.json"))
+
+    # 3. FAISS vector indices (all embedding-backend subdirectories)
+    for suffix in ("index.faiss", "index.pkl"):
+        targets.extend((_APP_DATA_ROOT / "vectorstore").rglob(suffix))
+
+    if not targets:
+        print("  [clean] Nothing to remove — already clean.")
+        return
+
+    label = "Would remove" if dry_run else "Removing"
+    total = 0
+    for p in sorted(targets):
+        size = p.stat().st_size if p.exists() else 0
+        print(f"  {label}: {p}  ({size:,} bytes)")
+        if not dry_run:
+            p.unlink(missing_ok=True)
+            total += size
+
+    if dry_run:
+        print(f"  [dry-run] {len(targets)} file(s) would be removed.")
+    else:
+        print(f"  [clean] Removed {len(targets)} file(s), freed {total:,} bytes.")
 
 
 # ---------------------------------------------------------------------------
@@ -381,8 +440,24 @@ if __name__ == "__main__":
     parser.add_argument("--rerun-pipelines", action="store_true",
                         dest="rerun_pipelines",
                         help="Ignore disk pipeline cache and re-run all pipelines")
+    parser.add_argument("--clean", action="store_true",
+                        help="Delete pipeline cache, app query cache, and FAISS indices "
+                             "before running, ensuring a clean-slate eval")
+    parser.add_argument("--dry-run", action="store_true",
+                        dest="dry_run",
+                        help="With --clean: print what would be deleted without removing anything")
     add_provider_args(parser)
     args = parser.parse_args()
+
+    if args.clean or args.dry_run:
+        label = "DRY RUN — " if args.dry_run else ""
+        print(f"\n{'='*60}")
+        print(f"{label}CLEANING EVAL STATE")
+        print(f"{'='*60}")
+        clean_eval_state(args.output_dir, dry_run=args.dry_run)
+        if args.dry_run:
+            raise SystemExit(0)
+        print()
 
     cfg = cfg_from_args(args)
 
