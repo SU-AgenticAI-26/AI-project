@@ -78,6 +78,8 @@ PASS_THRESHOLDS = {
     "channel_f1":            0.75,
     "iteration_efficiency":  0.70,
     "kg_density":            0.60,
+    # Citation
+    "citation_accuracy":     0.75,
 }
 
 
@@ -162,7 +164,7 @@ def run_full_eval(
     # Results are also persisted to a JSON file so that interrupted runs can
     # be resumed without re-running the expensive LangGraph pipeline steps.
     # ------------------------------------------------------------------
-    _cache_consumers = {"ragas", "deepeval", "graph", "uptrain", "agentbench"}
+    _cache_consumers = {"ragas", "deepeval", "graph", "uptrain", "agentbench", "citation"}
     pipeline_cache: dict = {}
     if set(modules) & _cache_consumers:
         from test_queries import TEST_QUERIES, run_pipeline
@@ -314,6 +316,21 @@ def run_full_eval(
                 "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
             }
 
+    # --- Citation ---
+    if "citation" in modules:
+        print("\n" + "="*60)
+        print("MODULE: Citation Verifier")
+        print("="*60)
+        from eval_citation import run_citation_eval
+        cit_results = run_citation_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+        summary["results"]["citation"] = cit_results
+
+        mean, passed = check_pass(cit_results, "citation_accuracy",
+                                   PASS_THRESHOLDS["citation_accuracy"])
+        summary["pass_fail"]["citation_accuracy"] = {
+            "mean": mean, "threshold": PASS_THRESHOLDS["citation_accuracy"], "pass": passed
+        }
+
     # --- Ablation ---
     if "ablation" in modules:
         print("\n" + "="*60)
@@ -351,7 +368,7 @@ def run_full_eval(
 
 
 if __name__ == "__main__":
-    ALL_MODULES = ["ragas", "deepeval", "uptrain", "agentbench", "graph", "perf", "baseline", "ablation"]
+    ALL_MODULES = ["ragas", "deepeval", "uptrain", "agentbench", "graph", "perf", "baseline", "ablation", "citation"]
 
     parser = argparse.ArgumentParser(description="Run full evaluation suite")
     parser.add_argument("--quick",      action="store_true",
