@@ -329,15 +329,16 @@ def compute_citation_metrics(
 
     grounding_map: dict = {}
     grounded_count = 0
-    similarity_sum = 0.0
 
     for cit in citations:
         hint = cit["source_hint"]
         candidates = buckets.get(hint, []) if hint else []
+        actual_source = hint or "all"
 
         # Fall back to "all" if the hinted bucket is too sparse
         if len(candidates) < 3:
             candidates = buckets["all"]
+            actual_source = "all"
 
         is_grounded, score, evidence = semantic_grounded(claim=cit["text"],
                                                          candidate_texts=candidates,
@@ -345,11 +346,10 @@ def compute_citation_metrics(
         if is_grounded:
             grounded_count += 1
 
-        similarity_sum += score
         key = cit["text"][:100]
         grounding_map[key] = {
             "grounded":   is_grounded,
-            "source":     hint or "all",
+            "source":     actual_source,
             "evidence":   evidence,
             "similarity": round(score, 4),
             "type":       cit["type"],

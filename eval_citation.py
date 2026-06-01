@@ -1,12 +1,16 @@
 """
 eval_citation.py — Semantic citation grounding evaluation.
 
-Metrics (computed without external API or LLM calls):
+Metrics:
   - citation_accuracy:  Fraction of cited claims that are semantically grounded
                         in the retrieved context. Pass: >= 0.75.
   - grounded_count:     Absolute count of grounded citations.
   - citation_count:     Total citations extracted from the summary.
   - mean_similarity:    Mean max cosine similarity across all citations.
+
+The citation *scoring* is fully local — it uses sentence-transformers/all-MiniLM-L6-v2
+(no external API calls). The pipeline run that produces the summary still calls
+the configured LLM provider (OpenAI, Groq, etc.) via run_pipeline().
 
 Uses sentence-transformers/all-MiniLM-L6-v2 (already in requirements.txt).
 First run downloads ~80MB model from HuggingFace; subsequent runs use disk cache.

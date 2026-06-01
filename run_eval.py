@@ -107,21 +107,30 @@ def clean_eval_state(output_dir: str, dry_run: bool = False) -> None:
     Timestamped eval output files (ragas_*.json, summary_*.json, …) and the SQL
     knowledge.db are left untouched — they don't affect future pipeline runs.
     """
-    targets: list[Path] = []
+    candidates: list[Path] = []
 
     # 1. Pipeline cache files in output_dir and repo root
     for pattern in (
         Path(output_dir).glob("pipeline_cache_*.json"),
         Path(".").glob("pipeline_cache_*.json"),
     ):
-        targets.extend(pattern)
+        candidates.extend(pattern)
 
     # 2. App query cache
-    targets.extend((_APP_DATA_ROOT / "cache").glob("*.json"))
+    candidates.extend((_APP_DATA_ROOT / "cache").glob("*.json"))
 
     # 3. FAISS vector indices (all embedding-backend subdirectories)
     for suffix in ("index.faiss", "index.pkl"):
-        targets.extend((_APP_DATA_ROOT / "vectorstore").rglob(suffix))
+        candidates.extend((_APP_DATA_ROOT / "vectorstore").rglob(suffix))
+
+    # Deduplicate by resolved path and drop any that no longer exist
+    seen: set[Path] = set()
+    targets: list[Path] = []
+    for p in candidates:
+        rp = p.resolve()
+        if rp not in seen and p.exists():
+            seen.add(rp)
+            targets.append(p)
 
     if not targets:
         print("  [clean] Nothing to remove — already clean.")
@@ -445,11 +454,15 @@ if __name__ == "__main__":
                              "before running, ensuring a clean-slate eval")
     parser.add_argument("--dry-run", action="store_true",
                         dest="dry_run",
-                        help="With --clean: print what would be deleted without removing anything")
+                        help="With --clean: print what would be deleted without removing anything. "
+                             "Implies --clean; exits before running any eval modules.")
     add_provider_args(parser)
     args = parser.parse_args()
 
-    if args.clean or args.dry_run:
+    if args.dry_run:
+        args.clean = True  # --dry-run implies --clean
+
+    if args.clean:
         label = "DRY RUN — " if args.dry_run else ""
         print(f"\n{'='*60}")
         print(f"{label}CLEANING EVAL STATE")
