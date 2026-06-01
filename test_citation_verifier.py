@@ -115,7 +115,7 @@ class TestExtractCitations(unittest.TestCase):
         cits = cv.extract_citations(summary)
         numeric = [c for c in cits if c["type"] == "numeric"]
         self.assertTrue(len(numeric) >= 1)
-        self.assertIn("[1]", numeric[0]["text"] + summary)
+        self.assertIn("[1]", numeric[0]["text"])
 
     def test_extracts_parenthetical_claim(self):
         summary = "Approaches described as a multi-step iterative refinement process (combining dense retrieval with reranking and cross-encoder scoring) show strong results."
@@ -308,23 +308,41 @@ class TestComputeCitationMetrics(unittest.TestCase):
         self.assertEqual(score, 1.0)
 
     def test_source_hint_used_to_select_bucket(self):
-        # Verify that when source_hint="vector_db" the model is only encoding
-        # from the vector_db bucket (not sql or web)
+        # Verify that when source_hint="vector_db" and the vector_db bucket has
+        # >= 3 candidates, encode() receives only vector_db text — not SQL or web.
         model = MagicMock()
         model.encode.side_effect = lambda texts, **kw: (
             np.array([1.0, 0.0]) if isinstance(texts, str)
             else np.array([[0.9, 0.436]] * len(texts))
         )
         summary = '"dense retrieval reduces hallucination in language model outputs" [VectorDB]'
+        # Three paragraphs of >= 10 words each → vector_db bucket has >= 3 candidates,
+        # so the fallback to "all" is not triggered.
+        vector_findings = (
+            "Dense retrieval is a core technique in information retrieval for NLP applications.\n\n"
+            "Retrieval augmented generation combines dense passage retrieval with language model outputs.\n\n"
+            "Vector search enables semantic similarity matching across large document collections efficiently."
+        )
+        sql_findings = "SENTINEL_SQL relational database schema knowledge stored here for testing purposes only"
+        web_findings = "SENTINEL_WEB live web search results from external sources retrieved for testing only"
         with patch("citation_verifier._get_model", return_value=model):
             cv.compute_citation_metrics(
                 summary=summary,
                 extraction_findings=_EXTRACTION_BLOCK,
                 merged_context="some merged context",
-                vector_findings="Dense retrieval is an important technique in NLP.",
+                vector_findings=vector_findings,
+                sql_findings=sql_findings,
+                web_findings=web_findings,
             )
-        # encode() called at least twice (claim + candidates)
-        self.assertGreaterEqual(model.encode.call_count, 2)
+        # Locate the encode() call that received the candidate list (not the claim string)
+        candidate_calls = [
+            c for c in model.encode.call_args_list
+            if not isinstance(c.args[0], str)
+        ]
+        self.assertTrue(candidate_calls, "encode() was never called with a candidate list")
+        candidates_used = " ".join(candidate_calls[0].args[0])
+        self.assertNotIn("SENTINEL_SQL", candidates_used)
+        self.assertNotIn("SENTINEL_WEB", candidates_used)
 
 
 if __name__ == "__main__":

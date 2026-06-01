@@ -99,7 +99,8 @@ def clean_eval_state(output_dir: str, dry_run: bool = False) -> None:
     """
     Delete all state that can influence eval results between sessions:
 
-      1. Pipeline cache JSON(s) — stale LLM outputs reused by --rerun-pipelines
+      1. Pipeline cache JSON(s) — stale LLM outputs served from disk on subsequent
+                             runs (bypassed only when --rerun-pipelines is passed)
       2. App query cache        — collab_rag_data/cache/*.json (20-day TTL)
       3. FAISS vector indices   — collab_rag_data/vectorstore/**/index.{faiss,pkl}
                                   (grows with interactive app use; biases vector_db_agent)

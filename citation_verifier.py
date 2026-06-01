@@ -346,7 +346,12 @@ def compute_citation_metrics(
         if is_grounded:
             grounded_count += 1
 
-        key = cit["text"][:100]
+        base_key = cit["text"][:100]
+        key = base_key
+        suffix = 1
+        while key in grounding_map:
+            key = f"{base_key}#{suffix}"
+            suffix += 1
         grounding_map[key] = {
             "grounded":   is_grounded,
             "source":     actual_source,
