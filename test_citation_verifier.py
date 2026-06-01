@@ -186,6 +186,41 @@ class TestExtractPaperChunks(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TestSlidingWindows
+# ---------------------------------------------------------------------------
+
+class TestSlidingWindows(unittest.TestCase):
+
+    def test_tail_always_covered(self):
+        # Build a paragraph where (len(words) - window) % step != 0 so the
+        # step-aligned loop leaves a trailing remainder.
+        # 25 words, window=10, step=8 → range(0, 16, 8) = [0, 8]
+        # last aligned window ends at word 18; words 18-24 are the tail.
+        words = [f"word{i}" for i in range(25)]
+        text = " ".join(words)
+        result = cv._sliding_windows(text, window=10, step=8)
+        joined = " ".join(result)
+        # The final word must appear in at least one window
+        self.assertIn("word24", joined)
+
+    def test_no_duplicate_tail_when_evenly_divisible(self):
+        # When (len(words) - window) % step == 0 the loop already covers the
+        # end exactly — no extra window should be appended.
+        # 20 words, window=10, step=10 → range(0, 11, 10) = [0, 10]; last
+        # window is words[10:20], which reaches the end.
+        words = [f"word{i}" for i in range(20)]
+        text = " ".join(words)
+        result = cv._sliding_windows(text, window=10, step=10)
+        self.assertEqual(len(result), 2)
+
+    def test_short_paragraph_returned_whole(self):
+        text = " ".join([f"word{i}" for i in range(15)])
+        result = cv._sliding_windows(text, window=20, step=10)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0], text)
+
+
+# ---------------------------------------------------------------------------
 # TestSemanticGrounded
 # ---------------------------------------------------------------------------
 

@@ -213,6 +213,10 @@ def _sliding_windows(text: str, window: int = 300, step: int = 150) -> list[str]
         else:
             for start in range(0, len(words) - window + 1, step):
                 windows.append(" ".join(words[start: start + window]))
+            # Always cover the tail: if the last step-aligned window doesn't
+            # reach the end of the paragraph, append a final window flush to it.
+            if (len(words) - window) % step != 0:
+                windows.append(" ".join(words[-window:]))
     return windows
 
 
