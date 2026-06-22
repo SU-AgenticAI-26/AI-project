@@ -88,18 +88,9 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, StateGraph
 
-from agents.scoping_agent import scoping_agent as _mod_scoping_agent
-from agents.router_agent import router_agent as _mod_router_agent
-from agents.vector_db_agent import vector_db_agent as _mod_vector_db_agent
-from agents.sql_db_agent import sql_db_agent as _mod_sql_db_agent
-from agents.web_agent import web_agent as _mod_web_agent
-from agents.reading_extraction_agent import reading_extraction_agent as _mod_reading_extraction_agent
-from agents.orchestrator_agent import orchestrator_agent as _mod_orchestrator_agent
-from agents.conflict_agent import conflict_agent as _mod_conflict_agent
-from agents.knowledge_mapper_agent import knowledge_mapper_agent as _mod_knowledge_mapper_agent
-from agents.critic_agent import critic_agent as _mod_critic_agent
-from agents.summarizer_agent import summarizer_agent as _mod_summarizer_agent
-from agents.experiment_design_agent import experiment_design_agent as _mod_experiment_design_agent
+# new code
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS
@@ -1961,102 +1952,129 @@ def web_agent(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> d
         except Exception as e:
             pass  # Gracefully skip if something goes wrong
 
-    # OpenAlex ──────────────────────────────────────────────────────────────
-    try:
-        r = requests.get("https://api.openalex.org/works",
-                         params={"search": query, "per-page": 5, "mailto": "research@example.com"},
-                         timeout=10)
-        if r.ok:
-            for item in r.json().get("results", []):
-                title   = item.get("title", "No title")
-                year    = item.get("publication_year", "")
-                authors = [a.get("author", {}).get("display_name", "")
-                           for a in item.get("authorships", [])[:3]]
-                results_text.append(f"[OpenAlex] {title} ({year}) — {', '.join(authors)}")
-                vdb.add_text(f"Title: {title}\nAuthors: {', '.join(authors)}\nYear: {year}",
-                             {"source": "openalex", "title": title})
-                indexed += 1
-            sources_used.append("OpenAlex")
-    except Exception as e:
-        errors.append(f"OpenAlex: {e}")
+        # New Start Fetch all four sources concurrently ────────────────────────────────
 
-    # ── Crossref ──────────────────────────────────────────────────────────────
-    try:
-        r = requests.get("https://api.crossref.org/works",
-                         params={"query": query, "rows": 5, "mailto": "research@example.com"},
-                         timeout=10)
-        if r.ok:
-            for item in r.json().get("message", {}).get("items", []):
-                title   = (item.get("title") or ["No title"])[0]
-                doi     = item.get("DOI", "")
-                authors = [f"{a.get('given','')} {a.get('family','')}".strip()
-                           for a in item.get("author", [])[:3]]
-                results_text.append(f"[Crossref] {title} — {', '.join(authors)} | doi:{doi}")
-                vdb.add_text(f"Title: {title}\nAuthors: {', '.join(authors)}\nDOI: {doi}",
-                             {"source": "crossref", "title": title})
-                indexed += 1
-            sources_used.append("Crossref")
-    except Exception as e:
-        errors.append(f"Crossref: {e}")
+        def _fetch_openalex():
+            papers = []
+            try:
+                r = requests.get("https://api.openalex.org/works",
+                                 params={"search": query, "per-page": 5,
+                                         "mailto": "research@example.com"},
+                                 timeout=10)
+                if r.ok:
+                    for item in r.json().get("results", []):
+                        title = item.get("title", "No title")
+                        year = item.get("publication_year", "")
+                        authors = [a.get("author", {}).get("display_name", "")
+                                   for a in item.get("authorships", [])[:3]]
+                        papers.append({
+                            "text": f"[OpenAlex] {title} ({year}) — {', '.join(authors)}",
+                            "doc": (f"Title: {title}\nAuthors: {', '.join(authors)}\nYear: {year}",
+                                    {"source": "openalex", "title": title}),
+                            "source": "OpenAlex",
+                        })
+            except Exception as e:
+                return [], f"OpenAlex: {e}"
+            return papers, None
 
-    # Semantic Scholar ──────────────────────────────────────────────────────
-    try:
-        ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
-        headers = {"x-api-key": ss_key} if ss_key else {}
-        r = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            params={"query": query,
-                    "limit": 5,
-                    "fields": "title,year,citationCount,authors"},
-            headers=headers, timeout=10
-        )
+        def _fetch_crossref():
+            papers = []
+            try:
+                r = requests.get("https://api.crossref.org/works",
+                                 params={"query": query, "rows": 5,
+                                         "mailto": "research@example.com"},
+                                 timeout=10)
+                if r.ok:
+                    for item in r.json().get("message", {}).get("items", []):
+                        title = (item.get("title") or ["No title"])[0]
+                        doi = item.get("DOI", "")
+                        authors = [f"{a.get('given', '')} {a.get('family', '')}".strip()
+                                   for a in item.get("author", [])[:3]]
+                        papers.append({
+                            "text": f"[Crossref] {title} — {', '.join(authors)} | doi:{doi}",
+                            "doc": (f"Title: {title}\nAuthors: {', '.join(authors)}\nDOI: {doi}",
+                                    {"source": "crossref", "title": title}),
+                            "source": "Crossref",
+                        })
+            except Exception as e:
+                return [], f"Crossref: {e}"
+            return papers, None
 
-        if r.ok:
-            for paper in r.json().get("data", []):
-                title   = paper.get("title", "No title")
-                year    = paper.get("year", "")
-                cites   = paper.get("citationCount", 0)
-                authors = [a.get("name","") for a in (paper.get("authors") or [])[:3]]
-                results_text.append(f"[Semantic Scholar] {title} ({year}) — {', '.join(authors)} — {cites} citations")
-                vdb.add_text(
-                    f"Title: {title}\nAuthors: {', '.join(authors)}\nYear: {year}\nCitations: {cites}",
-                    {"source": "semantic_scholar", "title": title}
+        def _fetch_semantic_scholar():
+            papers = []
+            try:
+                ss_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
+                headers = {"x-api-key": ss_key} if ss_key else {}
+                r = requests.get(
+                    "https://api.semanticscholar.org/graph/v1/paper/search",
+                    params={"query": query, "limit": 5,
+                            "fields": "title,year,citationCount,authors"},
+                    headers=headers, timeout=10,
                 )
-                indexed += 1
-            sources_used.append("Semantic Scholar")
-    except Exception as e:
-        errors.append(f"Semantic Scholar: {e}")
+                if r.ok:
+                    for paper in r.json().get("data", []):
+                        title = paper.get("title", "No title")
+                        year = paper.get("year", "")
+                        cites = paper.get("citationCount", 0)
+                        authors = [a.get("name", "") for a in (paper.get("authors") or [])[:3]]
+                        papers.append({
+                            "text": (f"[Semantic Scholar] {title} ({year}) — "
+                                     f"{', '.join(authors)} — {cites} citations"),
+                            "doc": (f"Title: {title}\nAuthors: {', '.join(authors)}\n"
+                                    f"Year: {year}\nCitations: {cites}",
+                                    {"source": "semantic_scholar", "title": title}),
+                            "source": "Semantic Scholar",
+                        })
+            except Exception as e:
+                return [], f"Semantic Scholar: {e}"
+            return papers, None
 
-    # arXiv ─────────────────────────────────────────────────────────────────
-    try:
-        encoded = urllib.parse.quote(query)
-        url = (f"http://export.arxiv.org/api/query"
-               f"?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance")
+        def _fetch_arxiv():
+            papers = []
+            try:
+                encoded = urllib.parse.quote(query)
+                url = (f"http://export.arxiv.org/api/query"
+                       f"?search_query=all:{encoded}&start=0&max_results=5&sortBy=relevance")
+                with urllib.request.urlopen(url, timeout=15) as resp:
+                    xml = resp.read().decode("utf-8")
+                ns = {"atom": "http://www.w3.org/2005/Atom"}
+                root = ET.fromstring(xml)
+                for entry in root.findall("atom:entry", ns):
+                    title = (entry.findtext("atom:title", "", ns) or "").strip().replace("\n", " ")
+                    summary = (entry.findtext("atom:summary", "", ns) or "").strip()[:400]
+                    eid = (entry.findtext("atom:id", "", ns) or "").strip()
+                    authors = [a.findtext("atom:name", "", ns)
+                               for a in entry.findall("atom:author", ns)]
+                    papers.append({
+                        "text": f"[arXiv] {title} — {', '.join(authors[:3])}\n{eid}",
+                        "doc": (f"Title: {title}\nAuthors: {', '.join(authors)}\n"
+                                f"Abstract: {summary}",
+                                {"source": "arXiv", "title": title,
+                                 "url": eid, "indexed_at": _stamp()}),
+                        "source": "arXiv",
+                    })
+            except Exception as e:
+                return [], f"arXiv: {e}"
+            return papers, None
 
-        with urllib.request.urlopen(url, timeout=15) as resp:
-            xml = resp.read().decode("utf-8")
+        # Run all four of the fetches in parallel collecting results in the main thread
+        # so that vdb.add_text (FAISS) is never called from multiple threads
+        fetchers = [_fetch_openalex, _fetch_crossref,
+                    _fetch_semantic_scholar, _fetch_arxiv]
 
-        ns      = {"atom": "http://www.w3.org/2005/Atom"}
-        root    = ET.fromstring(xml)
-        entries = root.findall("atom:entry", ns)
-
-        for entry in entries:
-            title   = (entry.findtext("atom:title",   "", ns) or "").strip().replace("\n", " ")
-            summary = (entry.findtext("atom:summary", "", ns) or "").strip()[:400]
-            eid     = (entry.findtext("atom:id",      "", ns) or "").strip()
-            authors = [a.findtext("atom:name","",ns) for a in entry.findall("atom:author",ns)]
-            results_text.append(f"[arXiv] {title} — {', '.join(authors[:3])}\n{eid}")
-
-            # Index into vector DB
-            vdb.add_text(
-                f"Title: {title}\nAuthors: {', '.join(authors)}\nAbstract: {summary}",
-                {"source": "arXiv", "title": title, "url": eid, "indexed_at": _stamp()},
-            )
-            indexed += 1
-        sources_used.append("arXiv")
-
-    except Exception as e:
-        errors.append(f"arXiv: {e}")
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {executor.submit(fn): fn for fn in fetchers}
+            for future in as_completed(futures):
+                papers, error = future.result()
+                if error:
+                    errors.append(error)
+                elif papers:
+                    for p in papers:
+                        results_text.append(p["text"])
+                        doc_text, doc_meta = p["doc"]
+                        vdb.add_text(doc_text, doc_meta)
+                        indexed += 1
+                    sources_used.append(papers[0]["source"])    ## new end
 
     # Build content for the LLM — errors are noted but never treated as findings.
     if results_text:
