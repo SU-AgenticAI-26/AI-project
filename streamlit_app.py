@@ -249,6 +249,8 @@ SQL_TRIGGER_PATTERNS = [
     "what are the main",
     "what approaches",
     "what mechanisms",
+    "approaches",
+    "mechanisms",
     "challenges",
     "list the",
     "compare",
@@ -2375,7 +2377,7 @@ def _route_critic(state: AgentState) -> str:
     The critique is passed to router to adjust active_agents strategy.
     """
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
-        return "orchestrator"
+        return "router"
     return "summarizer"
 
 
@@ -2513,6 +2515,11 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
     finally:
         tmp_path.unlink(missing_ok=True)
     return html
+
+
+def _html_to_data_uri(content: str) -> str:
+    """Embed inline HTML using a data URI for st.iframe."""
+    return "data:text/html;charset=utf-8," + urllib.parse.quote(content)
 
 
 
@@ -2728,19 +2735,19 @@ with tab_web:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        do_search = st.button("Search Web", use_container_width=True)
+        do_search = st.button("Search Web", width="stretch")
 
     with c2:
         add_to_rag = st.button(
             "Add Results to RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not st.session_state.web_results
         )
 
     with c3:
         ask_rag = st.button(
             "Ask with RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not web_q
         )
 
@@ -3083,7 +3090,7 @@ with tab_research:
                 for i, (s, c) in enumerate(src_counts.items()):
                     cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
                                      unsafe_allow_html=True)
-                st.components.v1.html(render_knowledge_map(km), height=520)
+                st.iframe(_html_to_data_uri(render_knowledge_map(km)), height=520, scrolling=True)
                 with st.expander("📊 Raw graph data"):
                     c1, c2 = st.columns(2)
                     c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
@@ -3122,7 +3129,7 @@ with tab_sql:
     st.header("SQL / DB Browser")
     topics = sql_list_topics()
     st.metric("Topics in DB", len(topics))
-    st.dataframe(topics, use_container_width=True)
+    st.dataframe(topics, width="stretch")
     st.divider()
     st.subheader("Test keyword search")
     test_q = st.text_input("Keyword")
@@ -3147,7 +3154,7 @@ with tab_maps:
                 if st.button("Visualise", key=f"vis_{m['file']}"):
                     raw = map_load(m["file"])
                     if raw:
-                        st.components.v1.html(render_knowledge_map(raw["map"]), height=470)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(raw["map"])), height=470, scrolling=True)
 
 
 # ════════════ TAB 4 — SESSIONS ════════════════════════════════════════════════
@@ -3210,7 +3217,7 @@ with tab_cache:
                     st.markdown(pl.get("summary",""))
                     km = pl.get("knowledge_map",{})
                     if km.get("nodes"):
-                        st.components.v1.html(render_knowledge_map(km, 400), height=420)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(km, 400)), height=420, scrolling=True)
     st.divider()
     if st.button("🧹 Clear ALL cache"):
         for p in CACHE_DIR.glob("*.json"):

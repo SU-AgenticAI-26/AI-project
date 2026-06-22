@@ -178,6 +178,15 @@ class TestRouterAgent(unittest.TestCase):
         result = app.router_agent(state, _mock_llm(resp))
         self.assertIn("sql_db", result["active_agents"])
 
+    def test_mechanisms_wording_force_sql_agent(self):
+        """Mechanism-enumeration wording should force sql_db even if LLM omits it."""
+        state = _make_state(
+            query="What collaboration mechanisms are used in multi-agent LLM systems?"
+        )
+        resp = json.dumps({"agents": ["vector_db", "web"], "reasoning": "recent systems focus"})
+        result = app.router_agent(state, _mock_llm(resp))
+        self.assertIn("sql_db", result["active_agents"])
+
     def test_non_trigger_query_does_not_force_sql_agent(self):
         """Queries without SQL trigger patterns should not add sql_db automatically."""
         state = _make_state(query="Explain transformer attention with a simple example")
@@ -428,6 +437,21 @@ class TestOrchestratorAgent(unittest.TestCase):
         human_content = model.invoke.call_args[0][0][-1].content
         self.assertIn("UNIQUE_QUERY_SENTINEL", human_content)
 
+    def test_returns_tagged_findings_with_sources(self):
+        result, _ = self._run(
+            vector_findings="vector claim A\n\nvector claim B",
+            sql_findings="sql claim",
+            web_findings="web claim",
+            extraction_findings="structured extraction",
+        )
+        tagged = result.get("tagged_findings", [])
+        self.assertGreaterEqual(len(tagged), 4)
+        sources = {item.get("source") for item in tagged}
+        self.assertIn("vector_db", sources)
+        self.assertIn("sql_db", sources)
+        self.assertIn("web", sources)
+        self.assertIn("merged", sources)
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Knowledge Mapper Agent
@@ -490,6 +514,37 @@ class TestKnowledgeMapperAgent(unittest.TestCase):
         human_content = model.invoke.call_args[0][0][-1].content
         self.assertIn("UNIQUE_CTX_SENTINEL", human_content)
 
+    def test_tagged_findings_sent_to_llm(self):
+        model = _mock_llm(_KM_VALID_JSON)
+        state = _make_state(
+            merged_context="ctx",
+            tagged_findings=[
+                {"text": "Transformer scaling study", "source": "vector_db"},
+                {"text": "Web benchmark report", "source": "web"},
+            ],
+        )
+        app.knowledge_mapper_agent(state, model)
+        human_content = model.invoke.call_args[0][0][-1].content
+        self.assertIn("tagged_findings JSON", human_content)
+        self.assertIn("vector_db", human_content)
+
+    def test_repairs_node_source_from_tagged_findings(self):
+        model_out = json.dumps({
+            "nodes": [
+                {"id": "n1", "label": "Transformer", "type": "concept", "source": "merged"}
+            ],
+            "edges": [],
+        })
+        state = _make_state(
+            merged_context="ctx",
+            tagged_findings=[
+                {"text": "Transformer architecture details from local corpus", "source": "vector_db"},
+                {"text": "Unrelated web trend", "source": "web"},
+            ],
+        )
+        result = app.knowledge_mapper_agent(state, _mock_llm(model_out))
+        self.assertEqual(result["knowledge_map"]["nodes"][0]["source"], "vector_db")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Critic Agent
@@ -536,7 +591,7 @@ class TestCriticAgent(unittest.TestCase):
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
         result = app.critic_agent(state, _mock_llm("definitely not json"))
         self.assertFalse(result["_needs_more"])
-        self.assertEqual(result["critique"], "")
+        self.assertIn("nodes=", result["critique"])
 
     def test_strips_markdown_fences(self):
         fenced = f"```json\n{_NEEDS_MORE_JSON}\n```"
@@ -683,13 +738,13 @@ class TestExperimentDesignAgent(unittest.TestCase):
 
 class TestRouteCritic(unittest.TestCase):
 
-    def test_routes_to_orchestrator_when_needs_more_and_loop_zero(self):
+    def test_routes_to_router_when_needs_more_and_loop_zero(self):
         state = _make_state(_needs_more=True, loop_count=0)
-        self.assertEqual(app._route_critic(state), "orchestrator")
+        self.assertEqual(app._route_critic(state), "router")
 
-    def test_routes_to_orchestrator_when_needs_more_and_loop_one(self):
+    def test_routes_to_router_when_needs_more_and_loop_one(self):
         state = _make_state(_needs_more=True, loop_count=1)
-        self.assertEqual(app._route_critic(state), "orchestrator")
+        self.assertEqual(app._route_critic(state), "router")
 
     def test_routes_to_summarizer_when_loop_count_reaches_limit(self):
         """At loop_count >= 2 the critic must stop looping regardless of needs_more."""

@@ -11,6 +11,8 @@ SQL_TRIGGER_PATTERNS = [
     "what are the main",
     "what approaches",
     "what mechanisms",
+    "approaches",
+    "mechanisms",
     "challenges",
     "list the",
     "compare",
