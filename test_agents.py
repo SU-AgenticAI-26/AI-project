@@ -169,6 +169,22 @@ def _mock_vdb(docs=None) -> MagicMock:
 
 class TestRouterAgent(unittest.TestCase):
 
+    def test_sql_trigger_patterns_force_sql_agent(self):
+        """Enumeration/categorical queries should force sql_db even if LLM omits it."""
+        state = _make_state(
+            query="What are the main approaches and challenges in federated learning for healthcare applications?"
+        )
+        resp = json.dumps({"agents": ["vector_db", "web"], "reasoning": "recent research focus"})
+        result = app.router_agent(state, _mock_llm(resp))
+        self.assertIn("sql_db", result["active_agents"])
+
+    def test_non_trigger_query_does_not_force_sql_agent(self):
+        """Queries without SQL trigger patterns should not add sql_db automatically."""
+        state = _make_state(query="Explain transformer attention with a simple example")
+        resp = json.dumps({"agents": ["vector_db"], "reasoning": "semantic context is enough"})
+        result = app.router_agent(state, _mock_llm(resp))
+        self.assertEqual(result["active_agents"], ["vector_db"])
+
     def test_parses_all_three_agents(self):
         """Router correctly extracts all three agent names from JSON."""
         resp = json.dumps({"agents": ["vector_db", "sql_db", "web"], "reasoning": "all needed"})

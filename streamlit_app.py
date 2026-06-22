@@ -103,6 +103,41 @@ SQL_DB_PATH = ROOT / "knowledge.db"
 
 CACHE_TTL_DAYS = 20
 
+
+def _load_env_from_project_root() -> None:
+    """Load .env from project root and let file values override stale process env."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    parsed: dict[str, str] = {}
+    with env_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                parsed[key] = value
+
+    for key, value in parsed.items():
+        os.environ[key] = value
+
+    if "OPENAI_API_KEY" not in parsed:
+        for alias in ("key", "openai_key", "OPENAI_KEY"):
+            if alias in parsed:
+                os.environ["OPENAI_API_KEY"] = parsed[alias]
+                break
+
+
+_load_env_from_project_root()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVIDER CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -194,6 +229,23 @@ SEARCH_SQLDB_TOOL = {
         },
     },
 }
+
+
+# Router guardrails: categorical/enumeration queries should include SQL.
+SQL_TRIGGER_PATTERNS = [
+    "what are the main",
+    "what approaches",
+    "what mechanisms",
+    "challenges",
+    "list the",
+    "compare",
+    "how many",
+]
+
+
+def _needs_sql_for_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(pattern in q for pattern in SQL_TRIGGER_PATTERNS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1074,6 +1126,11 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         "You are a Router Agent. Given a user query and refined scoping context, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
         "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
+        "Routing examples:\n"
+        "- Query: 'What are the main approaches and challenges in federated learning for healthcare?' "
+        "-> include 'sql_db' for categorical/structured coverage.\n"
+        "- Query: 'What collaboration mechanisms are used in multi-agent LLM systems?' "
+        "-> include 'sql_db' for mechanism enumeration.\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
     
@@ -1094,6 +1151,14 @@ Decide which sources would best address these angles.{critique_context}"""
     except Exception:
         agents = ["vector_db", "sql_db"]
         reason = "defaulted"
+
+    # Hard guardrail for structured/categorical prompts the LLM may miss.
+    if _needs_sql_for_query(state.get("query", "")) and "sql_db" not in agents:
+        agents.append("sql_db")
+        if reason:
+            reason = f"{reason}; sql_db forced by SQL trigger pattern"
+        else:
+            reason = "sql_db forced by SQL trigger pattern"
 
     return {
         "active_agents":    agents,
@@ -2054,19 +2119,24 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 # ── 8. Summarizer ─────────────────────────────────────────────────────────────
 def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
-        "You are a Summarizer Agent. Write a clear, well-structured answer grounded in the "
-        "merged context. Cite which source (Vector DB / SQL DB / Web) each key claim comes from.\n\n"
-        "CRITICAL FOR GROUNDING VALIDATION: When stating substantive claims, wrap them in double quotes. "
-        "Example: \"Diffusion models work by iteratively predicting and removing noise\" (source: Vector DB).\n"
-        "This enables automatic citation verification. Include 5-10 quoted key claims to ensure grounding validation works."
+        "You are given a research query and multi-source findings.\n"
+        "Write a response that:\n"
+        "- Answers ONLY what the query asks -- do not add background the user didn't request\n"
+        "- Is <=400 words unless the query explicitly requires exhaustive coverage\n"
+        "- Uses prose paragraphs, not bullet lists\n"
+        "- Identifies at least one tension or disagreement across sources\n"
+        "- Cites which source supports each distinct claim\n"
+        "\n"
+        "Accepted source labels: Vector DB, SQL DB, Web, Extraction."
     ))
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
     context_src = synthesis if synthesis and synthesis != "(no content to synthesise)" else state.get("merged_context", "")
+    key_concepts = [n["label"] for n in state["knowledge_map"].get("nodes", [])]
     resp = model.invoke([system, HumanMessage(content=(
         f"Query: {state['query']}\n\n"
-        f"Thematic synthesis:\n{context_src}\n\n"
-        f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
+        f"Findings: {context_src}\n\n"
+        f"Key concepts: {key_concepts}"
     ))])
     
     # ── BLOCK 2: Validate citations against retrieved sources ─────────────────────
