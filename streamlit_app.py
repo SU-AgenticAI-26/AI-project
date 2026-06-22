@@ -88,6 +88,19 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, StateGraph
 
+from agents.scoping_agent import scoping_agent as _mod_scoping_agent
+from agents.router_agent import router_agent as _mod_router_agent
+from agents.vector_db_agent import vector_db_agent as _mod_vector_db_agent
+from agents.sql_db_agent import sql_db_agent as _mod_sql_db_agent
+from agents.web_agent import web_agent as _mod_web_agent
+from agents.reading_extraction_agent import reading_extraction_agent as _mod_reading_extraction_agent
+from agents.orchestrator_agent import orchestrator_agent as _mod_orchestrator_agent
+from agents.conflict_agent import conflict_agent as _mod_conflict_agent
+from agents.knowledge_mapper_agent import knowledge_mapper_agent as _mod_knowledge_mapper_agent
+from agents.critic_agent import critic_agent as _mod_critic_agent
+from agents.summarizer_agent import summarizer_agent as _mod_summarizer_agent
+from agents.experiment_design_agent import experiment_design_agent as _mod_experiment_design_agent
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2244,6 +2257,84 @@ def experiment_design_agent(state: AgentState, model: BaseChatModel) -> dict:
     }
 
 
+# ╭─ MODULE DELEGATION ADAPTERS ───────────────────────────────────────────────
+def _scoping_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_scoping_agent(state, model, stamp_fn=_stamp)
+
+
+def _router_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_router_agent(state, model, stamp_fn=_stamp)
+
+
+def _vector_db_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_vector_db_agent(
+        state,
+        model,
+        vdb,
+        search_tool=SEARCH_VECTORDB_TOOL,
+        handle_tool_fn=handle_vectordb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _sql_db_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_sql_db_agent(
+        state,
+        model,
+        sql_search_fn=sql_search,
+        search_tool=SEARCH_SQLDB_TOOL,
+        handle_tool_fn=handle_sqldb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _web_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_web_agent(state, model, vdb, stamp_fn=_stamp)
+
+
+def _reading_extraction_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_reading_extraction_agent(state, model, stamp_fn=_stamp)
+
+
+def _orchestrator_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_orchestrator_agent(state, model, stamp_fn=_stamp)
+
+
+def _conflict_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_conflict_agent(state, model, stamp_fn=_stamp)
+
+
+def _knowledge_mapper_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_knowledge_mapper_agent(state, model, stamp_fn=_stamp)
+
+
+def _critic_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_critic_agent(state, model, stamp_fn=_stamp)
+
+
+def _summarizer_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_summarizer_agent(state, model, stamp_fn=_stamp)
+
+
+def _experiment_design_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_experiment_design_agent(state, model, stamp_fn=_stamp)
+
+
+# Public callable names used across graph/tests now point to module implementations.
+scoping_agent = _scoping_agent_delegate
+router_agent = _router_agent_delegate
+vector_db_agent = _vector_db_agent_delegate
+sql_db_agent = _sql_db_agent_delegate
+web_agent = _web_agent_delegate
+reading_extraction_agent = _reading_extraction_agent_delegate
+orchestrator_agent = _orchestrator_agent_delegate
+conflict_agent = _conflict_agent_delegate
+knowledge_mapper_agent = _knowledge_mapper_agent_delegate
+critic_agent = _critic_agent_delegate
+summarizer_agent = _summarizer_agent_delegate
+experiment_design_agent = _experiment_design_agent_delegate
+
+
 # ── Routing ───────────────────────────────────────────────────────────────────
 
 def _route_to_all_retrievers(state: AgentState) -> list[str]:
@@ -2284,8 +2375,7 @@ def _route_critic(state: AgentState) -> str:
     The critique is passed to router to adjust active_agents strategy.
     """
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
-        # Pass critique back to router for fresh retrieval strategy
-        return "router"
+        return "orchestrator"
     return "summarizer"
 
 
