@@ -107,6 +107,41 @@ SQL_DB_PATH = ROOT / "knowledge.db"
 
 CACHE_TTL_DAYS = 20
 
+
+def _load_env_from_project_root() -> None:
+    """Load .env from project root and let file values override stale process env."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    parsed: dict[str, str] = {}
+    with env_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                parsed[key] = value
+
+    for key, value in parsed.items():
+        os.environ[key] = value
+
+    if "OPENAI_API_KEY" not in parsed:
+        for alias in ("key", "openai_key", "OPENAI_KEY"):
+            if alias in parsed:
+                os.environ["OPENAI_API_KEY"] = parsed[alias]
+                break
+
+
+_load_env_from_project_root()
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVIDER CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -198,6 +233,25 @@ SEARCH_SQLDB_TOOL = {
         },
     },
 }
+
+
+# Router guardrails: categorical/enumeration queries should include SQL.
+SQL_TRIGGER_PATTERNS = [
+    "what are the main",
+    "what approaches",
+    "what mechanisms",
+    "approaches",
+    "mechanisms",
+    "challenges",
+    "list the",
+    "compare",
+    "how many",
+]
+
+
+def _needs_sql_for_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(pattern in q for pattern in SQL_TRIGGER_PATTERNS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -566,6 +620,40 @@ def init_sql_db() -> None:
         id INTEGER PRIMARY KEY,
         subject TEXT, predicate TEXT, object TEXT, confidence REAL, source TEXT
     );
+    CREATE TABLE IF NOT EXISTS source_registry (
+        id INTEGER PRIMARY KEY,
+        source_type TEXT,
+        source_key TEXT,
+        title TEXT,
+        url TEXT,
+        metadata TEXT,
+        created_at TEXT,
+        UNIQUE(source_type, source_key)
+    );
+    CREATE TABLE IF NOT EXISTS extracted_papers (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        source_type TEXT,
+        source_key TEXT,
+        url TEXT,
+        research_problem TEXT,
+        methodology TEXT,
+        key_findings TEXT,
+        limitations TEXT,
+        created_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS pipeline_runs (
+        id INTEGER PRIMARY KEY,
+        query TEXT,
+        active_agents TEXT,
+        loop_count INTEGER,
+        node_count INTEGER,
+        grounding_score REAL,
+        needs_more INTEGER,
+        critique TEXT,
+        summary_len INTEGER,
+        created_at TEXT
+    );
     """)
     if cur.execute("SELECT COUNT(*) FROM topics").fetchone()[0] == 0:
         cur.executemany(
@@ -614,6 +702,7 @@ def init_sql_db() -> None:
 
 
 def sql_search(query: str, k: int = 8) -> str:
+    import sqlite3, json as _json
     con   = sqlite3.connect(SQL_DB_PATH)
     cur   = con.cursor()
     words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3][:5]
@@ -656,6 +745,22 @@ def sql_search(query: str, k: int = 8) -> str:
     ).fetchall():
         results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
 
+    ep_clause = " OR ".join(
+        ["LOWER(title) LIKE ? OR LOWER(research_problem) LIKE ? "
+         "OR LOWER(key_findings) LIKE ? OR LOWER(methodology) LIKE ?"] * len(words)
+    )
+    ep_params = [p for w in like for p in (w, w, w, w)]
+    for row in cur.execute(
+        f"SELECT title, research_problem, methodology, key_findings, limitations "
+        f"FROM extracted_papers WHERE {ep_clause} ORDER BY id DESC LIMIT 5",
+        ep_params,
+    ).fetchall():
+        findings_snippet = (row[3] or "")[:120]
+        results.append(
+            f"[PAPER] {row[0]} | Problem: {(row[1] or '')[:80]} | "
+            f"Method: {(row[2] or '')[:60]} | Findings: {findings_snippet}"
+        )
+
     con.close()
     seen, unique = set(), []
     for r in results:
@@ -682,6 +787,118 @@ def sql_list_topics() -> list[dict]:
     ).fetchall()
     con.close()
     return [{"id": r[0], "title": r[1], "category": r[2], "keywords": r[3]} for r in rows]
+
+
+def sql_source_registered(source_type: str, source_key: str) -> bool:
+    con = sqlite3.connect(SQL_DB_PATH)
+    row = con.execute(
+        "SELECT 1 FROM source_registry WHERE source_type = ? AND source_key = ? LIMIT 1",
+        (source_type, source_key),
+    ).fetchone()
+    con.close()
+    return bool(row)
+
+
+def sql_register_source(source_type: str, source_key: str, title: str = "", url: str = "", metadata: dict | None = None) -> int:
+    import json as _json
+    con = sqlite3.connect(SQL_DB_PATH)
+    cur = con.cursor()
+    cur.execute(
+        "INSERT OR IGNORE INTO source_registry "
+        "(source_type, source_key, title, url, metadata, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (source_type, source_key, title, url, _json.dumps(metadata or {}), _stamp()),
+    )
+    con.commit()
+    row = cur.execute(
+        "SELECT id FROM source_registry WHERE source_type = ? AND source_key = ?",
+        (source_type, source_key),
+    ).fetchone()
+    con.close()
+    return int(row[0]) if row else 0
+
+
+def sql_log_pipeline_run(state: dict) -> None:
+    import sqlite3, json as _json
+    con = sqlite3.connect(SQL_DB_PATH)
+    con.execute(
+        "INSERT INTO pipeline_runs "
+        "(query, active_agents, loop_count, node_count, grounding_score, "
+        " needs_more, critique, summary_len, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (
+            state.get("query", ""),
+            _json.dumps(state.get("active_agents", [])),
+            state.get("loop_count", 0),
+            len(state.get("knowledge_map", {}).get("nodes", [])),
+            state.get("grounding_score", 0.0),
+            int(state.get("_needs_more", False)),
+            state.get("critique", "")[:500],
+            len(state.get("summary", "")),
+            _stamp(),
+        ),
+    )
+    con.commit()
+    con.close()
+
+
+def sql_analytics() -> dict:
+    import sqlite3
+    con = sqlite3.connect(SQL_DB_PATH)
+    cur = con.cursor()
+
+    recurring = cur.execute(
+        "SELECT query, COUNT(*) as runs, "
+        "ROUND(AVG(grounding_score)*100,1) as avg_grounding, "
+        "MAX(node_count) as max_nodes "
+        "FROM pipeline_runs "
+        "GROUP BY LOWER(TRIM(query)) "
+        "ORDER BY runs DESC LIMIT 10"
+    ).fetchall()
+
+    grounding_trend = cur.execute(
+        "SELECT created_at, grounding_score, loop_count "
+        "FROM pipeline_runs ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+
+    loop_stats = cur.execute(
+        "SELECT loop_count, COUNT(*) as freq "
+        "FROM pipeline_runs GROUP BY loop_count ORDER BY loop_count"
+    ).fetchall()
+
+    common_problems = cur.execute(
+        "SELECT SUBSTR(research_problem,1,80) as problem_prefix, "
+        "COUNT(*) as count "
+        "FROM extracted_papers "
+        "WHERE research_problem != '' "
+        "GROUP BY LOWER(TRIM(SUBSTR(research_problem,1,60))) "
+        "ORDER BY count DESC LIMIT 8"
+    ).fetchall()
+
+    source_counts = cur.execute(
+        "SELECT source_type, COUNT(*) as total, "
+        "COUNT(DISTINCT source_key) as unique_keys "
+        "FROM source_registry GROUP BY source_type ORDER BY total DESC"
+    ).fetchall()
+
+    con.close()
+
+    return {
+        "recurring_queries": [
+            {"query": r[0][:70], "runs": r[1], "avg_grounding_%": r[2], "max_nodes": r[3]}
+            for r in recurring
+        ],
+        "grounding_trend": [
+            {"ts": r[0][:16], "score": round(r[1], 3), "loops": r[2]}
+            for r in grounding_trend
+        ],
+        "loop_frequency": [{"loop_count": r[0], "runs": r[1]} for r in loop_stats],
+        "common_problems": [{"problem": r[0], "count": r[1]} for r in common_problems],
+        "source_stats": [
+            {"source": r[0], "total_seen": r[1], "unique_keys": r[2]}
+            for r in source_counts
+        ],
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1079,6 +1296,11 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         "You are a Router Agent. Given a user query and refined scoping context, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
         "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
+        "Routing examples:\n"
+        "- Query: 'What are the main approaches and challenges in federated learning for healthcare?' "
+        "-> include 'sql_db' for categorical/structured coverage.\n"
+        "- Query: 'What collaboration mechanisms are used in multi-agent LLM systems?' "
+        "-> include 'sql_db' for mechanism enumeration.\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
     
@@ -1099,6 +1321,14 @@ Decide which sources would best address these angles.{critique_context}"""
     except Exception:
         agents = ["vector_db", "sql_db"]
         reason = "defaulted"
+
+    # Hard guardrail for structured/categorical prompts the LLM may miss.
+    if _needs_sql_for_query(state.get("query", "")) and "sql_db" not in agents:
+        agents.append("sql_db")
+        if reason:
+            reason = f"{reason}; sql_db forced by SQL trigger pattern"
+        else:
+            reason = "sql_db forced by SQL trigger pattern"
 
     return {
         "active_agents":    agents,
@@ -2129,10 +2359,11 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
     context_src = synthesis if synthesis and synthesis != "(no content to synthesise)" else state.get("merged_context", "")
+    key_concepts = [n["label"] for n in state["knowledge_map"].get("nodes", [])]
     resp = model.invoke([system, HumanMessage(content=(
         f"Query: {state['query']}\n\n"
-        f"Thematic synthesis:\n{context_src}\n\n"
-        f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
+        f"Findings: {context_src}\n\n"
+        f"Key concepts: {key_concepts}"
     ))])
     
     # ── BLOCK 2: Validate citations against retrieved sources ─────────────────────
@@ -2240,6 +2471,84 @@ def experiment_design_agent(state: AgentState, model: BaseChatModel) -> dict:
     }
 
 
+# ╭─ MODULE DELEGATION ADAPTERS ───────────────────────────────────────────────
+def _scoping_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_scoping_agent(state, model, stamp_fn=_stamp)
+
+
+def _router_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_router_agent(state, model, stamp_fn=_stamp)
+
+
+def _vector_db_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_vector_db_agent(
+        state,
+        model,
+        vdb,
+        search_tool=SEARCH_VECTORDB_TOOL,
+        handle_tool_fn=handle_vectordb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _sql_db_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_sql_db_agent(
+        state,
+        model,
+        sql_search_fn=sql_search,
+        search_tool=SEARCH_SQLDB_TOOL,
+        handle_tool_fn=handle_sqldb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _web_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_web_agent(state, model, vdb, stamp_fn=_stamp)
+
+
+def _reading_extraction_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_reading_extraction_agent(state, model, stamp_fn=_stamp)
+
+
+def _orchestrator_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_orchestrator_agent(state, model, stamp_fn=_stamp)
+
+
+def _conflict_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_conflict_agent(state, model, stamp_fn=_stamp)
+
+
+def _knowledge_mapper_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_knowledge_mapper_agent(state, model, stamp_fn=_stamp)
+
+
+def _critic_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_critic_agent(state, model, stamp_fn=_stamp)
+
+
+def _summarizer_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_summarizer_agent(state, model, stamp_fn=_stamp)
+
+
+def _experiment_design_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_experiment_design_agent(state, model, stamp_fn=_stamp)
+
+
+# Public callable names used across graph/tests now point to module implementations.
+scoping_agent = _scoping_agent_delegate
+router_agent = _router_agent_delegate
+vector_db_agent = _vector_db_agent_delegate
+sql_db_agent = _sql_db_agent_delegate
+web_agent = _web_agent_delegate
+reading_extraction_agent = _reading_extraction_agent_delegate
+orchestrator_agent = _orchestrator_agent_delegate
+conflict_agent = _conflict_agent_delegate
+knowledge_mapper_agent = _knowledge_mapper_agent_delegate
+critic_agent = _critic_agent_delegate
+summarizer_agent = _summarizer_agent_delegate
+experiment_design_agent = _experiment_design_agent_delegate
+
+
 # ── Routing ───────────────────────────────────────────────────────────────────
 
 def _route_to_all_retrievers(state: AgentState) -> list[str]:
@@ -2280,7 +2589,6 @@ def _route_critic(state: AgentState) -> str:
     The critique is passed to router to adjust active_agents strategy.
     """
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
-        # Pass critique back to router for fresh retrieval strategy
         return "router"
     return "summarizer"
 
@@ -2419,6 +2727,11 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
     finally:
         tmp_path.unlink(missing_ok=True)
     return html
+
+
+def _html_to_data_uri(content: str) -> str:
+    """Embed inline HTML using a data URI for st.iframe."""
+    return "data:text/html;charset=utf-8," + urllib.parse.quote(content)
 
 
 
@@ -2634,19 +2947,19 @@ with tab_web:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        do_search = st.button("Search Web", use_container_width=True)
+        do_search = st.button("Search Web", width="stretch")
 
     with c2:
         add_to_rag = st.button(
             "Add Results to RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not st.session_state.web_results
         )
 
     with c3:
         ask_rag = st.button(
             "Ask with RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not web_q
         )
 
@@ -2795,6 +3108,7 @@ with tab_research:
                             full_state[key] = val
 
             progress.progress(100, "✅ Done!")
+            sql_log_pipeline_run(full_state)
             if full_state and use_cache:
                 cache_save(query, full_state)
             
@@ -2990,7 +3304,7 @@ with tab_research:
                 for i, (s, c) in enumerate(src_counts.items()):
                     cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
                                      unsafe_allow_html=True)
-                st.components.v1.html(render_knowledge_map(km), height=520)
+                st.iframe(_html_to_data_uri(render_knowledge_map(km)), height=520, scrolling=True)
                 with st.expander("📊 Raw graph data"):
                     c1, c2 = st.columns(2)
                     c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
@@ -3029,12 +3343,39 @@ with tab_sql:
     st.header("SQL / DB Browser")
     topics = sql_list_topics()
     st.metric("Topics in DB", len(topics))
-    st.dataframe(topics, use_container_width=True)
+    st.dataframe(topics, width="stretch")
     st.divider()
     st.subheader("Test keyword search")
     test_q = st.text_input("Keyword")
     if test_q:
         st.code(sql_search(test_q), language="text")
+
+    st.divider()
+    st.subheader("Cross-Run Analytics")
+    with st.expander("Open analytics dashboard", expanded=False):
+        analytics = sql_analytics()
+
+        if analytics["recurring_queries"]:
+            st.markdown("**Recurring queries** (most-run topics)")
+            st.dataframe(analytics["recurring_queries"], use_container_width=True)
+        else:
+            st.info("Run at least one pipeline query to populate analytics.")
+
+        if analytics["grounding_trend"]:
+            st.markdown("**Grounding score over last 20 runs**")
+            st.dataframe(analytics["grounding_trend"], use_container_width=True)
+
+        if analytics["loop_frequency"]:
+            st.markdown("**Critic loop frequency**")
+            st.dataframe(analytics["loop_frequency"], use_container_width=True)
+
+        if analytics["common_problems"]:
+            st.markdown("**Most common research problems (across all extractions)**")
+            st.dataframe(analytics["common_problems"], use_container_width=True)
+
+        if analytics["source_stats"]:
+            st.markdown("**Source registry — unique papers per API**")
+            st.dataframe(analytics["source_stats"], use_container_width=True)
 
 
 # ════════════ TAB 3 — SAVED MAPS ══════════════════════════════════════════════
@@ -3054,7 +3395,7 @@ with tab_maps:
                 if st.button("Visualise", key=f"vis_{m['file']}"):
                     raw = map_load(m["file"])
                     if raw:
-                        st.components.v1.html(render_knowledge_map(raw["map"]), height=470)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(raw["map"])), height=470, scrolling=True)
 
 
 # ════════════ TAB 4 — SESSIONS ════════════════════════════════════════════════
@@ -3117,7 +3458,7 @@ with tab_cache:
                     st.markdown(pl.get("summary",""))
                     km = pl.get("knowledge_map",{})
                     if km.get("nodes"):
-                        st.components.v1.html(render_knowledge_map(km, 400), height=420)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(km, 400)), height=420, scrolling=True)
     st.divider()
     if st.button("🧹 Clear ALL cache"):
         for p in CACHE_DIR.glob("*.json"):

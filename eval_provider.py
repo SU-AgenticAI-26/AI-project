@@ -36,6 +36,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+# Pydantic plugin discovery can fail on some Windows Python installs when a
+# broken distribution metadata entry is present. Disable plugin loading to keep
+# LangChain imports stable for eval runs.
+os.environ.setdefault("PYDANTIC_DISABLE_PLUGINS", "1")
 
 # Map short provider names → streamlit_app provider constants
 _APP_PROVIDER = {
@@ -62,6 +68,48 @@ PROVIDER_PRICING = {
     "claude": {"input": 0.80,  "output": 4.00},   # claude-haiku-4-5
     "local":  {"input": 0.0,   "output": 0.0},
 }
+
+
+def _load_env_from_project_root() -> None:
+    """Load .env from project root and override stale process env values."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    parsed: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+
+        parsed[key] = value
+
+    for key, value in parsed.items():
+        os.environ[key] = value
+
+    if "OPENAI_API_KEY" not in parsed:
+        for alias in ("key", "openai_key", "OPENAI_KEY"):
+            if alias in parsed and parsed[alias]:
+                os.environ["OPENAI_API_KEY"] = parsed[alias]
+                break
+
+
+_load_env_from_project_root()
 
 
 def _resolve_api_key(provider: str) -> str:

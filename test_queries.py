@@ -18,6 +18,48 @@ if TYPE_CHECKING:
 # Imported lazily so we don't require streamlit_app on import; set after _add_project_to_path()
 VECTOR_DIR = Path("collab_rag_data") / "vectorstore"
 
+
+def _load_env_from_project_root() -> None:
+    """Load .env from project root and override existing process env values."""
+    project_root = Path(__file__).resolve().parent
+    env_path = project_root / ".env"
+    if not env_path.exists():
+        return
+
+    parsed: dict[str, str] = {}
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.lower().startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+
+        if not key:
+            continue
+
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+
+        parsed[key] = value
+
+    for key, value in parsed.items():
+        os.environ[key] = value
+
+    # Compatibility: some local setups store the OpenAI key as `key=`.
+    if "OPENAI_API_KEY" not in parsed:
+        for alias in ("key", "openai_key", "OPENAI_KEY"):
+            if alias in parsed and parsed[alias]:
+                os.environ["OPENAI_API_KEY"] = parsed[alias]
+                break
+
 # ---------------------------------------------------------------------------
 # Test query definitions
 # ---------------------------------------------------------------------------
@@ -207,6 +249,7 @@ def run_pipeline(
     wall_time : float
         Total wall-clock time in seconds.
     """
+    _load_env_from_project_root()
     _add_project_to_path()
 
     if cfg is None:
