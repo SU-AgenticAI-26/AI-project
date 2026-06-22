@@ -2,9 +2,6 @@
 streamlit>=1.32.0
 langgraph~=1.1
 requests>=2.31.0
-# ── Conference paper search ───────────────────────────────────────────────────
-openreview-py>=1.0.0
-acl-anthology>=0.9.0
 
 # ── LangChain stack ───────────────────────────────────────────────────────────
 langchain-core~=1.2
@@ -15,12 +12,16 @@ langchain-text-splitters~=1.1     # RecursiveCharacterTextSplitter
 # ── Vector store ──────────────────────────────────────────────────────────────
 faiss-cpu>=1.7.0
 
-# ── Embeddings for local / Claude provider ────────────────────────────────────
-sentence-transformers>=2.2.0     # HuggingFace all-MiniLM-L6-v2 used by HuggingFaceEmbeddings
-
 # ── Visualisation ─────────────────────────────────────────────────────────────
 pyvis>=0.3.2                     # Interactive knowledge-graph network view
 
-# ── Optional LLM providers (install the ones you need) ────────────────────────
-langchain-anthropic~=1.4
-langchain-google-genai~=4.2
+# ── Optional extras (install separately only if needed) ───────────────────────
+# Conference paper search:
+# pip install openreview-py acl-anthology
+#
+# Local embeddings for Claude/local provider:
+# pip install sentence-transformers
+#
+# Additional LLM providers:
+# pip install "langchain-anthropic~=1.4"
+# pip install "langchain-google-genai~=4.2"

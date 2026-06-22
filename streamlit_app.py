@@ -88,6 +88,19 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.graph import END, StateGraph
 
+from agents.scoping_agent import scoping_agent as _mod_scoping_agent
+from agents.router_agent import router_agent as _mod_router_agent
+from agents.vector_db_agent import vector_db_agent as _mod_vector_db_agent
+from agents.sql_db_agent import sql_db_agent as _mod_sql_db_agent
+from agents.web_agent import web_agent as _mod_web_agent
+from agents.reading_extraction_agent import reading_extraction_agent as _mod_reading_extraction_agent
+from agents.orchestrator_agent import orchestrator_agent as _mod_orchestrator_agent
+from agents.conflict_agent import conflict_agent as _mod_conflict_agent
+from agents.knowledge_mapper_agent import knowledge_mapper_agent as _mod_knowledge_mapper_agent
+from agents.critic_agent import critic_agent as _mod_critic_agent
+from agents.summarizer_agent import summarizer_agent as _mod_summarizer_agent
+from agents.experiment_design_agent import experiment_design_agent as _mod_experiment_design_agent
+
 # ══════════════════════════════════════════════════════════════════════════════
 # PATHS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -102,6 +115,41 @@ SQL_DB_PATH = ROOT / "knowledge.db"
 
 
 CACHE_TTL_DAYS = 20
+
+
+def _load_env_from_project_root() -> None:
+    """Load .env from project root and let file values override stale process env."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    if not env_path.exists():
+        return
+
+    parsed: dict[str, str] = {}
+    with env_path.open("r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                parsed[key] = value
+
+    for key, value in parsed.items():
+        os.environ[key] = value
+
+    if "OPENAI_API_KEY" not in parsed:
+        for alias in ("key", "openai_key", "OPENAI_KEY"):
+            if alias in parsed:
+                os.environ["OPENAI_API_KEY"] = parsed[alias]
+                break
+
+
+_load_env_from_project_root()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PROVIDER CONFIG
@@ -194,6 +242,25 @@ SEARCH_SQLDB_TOOL = {
         },
     },
 }
+
+
+# Router guardrails: categorical/enumeration queries should include SQL.
+SQL_TRIGGER_PATTERNS = [
+    "what are the main",
+    "what approaches",
+    "what mechanisms",
+    "approaches",
+    "mechanisms",
+    "challenges",
+    "list the",
+    "compare",
+    "how many",
+]
+
+
+def _needs_sql_for_query(query: str) -> bool:
+    q = (query or "").lower()
+    return any(pattern in q for pattern in SQL_TRIGGER_PATTERNS)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1238,6 +1305,11 @@ def router_agent(state: AgentState, model: BaseChatModel) -> dict:
         "You are a Router Agent. Given a user query and refined scoping context, decide which search agents to activate.\n"
         "Available: 'vector_db' (semantic doc search), 'sql_db' (structured facts/topics), "
         "'web' (live scholarly search — use when query needs recent papers or external knowledge).\n"
+        "Routing examples:\n"
+        "- Query: 'What are the main approaches and challenges in federated learning for healthcare?' "
+        "-> include 'sql_db' for categorical/structured coverage.\n"
+        "- Query: 'What collaboration mechanisms are used in multi-agent LLM systems?' "
+        "-> include 'sql_db' for mechanism enumeration.\n"
         "Return ONLY JSON: {\"agents\": [...], \"reasoning\": \"one sentence\"}. No other text."
     ))
     
@@ -1258,6 +1330,14 @@ Decide which sources would best address these angles.{critique_context}"""
     except Exception:
         agents = ["vector_db", "sql_db"]
         reason = "defaulted"
+
+    # Hard guardrail for structured/categorical prompts the LLM may miss.
+    if _needs_sql_for_query(state.get("query", "")) and "sql_db" not in agents:
+        agents.append("sql_db")
+        if reason:
+            reason = f"{reason}; sql_db forced by SQL trigger pattern"
+        else:
+            reason = "sql_db forced by SQL trigger pattern"
 
     return {
         "active_agents":    agents,
@@ -2261,10 +2341,11 @@ def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
     context_src = synthesis if synthesis and synthesis != "(no content to synthesise)" else state.get("merged_context", "")
+    key_concepts = [n["label"] for n in state["knowledge_map"].get("nodes", [])]
     resp = model.invoke([system, HumanMessage(content=(
         f"Query: {state['query']}\n\n"
-        f"Thematic synthesis:\n{context_src}\n\n"
-        f"Key concepts: {[n['label'] for n in state['knowledge_map'].get('nodes',[])]}"
+        f"Findings: {context_src}\n\n"
+        f"Key concepts: {key_concepts}"
     ))])
     
     # ── BLOCK 2: Validate citations against retrieved sources ─────────────────────
@@ -2372,6 +2453,84 @@ def experiment_design_agent(state: AgentState, model: BaseChatModel) -> dict:
     }
 
 
+# ╭─ MODULE DELEGATION ADAPTERS ───────────────────────────────────────────────
+def _scoping_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_scoping_agent(state, model, stamp_fn=_stamp)
+
+
+def _router_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_router_agent(state, model, stamp_fn=_stamp)
+
+
+def _vector_db_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_vector_db_agent(
+        state,
+        model,
+        vdb,
+        search_tool=SEARCH_VECTORDB_TOOL,
+        handle_tool_fn=handle_vectordb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _sql_db_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_sql_db_agent(
+        state,
+        model,
+        sql_search_fn=sql_search,
+        search_tool=SEARCH_SQLDB_TOOL,
+        handle_tool_fn=handle_sqldb_search_tool,
+        stamp_fn=_stamp,
+    )
+
+
+def _web_agent_delegate(state: AgentState, model: BaseChatModel, vdb: VectorDBModule) -> dict:
+    return _mod_web_agent(state, model, vdb, stamp_fn=_stamp)
+
+
+def _reading_extraction_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_reading_extraction_agent(state, model, stamp_fn=_stamp)
+
+
+def _orchestrator_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_orchestrator_agent(state, model, stamp_fn=_stamp)
+
+
+def _conflict_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_conflict_agent(state, model, stamp_fn=_stamp)
+
+
+def _knowledge_mapper_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_knowledge_mapper_agent(state, model, stamp_fn=_stamp)
+
+
+def _critic_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_critic_agent(state, model, stamp_fn=_stamp)
+
+
+def _summarizer_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_summarizer_agent(state, model, stamp_fn=_stamp)
+
+
+def _experiment_design_agent_delegate(state: AgentState, model: BaseChatModel) -> dict:
+    return _mod_experiment_design_agent(state, model, stamp_fn=_stamp)
+
+
+# Public callable names used across graph/tests now point to module implementations.
+scoping_agent = _scoping_agent_delegate
+router_agent = _router_agent_delegate
+vector_db_agent = _vector_db_agent_delegate
+sql_db_agent = _sql_db_agent_delegate
+web_agent = _web_agent_delegate
+reading_extraction_agent = _reading_extraction_agent_delegate
+orchestrator_agent = _orchestrator_agent_delegate
+conflict_agent = _conflict_agent_delegate
+knowledge_mapper_agent = _knowledge_mapper_agent_delegate
+critic_agent = _critic_agent_delegate
+summarizer_agent = _summarizer_agent_delegate
+experiment_design_agent = _experiment_design_agent_delegate
+
+
 # ── Routing ───────────────────────────────────────────────────────────────────
 
 def _route_to_all_retrievers(state: AgentState) -> list[str]:
@@ -2412,7 +2571,6 @@ def _route_critic(state: AgentState) -> str:
     The critique is passed to router to adjust active_agents strategy.
     """
     if state.get("_needs_more") and state.get("loop_count", 0) < 2:
-        # Pass critique back to router for fresh retrieval strategy
         return "router"
     return "summarizer"
 
@@ -2551,6 +2709,11 @@ def render_knowledge_map(km: dict, height: int = 500) -> str:
     finally:
         tmp_path.unlink(missing_ok=True)
     return html
+
+
+def _html_to_data_uri(content: str) -> str:
+    """Embed inline HTML using a data URI for st.iframe."""
+    return "data:text/html;charset=utf-8," + urllib.parse.quote(content)
 
 
 
@@ -2766,19 +2929,19 @@ with tab_web:
     c1, c2, c3 = st.columns(3)
 
     with c1:
-        do_search = st.button("Search Web", use_container_width=True)
+        do_search = st.button("Search Web", width="stretch")
 
     with c2:
         add_to_rag = st.button(
             "Add Results to RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not st.session_state.web_results
         )
 
     with c3:
         ask_rag = st.button(
             "Ask with RAG",
-            use_container_width=True,
+            width="stretch",
             disabled=not web_q
         )
 
@@ -3123,7 +3286,7 @@ with tab_research:
                 for i, (s, c) in enumerate(src_counts.items()):
                     cols[i].markdown(f'<span class="src-badge {css.get(s,"bm")}">{s}: {c}</span>',
                                      unsafe_allow_html=True)
-                st.components.v1.html(render_knowledge_map(km), height=520)
+                st.iframe(_html_to_data_uri(render_knowledge_map(km)), height=520, scrolling=True)
                 with st.expander("📊 Raw graph data"):
                     c1, c2 = st.columns(2)
                     c1.markdown("**Nodes**"); c1.dataframe(km["nodes"])
@@ -3162,7 +3325,7 @@ with tab_sql:
     st.header("SQL / DB Browser")
     topics = sql_list_topics()
     st.metric("Topics in DB", len(topics))
-    st.dataframe(topics, use_container_width=True)
+    st.dataframe(topics, width="stretch")
     st.divider()
     st.subheader("Test keyword search")
     test_q = st.text_input("Keyword")
@@ -3214,7 +3377,7 @@ with tab_maps:
                 if st.button("Visualise", key=f"vis_{m['file']}"):
                     raw = map_load(m["file"])
                     if raw:
-                        st.components.v1.html(render_knowledge_map(raw["map"]), height=470)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(raw["map"])), height=470, scrolling=True)
 
 
 # ════════════ TAB 4 — SESSIONS ════════════════════════════════════════════════
@@ -3277,7 +3440,7 @@ with tab_cache:
                     st.markdown(pl.get("summary",""))
                     km = pl.get("knowledge_map",{})
                     if km.get("nodes"):
-                        st.components.v1.html(render_knowledge_map(km, 400), height=420)
+                        st.iframe(_html_to_data_uri(render_knowledge_map(km, 400)), height=420, scrolling=True)
     st.divider()
     if st.button("🧹 Clear ALL cache"):
         for p in CACHE_DIR.glob("*.json"):
