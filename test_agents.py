@@ -12,9 +12,7 @@ are mocked.
 from __future__ import annotations
 
 import json
-import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -25,95 +23,10 @@ from unittest.mock import MagicMock, patch
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _patch_imports() -> None:
-    if "streamlit_app" in sys.modules:
-        return  # already patched by another test module in this session
-
-    mocks: dict = {}
-
-    # streamlit
-    st_mock = MagicMock()
-    st_mock.button.return_value = False
-    st_mock.form_submit_button.return_value = False
-    st_mock.text_input.return_value = ""
-    st_mock.text_area.return_value = ""
-    st_mock.number_input.return_value = 5
-    st_mock.checkbox.return_value = False
-    st_mock.file_uploader.return_value = None
-    st_mock.selectbox.return_value = "OpenAI"
-    st_mock.tabs.side_effect = lambda labels: [MagicMock() for _ in labels]
-    st_mock.columns.side_effect = (
-        lambda n: [MagicMock() for _ in (range(n) if isinstance(n, int) else n)]
-    )
-    st_mock.session_state.__contains__ = lambda self, key: False
-    mocks["streamlit"] = st_mock
-
-    # pyvis
-    pyvis_mod = types.ModuleType("pyvis")
-    pyvis_net = types.ModuleType("pyvis.network")
-    pyvis_net.Network = MagicMock()
-    pyvis_mod.network = pyvis_net
-    mocks["pyvis"] = pyvis_mod
-    mocks["pyvis.network"] = pyvis_net
-
-    # langchain_core
-    class _Msg:
-        def __init__(self, content: str = "", **_kw):
-            self.content = content
-
-    class _Doc:
-        def __init__(self, page_content: str = "", metadata: dict | None = None, **_kw):
-            self.page_content = page_content
-            self.metadata = metadata or {}
-
-    lc_core      = types.ModuleType("langchain_core")
-    lc_core_docs = types.ModuleType("langchain_core.documents")
-    lc_core_msgs = types.ModuleType("langchain_core.messages")
-    lc_core_llms = types.ModuleType("langchain_core.language_models")
-    lc_core_docs.Document      = _Doc
-    lc_core_msgs.AIMessage     = _Msg
-    lc_core_msgs.HumanMessage  = _Msg
-    lc_core_msgs.SystemMessage = _Msg
-    lc_core_llms.BaseChatModel = MagicMock
-    lc_core.documents          = lc_core_docs
-    lc_core.messages           = lc_core_msgs
-    lc_core.language_models    = lc_core_llms
-    mocks["langchain_core"]                 = lc_core
-    mocks["langchain_core.documents"]       = lc_core_docs
-    mocks["langchain_core.messages"]        = lc_core_msgs
-    mocks["langchain_core.language_models"] = lc_core_llms
-
-    for mod in [
-        "langchain_openai",
-        "langchain_community",
-        "langchain_community.vectorstores",
-        "langchain_community.vectorstores.FAISS",
-        "langchain_community.embeddings",
-        "langchain_text_splitters",
-        "faiss",
-    ]:
-        mocks[mod] = MagicMock()
-    mocks["langchain_community.vectorstores"].FAISS.load_local.side_effect = Exception("mock")
-
-    # langgraph
-    langgraph_mod   = types.ModuleType("langgraph")
-    langgraph_graph = types.ModuleType("langgraph.graph")
-    langgraph_graph.END = "END"
-
-    class _FakeStateGraph:
-        def __init__(self, *a, **kw): pass
-        def add_node(self, *a, **kw): pass
-        def add_edge(self, *a, **kw): pass
-        def add_conditional_edges(self, *a, **kw): pass
-        def set_entry_point(self, *a, **kw): pass
-        def compile(self): return MagicMock()
-
-    langgraph_graph.StateGraph = _FakeStateGraph
-    langgraph_mod.graph = langgraph_graph
-    mocks["langgraph"] = langgraph_mod
-    mocks["langgraph.graph"] = langgraph_graph
-
-    for key, val in mocks.items():
-        sys.modules[key] = val
+    # All shims are installed by conftest.py, which pytest loads before any
+    # test module is collected.  This function is kept as a call-site marker
+    # but is a no-op for normal pytest runs.
+    pass
 
 
 _patch_imports()
@@ -139,6 +52,7 @@ def _make_state(**overrides) -> app.AgentState:
         "knowledge_map":       {},
         "critique":            "",
         "loop_count":          0,
+        "_prev_node_count":    0,
         "summary":             "",
         "experiment_plan":     "",
         "current_agent":       "",
@@ -322,12 +236,15 @@ class TestSqlDbAgent(unittest.TestCase):
         self.assertEqual(result["sql_findings"], "SQL_RESPONSE")
 
     def test_activity_log_structure(self):
+        # Tests run the non-tool-calling fallback path (model is MagicMock, not
+        # ChatOpenAI).  That path does not include a "rows" key in the log entry;
+        # "rows" is only present in the tool-driven (OpenAI) path.
         state  = _make_state(active_agents=["sql_db"])
         result = app.sql_db_agent(state, _mock_llm("r"))
         entry  = result["activity_log"][0]
         self.assertEqual(entry["agent"], "sql_db")
         self.assertEqual(entry["icon"], "🗄️")
-        self.assertIn("rows", entry)
+        self.assertIn("detail", entry)
 
     def test_llm_receives_query_in_prompt(self):
         model = _mock_llm("r")
@@ -552,51 +469,78 @@ class TestKnowledgeMapperAgent(unittest.TestCase):
 
 _NEEDS_MORE_JSON  = json.dumps({"needs_more": True,  "feedback": "too few nodes"})
 _APPROVED_JSON    = json.dumps({"needs_more": False, "feedback": ""})
+
+# Structural FAIL: only 1 edge (need ≥ 4) and 1 node type (need ≥ 2).
+# critic_agent is purely structural — LLM output is not consulted.
 _KM_WITH_NODES = {
     "nodes": [{"id": str(i), "label": f"node{i}", "type": "concept", "source": "web"}
               for i in range(10)],
     "edges": [{"source": "0", "target": "1", "relation": "r", "weight": 0.5}],
 }
 
+# Structural PASS: ≥ 5 nodes, ≥ 4 edges, ≥ 2 distinct types.
+_KM_STRUCTURAL_PASS = {
+    "nodes": [
+        *[{"id": str(i),   "label": f"concept{i}", "type": "concept", "source": "web"}
+          for i in range(5)],
+        *[{"id": str(i+5), "label": f"entity{i}",  "type": "entity",  "source": "vector_db"}
+          for i in range(5)],
+    ],
+    "edges": [
+        {"source": "0", "target": "1", "relation": "related", "weight": 0.5},
+        {"source": "1", "target": "2", "relation": "extends", "weight": 0.5},
+        {"source": "2", "target": "3", "relation": "uses",    "weight": 0.5},
+        {"source": "3", "target": "4", "relation": "enables", "weight": 0.5},
+    ],
+}
+
 
 class TestCriticAgent(unittest.TestCase):
+    # critic_agent is purely structural — it never calls the LLM.
+    # The mock_llm argument is accepted by the function signature but not used.
 
-    def test_needs_more_true_when_json_says_so(self):
+    def test_needs_more_true_when_structural_check_fails(self):
+        """Graph with too few edges / types triggers _needs_more=True."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
         result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
         self.assertTrue(result["_needs_more"])
 
-    def test_needs_more_false_when_json_says_so(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
+    def test_needs_more_false_when_structural_check_passes(self):
+        """Graph meeting all structural thresholds produces _needs_more=False."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertFalse(result["_needs_more"])
 
-    def test_feedback_stored_in_critique(self):
+    def test_feedback_contains_structural_failure_reason(self):
+        """Critique text names which structural checks failed."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
         result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
-        self.assertEqual(result["critique"], "too few nodes")
+        self.assertIn("Needs enrichment", result["critique"])
+        # _KM_WITH_NODES has 1 edge and 1 type — both thresholds fail.
+        self.assertIn("edge", result["critique"])
+        self.assertIn("type", result["critique"])
 
     def test_loop_count_incremented(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES, loop_count=1)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS, loop_count=1)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["loop_count"], 2)
 
     def test_loop_count_starts_from_zero(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES, loop_count=0)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS, loop_count=0)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["loop_count"], 1)
 
-    def test_fallback_on_invalid_json(self):
-        """Critic defaults to needs_more=False on malformed LLM output."""
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
-        result = app.critic_agent(state, _mock_llm("definitely not json"))
+    def test_structural_pass_always_approves_regardless_of_llm_content(self):
+        """LLM output is irrelevant; a structurally sound graph always passes."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
         self.assertFalse(result["_needs_more"])
-        self.assertIn("nodes=", result["critique"])
+        self.assertIn("meets structural requirements", result["critique"])
 
-    def test_strips_markdown_fences(self):
-        fenced = f"```json\n{_NEEDS_MORE_JSON}\n```"
+    def test_structural_fail_always_requests_enrichment(self):
+        """LLM output is irrelevant; a structurally deficient graph always fails."""
         state  = _make_state(knowledge_map=_KM_WITH_NODES)
-        result = app.critic_agent(state, _mock_llm(fenced))
+        result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertTrue(result["_needs_more"])
 
     def test_activity_log_title_reflects_needs_more(self):
@@ -606,15 +550,80 @@ class TestCriticAgent(unittest.TestCase):
         self.assertIn("enrich", title)
 
     def test_activity_log_title_reflects_approved(self):
-        state   = _make_state(knowledge_map=_KM_WITH_NODES)
+        state   = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result  = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         title   = result["activity_log"][0]["title"].lower()
         self.assertIn("approv", title)
 
     def test_current_agent_set(self):
-        state  = _make_state(knowledge_map=_KM_WITH_NODES)
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
         result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
         self.assertEqual(result["current_agent"], "critic")
+
+    def test_prev_node_count_updated(self):
+        """_prev_node_count in returned state reflects the current graph size."""
+        state  = _make_state(knowledge_map=_KM_STRUCTURAL_PASS)
+        result = app.critic_agent(state, _mock_llm(_APPROVED_JSON))
+        self.assertEqual(result["_prev_node_count"], len(_KM_STRUCTURAL_PASS["nodes"]))
+
+    # ── Delta-node guard ──────────────────────────────────────────────────────
+
+    def test_delta_guard_suppresses_needs_more_when_graph_did_not_grow(self):
+        """
+        If an enrichment pass already ran (loop_count >= 1) and the graph grew
+        by fewer than 4 nodes, _needs_more must be forced False even when the
+        structural checks would otherwise request more enrichment.
+        """
+        # _KM_WITH_NODES has structural failures (edges < 4, types < 2).
+        # Simulate that the graph had the same number of nodes before the pass.
+        n = len(_KM_WITH_NODES["nodes"])  # 10
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,           # one enrichment pass already ran
+            _prev_node_count=n,     # graph didn't grow at all
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertFalse(result["_needs_more"])
+
+    def test_delta_guard_critique_explains_stop_reason(self):
+        """When delta guard fires, the critique records why enrichment stopped."""
+        n = len(_KM_WITH_NODES["nodes"])
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,
+            _prev_node_count=n,
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertIn("Stopping enrichment", result["critique"])
+
+    def test_delta_guard_does_not_fire_on_first_pass(self):
+        """
+        Delta guard requires loop_count >= 1. On the first critic pass
+        (loop_count=0), structural failures should still set _needs_more=True.
+        """
+        n = len(_KM_WITH_NODES["nodes"])
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=0,           # first pass — guard must not fire
+            _prev_node_count=n,
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        self.assertTrue(result["_needs_more"])
+
+    def test_delta_guard_allows_enrichment_when_graph_grew(self):
+        """
+        When the graph grew by >= 4 nodes after an enrichment pass, the delta
+        guard does not suppress _needs_more even if loop_count >= 1.
+        """
+        n = len(_KM_WITH_NODES["nodes"])  # 10
+        state = _make_state(
+            knowledge_map=_KM_WITH_NODES,
+            loop_count=1,
+            _prev_node_count=n - 5,   # graph grew by 5 — above threshold of 4
+        )
+        result = app.critic_agent(state, _mock_llm(_NEEDS_MORE_JSON))
+        # structural checks still fail (edges < 4, types < 2) and delta is ok
+        self.assertTrue(result["_needs_more"])
 
 
 # ═════════════════════════════════════════════════════════════════════════════

@@ -162,6 +162,39 @@ def _evaluate_query(
 # Public runner
 # ---------------------------------------------------------------------------
 
+def _print_header() -> None:
+    print("""\
+╔══════════════════════════════════════════════════════════════════╗
+║                    UpTrain Evaluation Framework                  ║
+╠══════════════════════════════════════════════════════════════════╣
+║  What it is:                                                     ║
+║    UpTrain is an open-source LLM evaluation framework that uses  ║
+║    a judge LLM to score response and retrieval quality. All      ║
+║    evaluation is done locally (evaluate_locally=True) — traffic  ║
+║    is not routed through UpTrain's cloud service.                ║
+║                                                                  ║
+║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
+║    response_relevance    Does the summary directly address the   ║
+║                          research query?                         ║
+║    response_completeness Does the summary cover all aspects of   ║
+║                          the query, or leave gaps?               ║
+║    context_relevance     Is the retrieved context on-topic for   ║
+║                          the query (low noise)?                  ║
+║    response_conciseness  Is the summary free of irrelevant       ║
+║                          padding or off-topic content?           ║
+║                                                                  ║
+║  How to read the output:                                         ║
+║    Each query prints a score and PASS/FAIL for every metric.     ║
+║    The aggregate section shows the mean score and pass rate      ║
+║    across all queries, with the threshold listed for reference.  ║
+║    A score of None means the pipeline returned an empty summary  ║
+║    or context for that query and evaluation was skipped.         ║
+╚══════════════════════════════════════════════════════════════════╝""")
+    print("  PASS thresholds (aligned with RAGAS, ≥ to PASS):")
+    for metric, threshold in THRESHOLDS.items():
+        print(f"    {metric}: {threshold}")
+
+
 def run_uptrain_eval(
     query_ids: list[str] | None = None,
     output_dir: str = "eval_results",
@@ -171,6 +204,8 @@ def run_uptrain_eval(
     # Legacy kwarg kept for backwards compatibility
     api_key: str | None = None,
 ) -> list[dict]:
+    _print_header()
+
     if cfg is None:
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not key:

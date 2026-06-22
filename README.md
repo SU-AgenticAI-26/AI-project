@@ -2,6 +2,7 @@
 
 An integrated AI-powered research assistant that combines multiple scholarly APIs, vector databases, and multi-agent RAG systems for comprehensive academic research.
 
+### UI LINK : https://appapppy-krh2gyhmwn43wxpkurbbdz.streamlit.app/
 ## Features
 
 - 🔍 **Multi-API Scholarly Search**: OpenAlex, Crossref, Arxiv, Semantic Scholar

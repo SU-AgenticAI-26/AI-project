@@ -210,6 +210,46 @@ def _judge_task_success(
 # Public runner
 # ---------------------------------------------------------------------------
 
+def _print_header() -> None:
+    print("""\
+╔══════════════════════════════════════════════════════════════════╗
+║                  AgentBench Evaluation Framework                 ║
+╠══════════════════════════════════════════════════════════════════╣
+║  What it is:                                                     ║
+║    An adaptation of the AgentBench benchmark (Liu et al., 2023)  ║
+║    that measures task success rate, routing capability, and      ║
+║    interaction efficiency for multi-agent research pipelines.    ║
+║    No external AgentBench installation is required; metrics are  ║
+║    computed locally using the judge LLM from eval_provider.py.   ║
+║                                                                  ║
+║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
+║    task_success         LLM judge rates relevance, depth,        ║
+║                         accuracy, and organisation of the        ║
+║                         summary (mean of four 0–1 rubric dims).  ║
+║    channel_precision    Fraction of activated channels that were ║
+║                         expected for this query type.            ║
+║    channel_recall       Fraction of expected channels that were  ║
+║                         actually activated by the Router.        ║
+║    channel_f1           Harmonic mean of precision and recall.   ║
+║    iteration_efficiency 1.0 = approved on first critic pass;     ║
+║                         0.75 = one enrichment loop; 0.5 = hit    ║
+║                         the loop cap (penalises over-iteration). ║
+║    kg_density           Normalised knowledge-graph node count:   ║
+║                         1.0 in ideal range [8, 25]; tapers to    ║
+║                         0.0 below 8 or above 50 nodes.           ║
+║                                                                  ║
+║  How to read the output:                                         ║
+║    Each query shows per-metric scores with a PASS/FAIL flag.     ║
+║    The aggregate table breaks results down by difficulty bucket  ║
+║    (easy / medium / hard), mirroring the original AgentBench     ║
+║    per-task-category reporting style.                            ║
+║    task_success is None when --no-llm-judge is used.            ║
+╚══════════════════════════════════════════════════════════════════╝""")
+    print("  PASS thresholds (≥ to PASS):")
+    for metric, threshold in THRESHOLDS.items():
+        print(f"    {metric}: {threshold}")
+
+
 def run_agentbench_eval(
     query_ids: list[str] | None = None,
     output_dir: str = "eval_results",
@@ -220,6 +260,8 @@ def run_agentbench_eval(
     # Legacy kwarg kept for backwards compatibility
     api_key: str | None = None,
 ) -> list[dict]:
+    _print_header()
+
     if cfg is None:
         key = api_key or os.environ.get("OPENAI_API_KEY", "")
         if not key:
