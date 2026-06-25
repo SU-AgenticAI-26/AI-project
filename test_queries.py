@@ -75,10 +75,10 @@ TEST_QUERIES: list[dict] = [
         "difficulty": "easy",
     },
     {
-        "id": "q2_federated",
+        "id": "q2_continual",
         "query": (
-            "What are the main approaches and challenges in federated learning "
-            "for healthcare applications?"
+            "What are the main strategies and trade-offs in continual learning "
+            "for avoiding catastrophic forgetting?"
         ),
         "expected_channels": ["vector_db", "sql_db", "web"],
         "difficulty": "medium",
@@ -93,9 +93,10 @@ TEST_QUERIES: list[dict] = [
         "difficulty": "hard",
     },
     {
-        "id": "q4_multiagent",
+        "id": "q4_diffusion",
         "query": (
-            "What collaboration mechanisms are used in multi-agent LLM systems?"
+            "What architectural components and training techniques distinguish "
+            "diffusion models from GANs for image synthesis?"
         ),
         "expected_channels": ["vector_db", "sql_db", "web"],
         "difficulty": "medium",

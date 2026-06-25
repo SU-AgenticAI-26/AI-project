@@ -124,6 +124,40 @@ def vector_db_agent(
             "current_agent": "vector_db",
         }
 
+    def _synthesise_from_docs(docs_found: list[dict[str, Any]]) -> str:
+        if not docs_found:
+            return "(No relevant documents found in Vector DB)"
+        formatted_docs = "\n\n---\n".join(
+            f"[{d['source']}] {d['content']}" for d in docs_found[:6]
+        )
+        synthesis_resp = model.invoke([
+            SystemMessage(content=(
+                "Synthesise the retrieved VectorDB documents into structured research notes. "
+                "Preserve source information and organise findings clearly."
+            )),
+            HumanMessage(content=(
+                f"Query: {state['query']}\n"
+                f"Focus keywords: {keywords_str}\n\n"
+                f"Documents:\n{formatted_docs}"
+            )),
+        ])
+        return str(synthesis_resp.content)
+
+    def _fallback_docs(query_text: str, top_k: int = 5) -> list[dict[str, Any]]:
+        docs = vdb.search(query_text, k=max(1, min(top_k, 20)))
+        out: list[dict[str, Any]] = []
+        for doc in docs:
+            out.append({
+                "source": doc.metadata.get("source", "unknown"),
+                "content": doc.page_content[:500],
+                "metadata": {
+                    "title": doc.metadata.get("title", ""),
+                    "url": doc.metadata.get("url", ""),
+                    "indexed_at": doc.metadata.get("indexed_at", ""),
+                },
+            })
+        return out
+
     system_prompt = SystemMessage(content=(
         "You are a Vector DB Search Agent. You have access to a database of indexed documents, "
         "papers, and web search results. Based on the user's query and scoping context, decide:\n"
@@ -168,24 +202,14 @@ def vector_db_agent(
                     except Exception as e:
                         tool_reasoning.append(f"Tool error: {e}")
 
-            if docs_found:
-                formatted_docs = "\n\n---\n".join(
-                    f"[{d['source']}] {d['content']}" for d in docs_found[:6]
-                )
-                synthesis_resp = model.invoke([
-                    SystemMessage(content=(
-                        "Synthesise the retrieved VectorDB documents into structured research notes. "
-                        "Preserve source information and organise findings clearly."
-                    )),
-                    HumanMessage(content=(
-                        f"Query: {state['query']}\n"
-                        f"Focus keywords: {keywords_str}\n\n"
-                        f"Documents:\n{formatted_docs}"
-                    )),
-                ])
-                vector_findings = str(synthesis_resp.content)
-            else:
-                vector_findings = "(No relevant documents found in Vector DB)"
+            if not docs_found:
+                docs_found = _fallback_docs(state["query"], top_k=5)
+                if docs_found:
+                    tool_reasoning.append(
+                        f"Fallback direct search on query -> {len(docs_found)} results"
+                    )
+
+            vector_findings = _synthesise_from_docs(docs_found)
 
             sources = list({d["source"] for d in docs_found})
             return {
@@ -204,14 +228,22 @@ def vector_db_agent(
             }
 
         llm_decision = getattr(response, "content", str(response))
+        docs_found = _fallback_docs(state["query"], top_k=5)
+        vector_findings = _synthesise_from_docs(docs_found)
+        sources = list({d["source"] for d in docs_found})
         return {
-            "vector_findings": f"(Vector DB search not needed: {str(llm_decision)[:200]})",
-            "messages": [AIMessage(content="[VectorDB] Skipped (LLM decision)")],
+            "vector_findings": vector_findings,
+            "messages": [AIMessage(content=f"[VectorDB] fallback search {len(docs_found)} doc(s)")],
             "activity_log": [{
                 "agent": "vector_db",
                 "icon": "🗂️",
-                "title": "Vector DB agent (LLM decision)",
-                "detail": f"No search needed: {str(llm_decision)[:100]}",
+                "title": "Vector DB agent (fallback search)",
+                "detail": (
+                    f"LLM skipped tool call ({str(llm_decision)[:80]}). "
+                    f"Fallback direct search returned {len(docs_found)} doc(s)."
+                ),
+                "docs_found": len(docs_found),
+                "sources": sources,
                 "ts": stamp_fn(),
             }],
             "current_agent": "vector_db",

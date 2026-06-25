@@ -101,6 +101,24 @@ class TestRouterAgent(unittest.TestCase):
         result = app.router_agent(state, _mock_llm(resp))
         self.assertIn("sql_db", result["active_agents"])
 
+    def test_what_are_main_wording_force_sql_agent(self):
+        """Variant wording without 'the' should still force sql_db."""
+        state = _make_state(
+            query="What are main approaches in federated learning for healthcare?"
+        )
+        resp = json.dumps({"agents": ["vector_db", "web"], "reasoning": "recent research focus"})
+        result = app.router_agent(state, _mock_llm(resp))
+        self.assertIn("sql_db", result["active_agents"])
+
+    def test_challenges_wording_force_sql_agent(self):
+        """Challenge-focused categorical prompts should force sql_db."""
+        state = _make_state(
+            query="What challenges remain for multi-agent coordination in LLM systems?"
+        )
+        resp = json.dumps({"agents": ["vector_db", "web"], "reasoning": "recent systems focus"})
+        result = app.router_agent(state, _mock_llm(resp))
+        self.assertIn("sql_db", result["active_agents"])
+
     def test_non_trigger_query_does_not_force_sql_agent(self):
         """Queries without SQL trigger patterns should not add sql_db automatically."""
         state = _make_state(query="Explain transformer attention with a simple example")
@@ -462,6 +480,41 @@ class TestKnowledgeMapperAgent(unittest.TestCase):
         result = app.knowledge_mapper_agent(state, _mock_llm(model_out))
         self.assertEqual(result["knowledge_map"]["nodes"][0]["source"], "vector_db")
 
+    def test_repairs_source_prefers_scored_non_merged_match(self):
+        model_out = json.dumps({
+            "nodes": [
+                {"id": "n1", "label": "Federated Averaging", "type": "concept", "source": "merged"}
+            ],
+            "edges": [],
+        })
+        state = _make_state(
+            merged_context="ctx",
+            tagged_findings=[
+                {"text": "Federated averaging is widely used in healthcare FL studies.", "source": "vector_db"},
+                {"text": "General background on federated methods.", "source": "merged"},
+            ],
+        )
+        result = app.knowledge_mapper_agent(state, _mock_llm(model_out))
+        self.assertEqual(result["knowledge_map"]["nodes"][0]["source"], "vector_db")
+
+    def test_repairs_source_uses_highest_scoring_match(self):
+        model_out = json.dumps({
+            "nodes": [
+                {"id": "n1", "label": "Transformer attention", "type": "concept", "source": "merged"}
+            ],
+            "edges": [],
+        })
+        state = _make_state(
+            merged_context="ctx",
+            tagged_findings=[
+                {"text": "Transformer attention mechanism improves token interactions.", "source": "web"},
+                {"text": "Attention is discussed.", "source": "merged"},
+                {"text": "Transformer architectures remain dominant.", "source": "vector_db"},
+            ],
+        )
+        result = app.knowledge_mapper_agent(state, _mock_llm(model_out))
+        self.assertEqual(result["knowledge_map"]["nodes"][0]["source"], "web")
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Critic Agent
@@ -667,6 +720,16 @@ class TestSummarizerAgent(unittest.TestCase):
         app.summarizer_agent(state, model)
         human_content = model.invoke.call_args[0][0][-1].content
         self.assertIn("UNIQUE_NODE_LABEL", human_content)
+
+    def test_prompt_requires_evidence_spans_not_source_labels(self):
+        model = _mock_llm("s")
+        state = _make_state(merged_context="ctx", knowledge_map={})
+        app.summarizer_agent(state, model)
+        system_content = model.invoke.call_args[0][0][0].content
+        self.assertIn("(evidence:", system_content)
+        self.assertIn("quoted verbatim", system_content)
+        self.assertIn("Forbidden citation styles", system_content)
+        self.assertIn("(source: Web)", system_content)
 
     def test_activity_log_reports_char_count(self):
         state  = _make_state(merged_context="ctx", knowledge_map={})

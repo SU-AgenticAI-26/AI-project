@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 
 _ALLOWED_SOURCES = {"vector_db", "sql_db", "web", "merged"}
+_SOURCE_PRIORITY = {"vector_db": 0, "sql_db": 1, "web": 2, "merged": 3}
 
 
 def _default_stamp() -> str:
@@ -57,6 +58,34 @@ def _repair_node_sources(km: dict[str, Any], tagged: list[dict[str, str]]) -> di
         for item in tagged
     ]
 
+    def _best_source_for_label(label_text: str) -> str | None:
+        label = (label_text or "").strip().lower()
+        if not label:
+            return None
+
+        tokens = [t for t in label.split() if len(t) >= 3]
+        source_scores: dict[str, int] = {}
+        for item in lower_tagged:
+            source = item["source"]
+            text = item["text"]
+            score = 0
+            if label in text:
+                # Strong signal: full label phrase appears in chunk.
+                score += 6
+            if tokens:
+                score += sum(1 for t in tokens if t in text)
+            if score > 0:
+                source_scores[source] = source_scores.get(source, 0) + score
+
+        if not source_scores:
+            return None
+
+        # Pick highest score; break ties by non-merged preference.
+        return sorted(
+            source_scores.items(),
+            key=lambda kv: (-kv[1], _SOURCE_PRIORITY.get(kv[0], 99)),
+        )[0][0]
+
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -65,13 +94,10 @@ def _repair_node_sources(km: dict[str, Any], tagged: list[dict[str, str]]) -> di
         if current_source not in _ALLOWED_SOURCES:
             current_source = "merged"
 
-        if label:
-            matched_sources = {
-                item["source"] for item in lower_tagged if label in item["text"]
-            }
-            if len(matched_sources) == 1:
-                node["source"] = next(iter(matched_sources))
-                continue
+        matched_source = _best_source_for_label(label)
+        if matched_source:
+            node["source"] = matched_source
+            continue
 
         node["source"] = current_source or "merged"
 

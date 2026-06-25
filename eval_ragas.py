@@ -19,19 +19,24 @@ Usage:
                          --judge-provider openai --judge-model gpt-4o-mini
 
     # Subset of queries
-    python eval_ragas.py --query-ids q1_rag q2_federated
+    python eval_ragas.py --query-ids q1_rag q2_continual
 
 Requires:
-    pip install ragas
-    # Plus provider packages; see streamlit_app.py install notes.
+    pip install ragas langchain-huggingface
 """
+
+# ── Must be set before any HuggingFace / tokenizer import ──────────────────
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+# ───────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
+import math
 import re
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -54,13 +59,35 @@ except ImportError as e:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
-async def evaluate_single(
+def _safe_score(val, default=None):
+    """Return float or None; guards against NaN from failed LLM calls."""
+    try:
+        f = float(val)
+        return None if math.isnan(f) else round(f, 4)
+    except (TypeError, ValueError):
+        return default
+
+
+def evaluate_single_sync(
     query: str,
     retrieved_contexts: list[str],
     response: str,
     cfg: EvalConfig,
 ) -> dict:
-    """Run RAGAS metrics on one pipeline result. Returns a dict of scores."""
+    """
+    Run RAGAS metrics synchronously for one pipeline result.
+    Called in a thread via asyncio.to_thread to avoid blocking the event loop,
+    but the call itself is fully synchronous — no nested asyncio.run().
+    """
+    response = (response or "").strip()
+    if not response:
+        return {
+            "faithfulness": None,
+            "response_relevancy": None,
+            "context_precision": None,
+            "_diag": "empty_response",
+        }
+
     ragas_llm = cfg.ragas_llm()
     ragas_emb = cfg.ragas_embeddings()
 
@@ -71,40 +98,32 @@ async def evaluate_single(
     )
     dataset = EvaluationDataset(samples=[sample])
 
-    # Generous timeout and retries for local/slow judge models.
-    # max_retries=1 was too low: a single parse failure caused faithfulness=NaN.
+    # Generous timeout; max_retries=3 handles occasional judge parse failures.
     run_cfg = RunConfig(timeout=300, max_retries=3, max_wait=30)
 
-    def _run_ragas_evaluation():
-        result = evaluate(
-            dataset=dataset,
-            metrics=[
-                Faithfulness(llm=ragas_llm),
-                ResponseRelevancy(llm=ragas_llm, embeddings=ragas_emb),
-                LLMContextPrecisionWithoutReference(llm=ragas_llm),
-            ],
-            run_config=run_cfg,
-            raise_exceptions=False,
-            show_progress=False,
-        )
-        df = result.to_pandas()
-        return df.iloc[0]
+    result = evaluate(
+        dataset=dataset,
+        metrics=[
+            Faithfulness(llm=ragas_llm),
+            ResponseRelevancy(llm=ragas_llm, embeddings=ragas_emb),
+            LLMContextPrecisionWithoutReference(llm=ragas_llm),
+        ],
+        run_config=run_cfg,
+        raise_exceptions=False,
+        show_progress=False,
+    )
+    df = result.to_pandas()
+    row = df.iloc[0]
 
-    row = await asyncio.to_thread(_run_ragas_evaluation)
-
-    def _safe_score(val, default=None):
-        """Return float or None; guards against NaN from failed LLM calls."""
-        import math
-        try:
-            f = float(val)
-            return None if math.isnan(f) else round(f, 4)
-        except (TypeError, ValueError):
-            return default
+    response_relevancy = row.get("response_relevancy")
+    if response_relevancy is None:
+        response_relevancy = row.get("answer_relevancy")
 
     return {
         "faithfulness":       _safe_score(row.get("faithfulness")),
-        "response_relevancy": _safe_score(row.get("response_relevancy")),
+        "response_relevancy": _safe_score(response_relevancy),
         "context_precision":  _safe_score(row.get("llm_context_precision_without_reference")),
+        "_diag": None,
     }
 
 
@@ -113,11 +132,8 @@ def evaluate_entity_recall(
     merged_context: str,
 ) -> float:
     """
-    Proxy for entity recall: check what fraction of knowledge graph node
-    labels appear (case-insensitive) in the merged context.
-
-    This is a lightweight string-match proxy. For higher accuracy, replace
-    with RAGAS ContextEntitiesRecall (requires a reference answer).
+    Proxy for entity recall: fraction of KG node labels found
+    (case-insensitive word-boundary match) in the merged context.
     """
     nodes = knowledge_map.get("nodes", [])
     if not nodes:
@@ -135,6 +151,78 @@ def evaluate_entity_recall(
 
 
 # ---------------------------------------------------------------------------
+# Async batch runner — sequential to avoid Windows tokenizer deadlock
+# ---------------------------------------------------------------------------
+
+async def _batch_evaluate_sequential(
+    pipeline_results: list[tuple[dict, dict, float]],
+    cfg: EvalConfig,
+) -> dict[int, dict]:
+    """
+    Evaluate each query one at a time in a background thread.
+
+    Running them all concurrently via asyncio.gather + asyncio.to_thread
+    causes a tokenizer deadlock on Windows (TOKENIZERS_PARALLELISM=false
+    alone is not always sufficient when multiple threads initialise the
+    model simultaneously). Sequential execution is ~same wall time because
+    each RAGAS call is I/O-bound (waiting on the judge LLM).
+    """
+    results: dict[int, dict] = {}
+    for i, (tq, state, _) in enumerate(pipeline_results):
+        contexts = split_context_into_chunks(state.get("merged_context", ""))
+        if not contexts:
+            continue
+
+        print(f"  [RAGAS] Evaluating {tq['id']} ({i + 1}/{len(pipeline_results)})...")
+        try:
+            scores = await asyncio.to_thread(
+                evaluate_single_sync,
+                tq["query"],
+                contexts,
+                state.get("summary", ""),
+                cfg,
+            )
+        except Exception as exc:
+            print(f"  WARNING: RAGAS evaluation failed for {tq['id']}: {exc}")
+            scores = {
+                "faithfulness": None,
+                "response_relevancy": None,
+                "context_precision": None,
+                "_diag": str(exc),
+            }
+        results[i] = scores
+    return results
+
+
+def _run_async(coro):
+    """
+    Cross-platform asyncio.run() wrapper.
+
+    On Windows with Python 3.10+ the default ProactorEventLoop works fine,
+    but if an event loop is already running (e.g. inside Jupyter / Streamlit)
+    asyncio.run() raises RuntimeError. This wrapper handles both cases.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        # Already inside an event loop (Streamlit, Jupyter) — use nest_asyncio
+        try:
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(coro)
+        except ImportError:
+            raise RuntimeError(
+                "Running inside an existing event loop. "
+                "Install nest_asyncio: pip install nest_asyncio"
+            )
+    else:
+        return asyncio.run(coro)
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
@@ -143,35 +231,15 @@ def _print_header() -> None:
 ╔══════════════════════════════════════════════════════════════════╗
 ║                      RAGAS Evaluation Framework                  ║
 ╠══════════════════════════════════════════════════════════════════╣
-║  What it is:                                                     ║
-║    RAGAS (Retrieval-Augmented Generation Assessment) is an       ║
-║    open-source framework for evaluating RAG pipelines. It uses   ║
-║    a judge LLM to score faithfulness and relevance, and an       ║
-║    embedding model to measure semantic alignment. All queries    ║
-║    are evaluated concurrently to reduce wall-clock time.         ║
-║                                                                  ║
 ║  Metrics (all scored 0.0 – 1.0, higher is better):              ║
-║    faithfulness        Are all claims in the summary grounded    ║
-║                        in the retrieved context? Penalises       ║
-║                        hallucinated or unsupported statements.   ║
-║    response_relevancy  Does the summary directly and completely  ║
-║                        address the research query?               ║
-║    context_precision   Is the retrieved context focused on the   ║
-║                        query, or does it contain noise?          ║
-║    entity_recall       Fraction of knowledge-graph node labels   ║
-║                        that appear in the merged context         ║
-║                        (lightweight string-match proxy).         ║
+║    faithfulness        Are all claims grounded in context?       ║
+║    response_relevancy  Does the summary address the query?       ║
+║    context_precision   Is retrieved context focused/not noisy?   ║
+║    entity_recall       KG node labels found in merged context.   ║
 ║                                                                  ║
 ║  PASS thresholds:                                                ║
 ║    faithfulness ≥ 0.75  |  response_relevancy ≥ 0.75            ║
 ║    context_precision ≥ 0.70  |  entity_recall ≥ 0.60            ║
-║                                                                  ║
-║  How to read the output:                                         ║
-║    Phase 1 runs (or reuses cached) pipeline results for all      ║
-║    queries. Phase 2 evaluates them concurrently via RAGAS.       ║
-║    Phase 3 prints per-query scores and a final aggregate table.  ║
-║    A score of None means the RAGAS judge call failed or returned ║
-║    NaN (often a timeout or JSON-parse error from the judge LLM). ║
 ╚══════════════════════════════════════════════════════════════════╝
 """)
 
@@ -180,11 +248,8 @@ def run_ragas_eval(
     query_ids: list[str] | None = None,
     output_dir: str = "eval_results",
     cfg: EvalConfig | None = None,
-    # Pre-computed pipeline results: maps query_id -> (state, wall_time).
-    # When provided, pipeline runs are skipped (reuse results from run_eval.py).
     pipeline_cache: dict | None = None,
-    # Legacy kwarg kept for backwards compatibility
-    api_key: str | None = None,
+    api_key: str | None = None,   # legacy kwarg
 ) -> list[dict]:
     _print_header()
 
@@ -198,41 +263,25 @@ def run_ragas_eval(
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Phase 1: Run (or reuse) pipelines for all queries
+    # Phase 1: Run (or reuse) pipelines
     # ------------------------------------------------------------------
-    pipeline_results: list[tuple[dict, dict, float]] = []  # (tq, state, wall_time)
+    pipeline_results: list[tuple[dict, dict, float]] = []
     for tq in queries:
         if pipeline_cache and tq["id"] in pipeline_cache:
             state, wall_time = pipeline_cache[tq["id"]]
-            print(f"\n[RAGAS] Reusing cached pipeline: {tq['id']}")
+            print(f"[RAGAS] Reusing cached pipeline: {tq['id']}")
         else:
-            print(f"\n[RAGAS] Running: {tq['id']} — {tq['query'][:60]}...")
+            print(f"[RAGAS] Running pipeline: {tq['id']} — {tq['query'][:60]}...")
             state, wall_time = run_pipeline(tq["query"], cfg=cfg)
         pipeline_results.append((tq, state, wall_time))
 
     # ------------------------------------------------------------------
-    # Phase 2: Batch all RAGAS evaluations concurrently
+    # Phase 2: RAGAS evaluation — sequential to avoid tokenizer deadlock
     # ------------------------------------------------------------------
-    # Build (index, coroutine) pairs only for queries with non-empty context.
-    async def _batch_evaluate():
-        tasks = {}
-        for i, (tq, state, _) in enumerate(pipeline_results):
-            contexts = split_context_into_chunks(state.get("merged_context", ""))
-            if contexts:
-                tasks[i] = evaluate_single(
-                    query=tq["query"],
-                    retrieved_contexts=contexts,
-                    response=state.get("summary", ""),
-                    cfg=cfg,
-                )
-        if not tasks:
-            return {}
-        indices = list(tasks.keys())
-        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        return dict(zip(indices, results))
-
-    print(f"\n[RAGAS] Evaluating {len(pipeline_results)} queries concurrently...")
-    score_by_index = asyncio.run(_batch_evaluate())
+    print(f"\n[RAGAS] Evaluating {len(pipeline_results)} queries (sequential, Windows-safe)...")
+    score_by_index = _run_async(
+        _batch_evaluate_sequential(pipeline_results, cfg)
+    )
 
     # ------------------------------------------------------------------
     # Phase 3: Collate results
@@ -250,15 +299,21 @@ def run_ragas_eval(
             }
         else:
             raw = score_by_index.get(i)
-            if isinstance(raw, Exception):
-                print(f"  WARNING: RAGAS evaluation failed for {tq['id']}: {raw}")
+            if raw is None or isinstance(raw, Exception):
+                print(f"  WARNING: no scores for {tq['id']}: {raw}")
                 scores = {
                     "faithfulness":       None,
                     "response_relevancy": None,
                     "context_precision":  None,
                 }
             else:
-                scores = raw
+                scores = {k: v for k, v in raw.items() if k != "_diag"}
+
+        if scores.get("response_relevancy") is None and contexts:
+            print(
+                f"  WARNING: response_relevancy is None for {tq['id']} despite "
+                "non-empty response. Check judge/embedding provider configuration."
+            )
 
         entity_recall = evaluate_entity_recall(
             state.get("knowledge_map", {}),
@@ -283,13 +338,14 @@ def run_ragas_eval(
         }
 
         # Pass/fail flags
-        result["faithfulness_pass"]      = (result["faithfulness"] or 0) >= 0.75
-        result["response_relevancy_pass"] = (result["response_relevancy"] or 0) >= 0.75
-        result["context_precision_pass"] = (result["context_precision"] or 0) >= 0.70
-        result["entity_recall_pass"]     = result["entity_recall"] >= 0.60
+        result["faithfulness_pass"]       = (result.get("faithfulness") or 0) >= 0.75
+        result["response_relevancy_pass"] = (result.get("response_relevancy") or 0) >= 0.75
+        result["context_precision_pass"]  = (result.get("context_precision") or 0) >= 0.70
+        result["entity_recall_pass"]      = result["entity_recall"] >= 0.60
 
         all_results.append(result)
 
+        print(f"\n  [{tq['id']}]")
         print(f"  Provider:        {cfg.provider} / {cfg.model}")
         print(f"  Judge:           {cfg._jp()} / {cfg._jm()}")
         print(f"  Faithfulness:    {result['faithfulness']}")
@@ -305,15 +361,15 @@ def run_ragas_eval(
     out_path.write_text(json.dumps(all_results, indent=2))
     print(f"\n[RAGAS] Results written to {out_path}")
 
-    # Print aggregate summary
+    # Aggregate summary
     print("\n=== RAGAS AGGREGATE ===")
     metrics = ["faithfulness", "response_relevancy", "context_precision", "entity_recall"]
     for m in metrics:
         vals = [r[m] for r in all_results if r.get(m) is not None]
         if vals:
-            mean = round(sum(vals) / len(vals), 4)
+            mean_val = round(sum(vals) / len(vals), 4)
             passes = sum(1 for r in all_results if r.get(f"{m}_pass"))
-            print(f"  {m:30s} mean={mean}  pass={passes}/{len(all_results)}")
+            print(f"  {m:30s} mean={mean_val}  pass={passes}/{len(all_results)}")
 
     return all_results
 
@@ -323,6 +379,10 @@ def run_ragas_eval(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Windows ProactorEventLoop fix for Python 3.8+
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     parser = argparse.ArgumentParser(description="Run RAGAS evaluation")
     parser.add_argument("--query-ids", nargs="*", help="Subset of query IDs to run")
     parser.add_argument("--output-dir", default="eval_results")

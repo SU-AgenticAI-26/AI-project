@@ -99,6 +99,24 @@ def sql_db_agent(
             "current_agent": "sql_db",
         }
 
+    def _fallback_rows(query_text: str, k: int = 8) -> list[dict[str, str]]:
+        raw = sql_search_fn(query_text, k=k)
+        return [{"type": "text", "content": line} for line in raw.split("\n") if line.strip()]
+
+    def _synthesise_rows(rows: list[dict[str, str]]) -> str:
+        if not rows:
+            return "(No relevant records found in SQL database)"
+        formatted_results = "\n".join([r["content"] for r in rows])
+        synthesis_system = SystemMessage(content=(
+            "Synthesise the SQL database results into structured research notes. "
+            "Preserve the topic, relationship, and fact distinctions."
+        ))
+        synthesis_resp = model.invoke([
+            synthesis_system,
+            HumanMessage(content=f"Query: {state['query']}\n\nDatabase results:\n{formatted_results}"),
+        ])
+        return str(synthesis_resp.content)
+
     system_prompt = SystemMessage(content=(
         "You are a SQL Database Agent. You have access to a database of structured topics, "
         "relationships, and facts. Based on the user's query and scoping keywords, decide:\n"
@@ -145,19 +163,14 @@ Decide whether and how to search the SQL database for structured facts."""
                     except Exception as e:
                         tool_reasoning.append(f"Tool error: {e}")
 
-            if results_found:
-                formatted_results = "\n".join([r["content"] for r in results_found])
-                synthesis_system = SystemMessage(content=(
-                    "Synthesise the SQL database results into structured research notes. "
-                    "Preserve the topic, relationship, and fact distinctions."
-                ))
-                synthesis_resp = model.invoke([
-                    synthesis_system,
-                    HumanMessage(content=f"Query: {state['query']}\n\nDatabase results:\n{formatted_results}"),
-                ])
-                sql_findings = str(synthesis_resp.content)
-            else:
-                sql_findings = "(No relevant records found in SQL database)"
+            if not results_found:
+                results_found = _fallback_rows(state["query"], k=8)
+                if results_found:
+                    tool_reasoning.append(
+                        f"Fallback direct SQL search on query -> {len(results_found)} rows"
+                    )
+
+            sql_findings = _synthesise_rows(results_found)
 
             return {
                 "sql_findings": sql_findings,
@@ -174,14 +187,20 @@ Decide whether and how to search the SQL database for structured facts."""
             }
 
         llm_decision = response.content if hasattr(response, "content") else str(response)
+        results_found = _fallback_rows(state["query"], k=8)
+        sql_findings = _synthesise_rows(results_found)
         return {
-            "sql_findings": f"(SQL search not needed: {str(llm_decision)[:200]})",
-            "messages": [AIMessage(content="[SQLDB] Skipped search (LLM decision)")],
+            "sql_findings": sql_findings,
+            "messages": [AIMessage(content=f"[SQLDB] fallback search {len(results_found)} row(s)")],
             "activity_log": [{
                 "agent": "sql_db",
                 "icon": "🗄️",
-                "title": "SQL / DB agent (LLM decision)",
-                "detail": f"LLM decided no SQL search needed: {str(llm_decision)[:100]}",
+                "title": "SQL / DB agent (fallback search)",
+                "detail": (
+                    f"LLM skipped tool call ({str(llm_decision)[:80]}). "
+                    f"Fallback direct SQL search returned {len(results_found)} row(s)."
+                ),
+                "rows": results_found[:12],
                 "ts": stamp_fn(),
             }],
             "current_agent": "sql_db",

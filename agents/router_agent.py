@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +20,19 @@ SQL_TRIGGER_PATTERNS = [
     "how many",
 ]
 
+_SQL_TRIGGER_REGEXES = [
+    # q2-style categorical prompts
+    re.compile(r"\bwhat\s+are\s+(?:the\s+)?main\b"),
+    re.compile(r"\bwhat\s+(?:are\s+)?(?:the\s+)?(?:main\s+)?approaches\b"),
+    re.compile(r"\bapproaches\s+and\s+challenges\b"),
+    # q4-style mechanism prompts
+    re.compile(r"\bwhat\s+(?:collaboration\s+)?mechanisms\b"),
+    re.compile(r"\bcollaboration\s+mechanisms\b"),
+    # generic enumeration / structured-fact prompts
+    re.compile(r"\bmechanisms?\b"),
+    re.compile(r"\bchallenges?\b"),
+]
+
 
 def _default_stamp() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -26,7 +40,9 @@ def _default_stamp() -> str:
 
 def _needs_sql_for_query(query: str) -> bool:
     q = (query or "").lower()
-    return any(pattern in q for pattern in SQL_TRIGGER_PATTERNS)
+    if any(pattern in q for pattern in SQL_TRIGGER_PATTERNS):
+        return True
+    return any(rx.search(q) is not None for rx in _SQL_TRIGGER_REGEXES)
 
 
 def router_agent(state: dict[str, Any], model: Any, stamp_fn=None) -> dict[str, Any]:

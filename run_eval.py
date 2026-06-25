@@ -1,50 +1,36 @@
 """
-run_eval.py — Master evaluation runner.
+run_eval.py — Master evaluation runner (parallelised).
 
-Runs the full evaluation suite and writes a consolidated summary report.
+All eval modules that share the pipeline cache (ragas, deepeval, graph,
+uptrain, agentbench, citation) now run concurrently via a thread pool.
+Baseline, perf, and ablation run in parallel with the main group.
 
 Usage:
-    # Full suite with OpenAI (default)
-    python run_eval.py
-
-    # Local llama.cpp pipeline, OpenAI judge for RAGAS/DeepEval
-    python run_eval.py --provider local --model mistral \\
-                       --base-url http://localhost:8080/v1 \\
-                       --judge-provider openai
-
-    # Fully local (pipeline + judge) — quality of RAGAS/DeepEval scores may vary
-    python run_eval.py --provider local --model mistral --base-url http://localhost:8080/v1
-
-    # Quick sanity check (1 query, skip ablation)
-    python run_eval.py --quick
-
-    # Skip specific modules
-    python run_eval.py --skip ragas ablation
-
-    # Only specific queries
-    python run_eval.py --query-ids q1_rag q2_federated
-
-    # Reset all cached state before running (clean slate)
-    python run_eval.py --clean
-
-    # Inspect what --clean would remove without deleting anything
-    python run_eval.py --clean --dry-run
-
-Available modules: ragas, deepeval, uptrain, agentbench, graph, perf, baseline, ablation, citation
+    python run_eval.py                          # full suite
+    python run_eval.py --quick                  # graph + perf on q1_rag only
+    python run_eval.py --skip ragas ablation    # skip specific modules
+    python run_eval.py --query-ids q1_rag q2_continual
+    python run_eval.py --clean                  # wipe cache first
+    python run_eval.py --clean --dry-run        # inspect what --clean removes
+    python run_eval.py --rerun-pipelines        # ignore disk pipeline cache
 """
 
 from __future__ import annotations
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import argparse
 import json
 import logging
-import os
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# Suppress "missing ScriptRunContext" warnings Streamlit emits when its
-# modules are imported outside a running Streamlit server.
-# Streamlit's child loggers set their own levels, so a filter on the root
-# streamlit logger is more reliable than just setting the level there.
+
+# ---------------------------------------------------------------------------
+# Suppress Streamlit bare-mode noise
+# ---------------------------------------------------------------------------
 def _suppress_streamlit_bare_mode_warnings():
     class _Drop(logging.Filter):
         def filter(self, record):
@@ -63,6 +49,9 @@ _suppress_streamlit_bare_mode_warnings()
 from eval_provider import EvalConfig, add_provider_args, cfg_from_args
 
 
+# ---------------------------------------------------------------------------
+# Pass/fail thresholds
+# ---------------------------------------------------------------------------
 PASS_THRESHOLDS = {
     "faithfulness":          0.75,
     "response_relevancy":    0.75,
@@ -74,17 +63,14 @@ PASS_THRESHOLDS = {
     "node_count_max":        25,
     "source_diversity":      0.30,
     "cap_hit_rate_max":      0.30,
-    # UpTrain
     "response_relevance":    0.75,
     "response_completeness": 0.70,
     "context_relevance":     0.65,
     "response_conciseness":  0.60,
-    # AgentBench
     "task_success":          0.70,
     "channel_f1":            0.75,
     "iteration_efficiency":  0.70,
     "kg_density":            0.60,
-    # Citation
     "citation_accuracy":     0.75,
 }
 
@@ -92,39 +78,19 @@ PASS_THRESHOLDS = {
 # ---------------------------------------------------------------------------
 # Clean / reset helpers
 # ---------------------------------------------------------------------------
-
 _APP_DATA_ROOT = Path("collab_rag_data")
 
 def clean_eval_state(output_dir: str, dry_run: bool = False) -> None:
-    """
-    Delete all state that can influence eval results between sessions:
-
-      1. Pipeline cache JSON(s) — stale LLM outputs served from disk on subsequent
-                             runs (bypassed only when --rerun-pipelines is passed)
-      2. App query cache        — collab_rag_data/cache/*.json (20-day TTL)
-      3. FAISS vector indices   — collab_rag_data/vectorstore/**/index.{faiss,pkl}
-                                  (grows with interactive app use; biases vector_db_agent)
-
-    Timestamped eval output files (ragas_*.json, summary_*.json, …) and the SQL
-    knowledge.db are left untouched — they don't affect future pipeline runs.
-    """
     candidates: list[Path] = []
-
-    # 1. Pipeline cache files in output_dir and repo root
     for pattern in (
         Path(output_dir).glob("pipeline_cache_*.json"),
         Path(".").glob("pipeline_cache_*.json"),
     ):
         candidates.extend(pattern)
-
-    # 2. App query cache
     candidates.extend((_APP_DATA_ROOT / "cache").glob("*.json"))
-
-    # 3. FAISS vector indices (all embedding-backend subdirectories)
     for suffix in ("index.faiss", "index.pkl"):
         candidates.extend((_APP_DATA_ROOT / "vectorstore").rglob(suffix))
 
-    # Deduplicate by resolved path and drop any that no longer exist
     seen: set[Path] = set()
     targets: list[Path] = []
     for p in candidates:
@@ -155,20 +121,11 @@ def clean_eval_state(output_dir: str, dry_run: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # Pipeline disk-cache helpers
 # ---------------------------------------------------------------------------
-
 def _pipeline_cache_path(cfg: EvalConfig, output_dir: str) -> Path:
-    """Return the auto-named pipeline cache file for this provider/model combo."""
     model_slug = (cfg.model or "default").replace("/", "-").replace(":", "-")
     return Path(output_dir) / f"pipeline_cache_{cfg.provider}_{model_slug}.json"
 
-
 def _load_pipeline_cache(path: Path) -> dict:
-    """
-    Load pipeline results from a previously saved JSON cache.
-
-    Returns a dict mapping query_id -> (state, wall_time), or {} if the
-    file doesn't exist or can't be parsed.
-    """
     if not path.exists():
         return {}
     try:
@@ -178,28 +135,132 @@ def _load_pipeline_cache(path: Path) -> dict:
         print(f"  WARNING: Could not load pipeline cache from {path}: {exc}")
         return {}
 
-
 def _save_pipeline_cache(path: Path, cache: dict) -> None:
-    """
-    Write the current pipeline cache to disk.
-
-    LangChain message objects are excluded (they aren't JSON-serialisable and
-    aren't needed by any eval module).
-    """
     serialisable = {}
     for qid, (state, wall_time) in cache.items():
         safe_state = {k: v for k, v in state.items() if k != "messages"}
         serialisable[qid] = {"state": safe_state, "wall_time": wall_time}
     path.write_text(json.dumps(serialisable, indent=2, default=str))
 
-
-def check_pass(results: list[dict], metric: str, threshold: float) -> tuple[float | None, bool | None]:
+def check_pass(results: list[dict], metric: str, threshold: float):
     vals = [r[metric] for r in results if r.get(metric) is not None]
     if not vals:
         return None, None
     mean = round(sum(vals) / len(vals), 4)
     return mean, mean >= threshold
 
+
+# ---------------------------------------------------------------------------
+# Per-module runners — each returns (module_name, results_list)
+# These are called from threads so they must be thread-safe.
+# Each module gets its own copy of kwargs to avoid shared-state issues.
+# ---------------------------------------------------------------------------
+
+def _run_baseline(kwargs: dict) -> tuple[str, list]:
+    from eval_baseline import run_baseline_eval
+    return "baseline", run_baseline_eval(**kwargs)
+
+def _run_ragas(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_ragas import run_ragas_eval
+    return "ragas", run_ragas_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_deepeval(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_deepeval import run_deepeval_eval
+    return "deepeval", run_deepeval_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_graph(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_graph import run_graph_eval
+    return "graph", run_graph_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_perf(kwargs: dict) -> tuple[str, list]:
+    from eval_perf import run_perf_eval
+    return "perf", run_perf_eval(**kwargs)
+
+def _run_uptrain(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_uptrain import run_uptrain_eval
+    return "uptrain", run_uptrain_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_agentbench(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_agentbench import run_agentbench_eval
+    return "agentbench", run_agentbench_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_citation(kwargs: dict, pipeline_cache: dict) -> tuple[str, list]:
+    from eval_citation import run_citation_eval
+    return "citation", run_citation_eval(**kwargs, pipeline_cache=pipeline_cache or None)
+
+def _run_ablation(kwargs: dict) -> tuple[str, list]:
+    from eval_ablation import run_ablation
+    # ablation only takes output_dir and cfg
+    return "ablation", run_ablation(output_dir=kwargs["output_dir"], cfg=kwargs["cfg"])
+
+
+# ---------------------------------------------------------------------------
+# Pass/fail collation — called after all modules complete
+# ---------------------------------------------------------------------------
+
+def _collate_pass_fail(summary: dict) -> None:
+    results = summary["results"]
+    pf = summary["pass_fail"]
+
+    if "ragas" in results:
+        for m in ["faithfulness", "response_relevancy", "context_precision", "entity_recall"]:
+            mean, passed = check_pass(results["ragas"], m, PASS_THRESHOLDS.get(m, 0))
+            pf[f"ragas_{m}"] = {"mean": mean, "threshold": PASS_THRESHOLDS.get(m), "pass": passed}
+
+    if "deepeval" in results:
+        for m in ["router_score", "coherence_score"]:
+            mean, passed = check_pass(results["deepeval"], m, PASS_THRESHOLDS.get(m, 0))
+            pf[f"deepeval_{m}"] = {"mean": mean, "threshold": PASS_THRESHOLDS.get(m), "pass": passed}
+
+    if "graph" in results:
+        for m, thr in [("source_diversity", PASS_THRESHOLDS["source_diversity"]),
+                       ("entity_recall",    PASS_THRESHOLDS["entity_recall"])]:
+            mean, passed = check_pass(results["graph"], m, thr)
+            pf[f"graph_{m}"] = {"mean": mean, "threshold": thr, "pass": passed}
+        node_means = [r["node_count"] for r in results["graph"]]
+        if node_means:
+            mn = round(sum(node_means) / len(node_means), 1)
+            pf["graph_node_count"] = {
+                "mean": mn,
+                "threshold": f"[{PASS_THRESHOLDS['node_count_min']}, {PASS_THRESHOLDS['node_count_max']}]",
+                "pass": all(
+                    PASS_THRESHOLDS["node_count_min"] <= r["node_count"] <= PASS_THRESHOLDS["node_count_max"]
+                    for r in results["graph"]
+                ),
+            }
+
+    if "perf" in results:
+        pr = results["perf"]
+        cap_hits = [r for r in pr if r.get("cap_hit")]
+        cap_rate = round(len(cap_hits) / len(pr), 3) if pr else None
+        pf["critic_cap_hit_rate"] = {
+            "rate": cap_rate,
+            "threshold_max": PASS_THRESHOLDS["cap_hit_rate_max"],
+            "pass": cap_rate is not None and cap_rate <= PASS_THRESHOLDS["cap_hit_rate_max"],
+        }
+
+    if "uptrain" in results:
+        for m in ["response_relevance", "response_completeness",
+                  "context_relevance", "response_conciseness"]:
+            mean, passed = check_pass(results["uptrain"], m, PASS_THRESHOLDS.get(m, 0))
+            pf[f"uptrain_{m}"] = {"mean": mean, "threshold": PASS_THRESHOLDS.get(m), "pass": passed}
+
+    if "agentbench" in results:
+        for m in ["task_success", "channel_f1", "iteration_efficiency", "kg_density"]:
+            mean, passed = check_pass(results["agentbench"], m, PASS_THRESHOLDS.get(m, 0))
+            pf[f"agentbench_{m}"] = {"mean": mean, "threshold": PASS_THRESHOLDS.get(m), "pass": passed}
+
+    if "citation" in results:
+        mean, passed = check_pass(results["citation"], "citation_accuracy",
+                                  PASS_THRESHOLDS["citation_accuracy"])
+        pf["citation_accuracy"] = {
+            "mean": mean, "threshold": PASS_THRESHOLDS["citation_accuracy"], "pass": passed
+        }
+
+
+# ---------------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------------
 
 def run_full_eval(
     modules: list[str],
@@ -221,36 +282,29 @@ def run_full_eval(
         "pass_fail":      {},
     }
 
-    kwargs = dict(output_dir=output_dir, cfg=cfg)
+    base_kwargs = dict(output_dir=output_dir, cfg=cfg)
     if query_ids:
-        kwargs["query_ids"] = query_ids
+        base_kwargs["query_ids"] = query_ids
 
     # ------------------------------------------------------------------
-    # Shared pipeline cache — ragas, deepeval, graph, uptrain, and agentbench
-    # all need the same full pipeline results.  Pre-run them once here and
-    # pass the cache so each module skips redundant pipeline invocations.
-    #
-    # Results are also persisted to a JSON file so that interrupted runs can
-    # be resumed without re-running the expensive LangGraph pipeline steps.
+    # Step 1: Build shared pipeline cache (serial — must finish first)
     # ------------------------------------------------------------------
     _cache_consumers = {"ragas", "deepeval", "graph", "uptrain", "agentbench", "citation"}
     pipeline_cache: dict = {}
+
     if set(modules) & _cache_consumers:
         from test_queries import TEST_QUERIES, run_pipeline
         _queries_to_cache = [
             q for q in TEST_QUERIES
             if query_ids is None or q["id"] in query_ids
         ]
-
         disk_cache_path = _pipeline_cache_path(cfg, output_dir)
 
-        # Load whatever has already been computed in a previous run.
         if not rerun_pipelines:
             pipeline_cache = _load_pipeline_cache(disk_cache_path)
             if pipeline_cache:
-                cached_ids = sorted(pipeline_cache.keys())
                 print(f"\n[Pipeline cache] Loaded {len(pipeline_cache)} cached "
-                      f"result(s) from {disk_cache_path}: {cached_ids}")
+                      f"result(s) from {disk_cache_path}: {sorted(pipeline_cache.keys())}")
 
         missing = [q for q in _queries_to_cache if q["id"] not in pipeline_cache]
         if missing:
@@ -263,169 +317,91 @@ def run_full_eval(
                 pipeline_cache[tq["id"]] = (state, wall_time)
                 print(f"  Done in {wall_time:.1f}s  "
                       f"nodes={len(state.get('knowledge_map', {}).get('nodes', []))}")
-                # Save incrementally so a crash mid-run doesn't lose earlier results.
                 _save_pipeline_cache(disk_cache_path, pipeline_cache)
-                print(f"  Saved to {disk_cache_path}")
         else:
-            print(f"\n[Pipeline cache] All {len(_queries_to_cache)} queries already "
-                  f"cached — skipping pipeline runs.")
+            print(f"\n[Pipeline cache] All {len(_queries_to_cache)} queries cached "
+                  f"— skipping pipeline runs.")
 
-    # --- Baseline ---
-    if "baseline" in modules:
-        print("\n" + "="*60)
-        print("MODULE: Baseline")
-        print("="*60)
-        from eval_baseline import run_baseline_eval
-        baseline_results = run_baseline_eval(**kwargs)
-        summary["results"]["baseline"] = baseline_results
+    # ------------------------------------------------------------------
+    # Step 2: Run all modules concurrently
+    #
+    # Groups:
+    #   A — share pipeline_cache, are I/O bound (LLM judge calls):
+    #       ragas, deepeval, graph, uptrain, agentbench, citation
+    #   B — independent, run in parallel with group A:
+    #       baseline, perf, ablation
+    #
+    # RAGAS uses asyncio.to_thread internally (sequential, Windows-safe).
+    # All other modules are synchronous. ThreadPoolExecutor handles both.
+    # ------------------------------------------------------------------
 
-    # --- RAGAS ---
-    if "ragas" in modules:
-        print("\n" + "="*60)
-        print("MODULE: RAGAS")
-        print("="*60)
-        from eval_ragas import run_ragas_eval
-        ragas_results = run_ragas_eval(**kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["ragas"] = ragas_results
+    # Map module name -> callable(base_kwargs, pipeline_cache) or callable(base_kwargs)
+    module_fns = {
+        "baseline":   lambda kw, pc: _run_baseline(kw),
+        "ragas":      lambda kw, pc: _run_ragas(kw, pc),
+        "deepeval":   lambda kw, pc: _run_deepeval(kw, pc),
+        "graph":      lambda kw, pc: _run_graph(kw, pc),
+        "perf":       lambda kw, pc: _run_perf(kw),
+        "uptrain":    lambda kw, pc: _run_uptrain(kw, pc),
+        "agentbench": lambda kw, pc: _run_agentbench(kw, pc),
+        "citation":   lambda kw, pc: _run_citation(kw, pc),
+        "ablation":   lambda kw, pc: _run_ablation(kw),
+    }
 
-        for metric in ["faithfulness", "response_relevancy", "context_precision", "entity_recall"]:
-            mean, passed = check_pass(ragas_results, metric, PASS_THRESHOLDS.get(metric, 0))
-            summary["pass_fail"][f"ragas_{metric}"] = {
-                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
-            }
+    active = [m for m in modules if m in module_fns]
 
-    # --- DeepEval ---
-    if "deepeval" in modules:
-        print("\n" + "="*60)
-        print("MODULE: DeepEval")
-        print("="*60)
-        from eval_deepeval import run_deepeval_eval
-        de_results = run_deepeval_eval(**kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["deepeval"] = de_results
+    print("\n" + "="*60)
+    print(f"RUNNING {len(active)} MODULE(S) CONCURRENTLY: {', '.join(active)}")
+    print("="*60)
 
-        for metric in ["router_score", "coherence_score"]:
-            mean, passed = check_pass(de_results, metric, PASS_THRESHOLDS.get(metric, 0))
-            summary["pass_fail"][f"deepeval_{metric}"] = {
-                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
-            }
+    t_start = datetime.now()
+    errors: dict[str, Exception] = {}
 
-    # --- Graph ---
-    if "graph" in modules:
-        print("\n" + "="*60)
-        print("MODULE: Knowledge Graph")
-        print("="*60)
-        from eval_graph import run_graph_eval
-        graph_results = run_graph_eval(**kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["graph"] = graph_results
-
-        for metric, thr in [("source_diversity", PASS_THRESHOLDS["source_diversity"]),
-                             ("entity_recall",    PASS_THRESHOLDS["entity_recall"])]:
-            mean, passed = check_pass(graph_results, metric, thr)
-            summary["pass_fail"][f"graph_{metric}"] = {
-                "mean": mean, "threshold": thr, "pass": passed
-            }
-        node_means = [r["node_count"] for r in graph_results]
-        if node_means:
-            mean_nodes = round(sum(node_means) / len(node_means), 1)
-            summary["pass_fail"]["graph_node_count"] = {
-                "mean": mean_nodes,
-                "threshold": f"[{PASS_THRESHOLDS['node_count_min']}, {PASS_THRESHOLDS['node_count_max']}]",
-                "pass": all(
-                    PASS_THRESHOLDS["node_count_min"] <= r["node_count"] <= PASS_THRESHOLDS["node_count_max"]
-                    for r in graph_results
-                ),
-            }
-
-    # --- Perf ---
-    if "perf" in modules:
-        print("\n" + "="*60)
-        print("MODULE: Performance")
-        print("="*60)
-        from eval_perf import run_perf_eval
-        perf_results = run_perf_eval(**kwargs)
-        summary["results"]["perf"] = perf_results
-
-        cap_hits = [r for r in perf_results if r.get("cap_hit")]
-        cap_rate = round(len(cap_hits) / len(perf_results), 3) if perf_results else None
-        summary["pass_fail"]["critic_cap_hit_rate"] = {
-            "rate": cap_rate,
-            "threshold_max": PASS_THRESHOLDS["cap_hit_rate_max"],
-            "pass": cap_rate is not None and cap_rate <= PASS_THRESHOLDS["cap_hit_rate_max"],
+    # One thread per module. RAGAS is the slowest (~judge LLM × 4 queries);
+    # all others finish well before it. Max workers capped at module count.
+    with ThreadPoolExecutor(max_workers=len(active)) as pool:
+        futures = {
+            pool.submit(module_fns[m], dict(base_kwargs), pipeline_cache): m
+            for m in active
         }
+        for future in as_completed(futures):
+            module_name = futures[future]
+            try:
+                name, result = future.result()
+                summary["results"][name] = result
+                elapsed = (datetime.now() - t_start).seconds
+                print(f"  ✓ [{elapsed:>3}s] {name} complete")
+            except Exception as exc:
+                errors[module_name] = exc
+                print(f"  ✗ {module_name} FAILED: {exc}")
 
-    # --- UpTrain ---
-    if "uptrain" in modules:
-        print("\n" + "="*60)
-        print("MODULE: UpTrain")
-        print("="*60)
-        from eval_uptrain import run_uptrain_eval
-        uptrain_results = run_uptrain_eval(**kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["uptrain"] = uptrain_results
+    if errors:
+        print(f"\n  WARNING: {len(errors)} module(s) failed: {list(errors.keys())}")
 
-        for metric in ["response_relevance", "response_completeness",
-                        "context_relevance", "response_conciseness"]:
-            mean, passed = check_pass(uptrain_results, metric, PASS_THRESHOLDS.get(metric, 0))
-            summary["pass_fail"][f"uptrain_{metric}"] = {
-                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
-            }
+    total_elapsed = (datetime.now() - t_start).seconds
+    print(f"\n  All modules done in {total_elapsed}s total.")
 
-    # --- AgentBench ---
-    if "agentbench" in modules:
-        print("\n" + "="*60)
-        print("MODULE: AgentBench")
-        print("="*60)
-        from eval_agentbench import run_agentbench_eval
-        ab_kwargs = {k: v for k, v in kwargs.items()}
-        ab_results = run_agentbench_eval(**ab_kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["agentbench"] = ab_results
+    # ------------------------------------------------------------------
+    # Step 3: Collate pass/fail, write summary
+    # ------------------------------------------------------------------
+    _collate_pass_fail(summary)
 
-        for metric in ["task_success", "channel_f1", "iteration_efficiency", "kg_density"]:
-            mean, passed = check_pass(ab_results, metric, PASS_THRESHOLDS.get(metric, 0))
-            summary["pass_fail"][f"agentbench_{metric}"] = {
-                "mean": mean, "threshold": PASS_THRESHOLDS.get(metric), "pass": passed
-            }
-
-    # --- Citation ---
-    if "citation" in modules:
-        print("\n" + "="*60)
-        print("MODULE: Citation Verifier")
-        print("="*60)
-        from eval_citation import run_citation_eval
-        cit_results = run_citation_eval(**kwargs, pipeline_cache=pipeline_cache or None)
-        summary["results"]["citation"] = cit_results
-
-        mean, passed = check_pass(cit_results, "citation_accuracy",
-                                   PASS_THRESHOLDS["citation_accuracy"])
-        summary["pass_fail"]["citation_accuracy"] = {
-            "mean": mean, "threshold": PASS_THRESHOLDS["citation_accuracy"], "pass": passed
-        }
-
-    # --- Ablation ---
-    if "ablation" in modules:
-        print("\n" + "="*60)
-        print("MODULE: Ablation")
-        print("="*60)
-        from eval_ablation import run_ablation
-        ablation_results = run_ablation(output_dir=output_dir, cfg=cfg)
-        summary["results"]["ablation"] = ablation_results
-
-    # --- Write consolidated summary ---
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_path = Path(output_dir) / f"summary_{ts}.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=str))
 
-    # Print final pass/fail table
     print("\n" + "="*60)
     print("FINAL PASS/FAIL SUMMARY")
     print("="*60)
     print(f"  Provider: {cfg.provider} / {cfg.model or '(default)'}  "
           f"Judge: {cfg._jp()} / {cfg._jm() or '(default)'}")
+
     all_pass = True
     for check, result in summary["pass_fail"].items():
-        passed  = result.get("pass")
-        symbol  = "PASS" if passed else ("FAIL" if passed is False else "N/A ")
-        mean    = result.get("mean") or result.get("rate", "")
-        thr     = result.get("threshold") or result.get("threshold_max", "")
+        passed = result.get("pass")
+        symbol = "PASS" if passed else ("FAIL" if passed is False else "N/A ")
+        mean   = result.get("mean") or result.get("rate", "")
+        thr    = result.get("threshold") or result.get("threshold_max", "")
         print(f"  [{symbol}] {check:40s} mean={mean}  threshold={thr}")
         if passed is False:
             all_pass = False
@@ -436,32 +412,37 @@ def run_full_eval(
     return summary
 
 
-if __name__ == "__main__":
-    ALL_MODULES = ["ragas", "deepeval", "uptrain", "agentbench", "graph", "perf", "baseline", "ablation", "citation"]
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-    parser = argparse.ArgumentParser(description="Run full evaluation suite")
-    parser.add_argument("--quick",      action="store_true",
+if __name__ == "__main__":
+    if sys.platform == "win32":
+        import asyncio
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    ALL_MODULES = [
+        "ragas", "deepeval", "uptrain", "agentbench",
+        "graph", "perf", "baseline", "ablation", "citation",
+    ]
+
+    parser = argparse.ArgumentParser(description="Run full evaluation suite (parallelised)")
+    parser.add_argument("--quick",           action="store_true",
                         help="Run only graph + perf on q1_rag (fast sanity check)")
-    parser.add_argument("--skip",       nargs="*", default=[],
-                        help="Modules to skip")
-    parser.add_argument("--query-ids",  nargs="*",
-                        help="Subset of query IDs")
-    parser.add_argument("--output-dir", default="eval_results")
-    parser.add_argument("--rerun-pipelines", action="store_true",
-                        dest="rerun_pipelines",
+    parser.add_argument("--skip",            nargs="*", default=[])
+    parser.add_argument("--query-ids",       nargs="*")
+    parser.add_argument("--output-dir",      default="eval_results")
+    parser.add_argument("--rerun-pipelines", action="store_true", dest="rerun_pipelines",
                         help="Ignore disk pipeline cache and re-run all pipelines")
-    parser.add_argument("--clean", action="store_true",
-                        help="Delete pipeline cache, app query cache, and FAISS indices "
-                             "before running, ensuring a clean-slate eval")
-    parser.add_argument("--dry-run", action="store_true",
-                        dest="dry_run",
-                        help="With --clean: print what would be deleted without removing anything. "
-                             "Implies --clean; exits before running any eval modules.")
+    parser.add_argument("--clean",           action="store_true",
+                        help="Delete pipeline cache, app query cache, and FAISS indices before running")
+    parser.add_argument("--dry-run",         action="store_true", dest="dry_run",
+                        help="With --clean: show what would be deleted without removing anything")
     add_provider_args(parser)
     args = parser.parse_args()
 
     if args.dry_run:
-        args.clean = True  # --dry-run implies --clean
+        args.clean = True
 
     if args.clean:
         label = "DRY RUN — " if args.dry_run else ""
@@ -475,11 +456,10 @@ if __name__ == "__main__":
 
     cfg = cfg_from_args(args)
 
-    # Require an API key unless using a local provider
     if cfg.provider != "local" and not cfg.api_key:
         raise SystemExit(
             f"No API key for provider '{cfg.provider}'. "
-            f"Set the appropriate environment variable or pass --api-key."
+            "Set the appropriate environment variable or pass --api-key."
         )
 
     if args.quick:

@@ -21,7 +21,7 @@ Usage:
     python eval_uptrain.py --judge-provider local --judge-base-url http://localhost:8080/v1
 
     # Subset of queries
-    python eval_uptrain.py --query-ids q1_rag q2_federated
+    python eval_uptrain.py --query-ids q1_rag q2_continual
 
 Requires:
     pip install uptrain
