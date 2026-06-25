@@ -28,6 +28,7 @@ import json
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from test_queries import TEST_QUERIES, run_pipeline
 from eval_provider import EvalConfig, add_provider_args, cfg_from_args
@@ -47,6 +48,24 @@ except ImportError as e:
 
 _ROUTER_THRESHOLD    = 0.80
 _COHERENCE_THRESHOLD = 0.65
+
+
+def _short_error(exc: Exception) -> str:
+    text = str(exc).strip().replace("\n", " ")
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return f"{exc.__class__.__name__}: {text}"
+
+
+def _safe_measure(metric: Any, test_case: LLMTestCase) -> tuple[float | None, str, bool]:
+    """Run a DeepEval metric and return (score, reason, ok) without raising."""
+    try:
+        metric.measure(test_case)
+        score = getattr(metric, "score", None)
+        reason = getattr(metric, "reason", "") or ""
+        return (round(score, 4) if score is not None else None), reason, True
+    except Exception as exc:
+        return None, _short_error(exc), False
 
 # ---------------------------------------------------------------------------
 # Metric definitions
@@ -177,9 +196,10 @@ def run_deepeval_eval(
             tools_called=[ToolCall(name=a) for a in active_agents],
             expected_tools=[ToolCall(name=c) for c in tq["expected_channels"]],
         )
-        router_metric.measure(router_test)
-        router_score  = round(router_metric.score, 4)
-        router_reason = router_metric.reason
+        router_score, router_reason, router_ok = _safe_measure(router_metric, router_test)
+        if not router_ok:
+            print(f"  WARNING: Router metric failed for {tq['id']}: {router_reason}")
+            router_reason = f"Router metric error: {router_reason}"
 
         # --- Thematic coherence test ---
         if summary and merged_context:
@@ -188,9 +208,10 @@ def run_deepeval_eval(
                 actual_output=summary,
                 retrieval_context=[merged_context],
             )
-            coherence_metric.measure(coherence_test)
-            coherence_score  = round(coherence_metric.score, 4)
-            coherence_reason = coherence_metric.reason
+            coherence_score, coherence_reason, coherence_ok = _safe_measure(coherence_metric, coherence_test)
+            if not coherence_ok:
+                print(f"  WARNING: Coherence metric failed for {tq['id']}: {coherence_reason}")
+                coherence_reason = f"Coherence metric error: {coherence_reason}"
         else:
             coherence_score  = None
             coherence_reason = "No summary or context available."
@@ -208,7 +229,7 @@ def run_deepeval_eval(
             "expected_channels": tq["expected_channels"],
             "router_score":      router_score,
             "router_reason":     router_reason,
-            "router_pass":       router_score >= _ROUTER_THRESHOLD,
+            "router_pass":       (router_score or 0) >= _ROUTER_THRESHOLD,
             "coherence_score":   coherence_score,
             "coherence_reason":  coherence_reason,
             "coherence_pass":    (coherence_score or 0) >= _COHERENCE_THRESHOLD,

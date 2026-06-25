@@ -12,15 +12,15 @@ langchain-text-splitters~=1.1     # RecursiveCharacterTextSplitter
 # ── Vector store ──────────────────────────────────────────────────────────────
 faiss-cpu>=1.7.0
 
+# ── Embeddings (used by citation grounding) ───────────────────────────────────
+sentence-transformers>=2.2.0
+
 # ── Visualisation ─────────────────────────────────────────────────────────────
 pyvis>=0.3.2                     # Interactive knowledge-graph network view
 
 # ── Optional extras (install separately only if needed) ───────────────────────
 # Conference paper search:
 # pip install openreview-py acl-anthology
-#
-# Local embeddings for Claude/local provider:
-# pip install sentence-transformers
 #
 # Additional LLM providers:
 # pip install "langchain-anthropic~=1.4"

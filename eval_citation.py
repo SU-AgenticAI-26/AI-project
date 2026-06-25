@@ -23,7 +23,7 @@ Usage:
     python eval_citation.py --provider local --model mistral --base-url http://localhost:8080/v1
 
     # Subset of queries
-    python eval_citation.py --query-ids q1_rag q2_federated
+    python eval_citation.py --query-ids q1_rag q2_continual
 
     # Custom similarity threshold
     python eval_citation.py --threshold 0.70

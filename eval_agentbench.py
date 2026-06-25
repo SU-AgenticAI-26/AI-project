@@ -34,7 +34,7 @@ Usage:
     python eval_agentbench.py --no-llm-judge
 
     # Subset of queries
-    python eval_agentbench.py --query-ids q1_rag q2_federated
+    python eval_agentbench.py --query-ids q1_rag q2_continual
 
 Requires:
     No additional packages beyond the core requirements.

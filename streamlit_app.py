@@ -287,6 +287,7 @@ class AgentState(TypedDict):
 
     # ── Extraction + merge ────────────────────────────────────────────────────
     extraction_findings:   str
+    tagged_findings:       List[dict]     # [{text, source}] chunk-level provenance
     merged_context:        str
     synthesis_report:      str            # optional thematic synthesis
 
@@ -297,7 +298,6 @@ class AgentState(TypedDict):
     critique:              str
     _needs_more:           bool
     loop_count:            int
-    _prev_node_count:      int   # node count after previous enrichment pass (for delta check)
 
     # ── Conflict detection (Block 3) ──────────────────────────────────────────
     conflicts:             List[dict]     # [{topic, claim_a, source_a, claim_b, source_b, resolution}]
@@ -629,40 +629,6 @@ def init_sql_db() -> None:
         id INTEGER PRIMARY KEY,
         subject TEXT, predicate TEXT, object TEXT, confidence REAL, source TEXT
     );
-    CREATE TABLE IF NOT EXISTS source_registry (
-        id INTEGER PRIMARY KEY,
-        source_type TEXT,
-        source_key TEXT,
-        title TEXT,
-        url TEXT,
-        metadata TEXT,
-        created_at TEXT,
-        UNIQUE(source_type, source_key)
-    );
-    CREATE TABLE IF NOT EXISTS extracted_papers (
-        id INTEGER PRIMARY KEY,
-        title TEXT,
-        source_type TEXT,
-        source_key TEXT,
-        url TEXT,
-        research_problem TEXT,
-        methodology TEXT,
-        key_findings TEXT,
-        limitations TEXT,
-        created_at TEXT
-    );
-    CREATE TABLE IF NOT EXISTS pipeline_runs (
-        id INTEGER PRIMARY KEY,
-        query TEXT,
-        active_agents TEXT,
-        loop_count INTEGER,
-        node_count INTEGER,
-        grounding_score REAL,
-        needs_more INTEGER,
-        critique TEXT,
-        summary_len INTEGER,
-        created_at TEXT
-    );
     """)
     if cur.execute("SELECT COUNT(*) FROM topics").fetchone()[0] == 0:
         cur.executemany(
@@ -711,7 +677,6 @@ def init_sql_db() -> None:
 
 
 def sql_search(query: str, k: int = 8) -> str:
-    import sqlite3, json as _json
     con   = sqlite3.connect(SQL_DB_PATH)
     cur   = con.cursor()
     words = [w.strip("?.!,") for w in query.lower().split() if len(w) > 3][:5]
@@ -754,22 +719,6 @@ def sql_search(query: str, k: int = 8) -> str:
     ).fetchall():
         results.append(f"[FACT] {row[0]} {row[1]} '{row[2]}' (source: {row[3]})")
 
-    ep_clause = " OR ".join(
-        ["LOWER(title) LIKE ? OR LOWER(research_problem) LIKE ? "
-         "OR LOWER(key_findings) LIKE ? OR LOWER(methodology) LIKE ?"] * len(words)
-    )
-    ep_params = [p for w in like for p in (w, w, w, w)]
-    for row in cur.execute(
-        f"SELECT title, research_problem, methodology, key_findings, limitations "
-        f"FROM extracted_papers WHERE {ep_clause} ORDER BY id DESC LIMIT 5",
-        ep_params,
-    ).fetchall():
-        findings_snippet = (row[3] or "")[:120]
-        results.append(
-            f"[PAPER] {row[0]} | Problem: {(row[1] or '')[:80]} | "
-            f"Method: {(row[2] or '')[:60]} | Findings: {findings_snippet}"
-        )
-
     con.close()
     seen, unique = set(), []
     for r in results:
@@ -796,118 +745,6 @@ def sql_list_topics() -> list[dict]:
     ).fetchall()
     con.close()
     return [{"id": r[0], "title": r[1], "category": r[2], "keywords": r[3]} for r in rows]
-
-
-def sql_source_registered(source_type: str, source_key: str) -> bool:
-    con = sqlite3.connect(SQL_DB_PATH)
-    row = con.execute(
-        "SELECT 1 FROM source_registry WHERE source_type = ? AND source_key = ? LIMIT 1",
-        (source_type, source_key),
-    ).fetchone()
-    con.close()
-    return bool(row)
-
-
-def sql_register_source(source_type: str, source_key: str, title: str = "", url: str = "", metadata: dict | None = None) -> int:
-    import json as _json
-    con = sqlite3.connect(SQL_DB_PATH)
-    cur = con.cursor()
-    cur.execute(
-        "INSERT OR IGNORE INTO source_registry "
-        "(source_type, source_key, title, url, metadata, created_at) "
-        "VALUES (?,?,?,?,?,?)",
-        (source_type, source_key, title, url, _json.dumps(metadata or {}), _stamp()),
-    )
-    con.commit()
-    row = cur.execute(
-        "SELECT id FROM source_registry WHERE source_type = ? AND source_key = ?",
-        (source_type, source_key),
-    ).fetchone()
-    con.close()
-    return int(row[0]) if row else 0
-
-
-def sql_log_pipeline_run(state: dict) -> None:
-    import sqlite3, json as _json
-    con = sqlite3.connect(SQL_DB_PATH)
-    con.execute(
-        "INSERT INTO pipeline_runs "
-        "(query, active_agents, loop_count, node_count, grounding_score, "
-        " needs_more, critique, summary_len, created_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?)",
-        (
-            state.get("query", ""),
-            _json.dumps(state.get("active_agents", [])),
-            state.get("loop_count", 0),
-            len(state.get("knowledge_map", {}).get("nodes", [])),
-            state.get("grounding_score", 0.0),
-            int(state.get("_needs_more", False)),
-            state.get("critique", "")[:500],
-            len(state.get("summary", "")),
-            _stamp(),
-        ),
-    )
-    con.commit()
-    con.close()
-
-
-def sql_analytics() -> dict:
-    import sqlite3
-    con = sqlite3.connect(SQL_DB_PATH)
-    cur = con.cursor()
-
-    recurring = cur.execute(
-        "SELECT query, COUNT(*) as runs, "
-        "ROUND(AVG(grounding_score)*100,1) as avg_grounding, "
-        "MAX(node_count) as max_nodes "
-        "FROM pipeline_runs "
-        "GROUP BY LOWER(TRIM(query)) "
-        "ORDER BY runs DESC LIMIT 10"
-    ).fetchall()
-
-    grounding_trend = cur.execute(
-        "SELECT created_at, grounding_score, loop_count "
-        "FROM pipeline_runs ORDER BY id DESC LIMIT 20"
-    ).fetchall()
-
-    loop_stats = cur.execute(
-        "SELECT loop_count, COUNT(*) as freq "
-        "FROM pipeline_runs GROUP BY loop_count ORDER BY loop_count"
-    ).fetchall()
-
-    common_problems = cur.execute(
-        "SELECT SUBSTR(research_problem,1,80) as problem_prefix, "
-        "COUNT(*) as count "
-        "FROM extracted_papers "
-        "WHERE research_problem != '' "
-        "GROUP BY LOWER(TRIM(SUBSTR(research_problem,1,60))) "
-        "ORDER BY count DESC LIMIT 8"
-    ).fetchall()
-
-    source_counts = cur.execute(
-        "SELECT source_type, COUNT(*) as total, "
-        "COUNT(DISTINCT source_key) as unique_keys "
-        "FROM source_registry GROUP BY source_type ORDER BY total DESC"
-    ).fetchall()
-
-    con.close()
-
-    return {
-        "recurring_queries": [
-            {"query": r[0][:70], "runs": r[1], "avg_grounding_%": r[2], "max_nodes": r[3]}
-            for r in recurring
-        ],
-        "grounding_trend": [
-            {"ts": r[0][:16], "score": round(r[1], 3), "loops": r[2]}
-            for r in grounding_trend
-        ],
-        "loop_frequency": [{"loop_count": r[0], "runs": r[1]} for r in loop_stats],
-        "common_problems": [{"problem": r[0], "count": r[1]} for r in common_problems],
-        "source_stats": [
-            {"source": r[0], "total_seen": r[1], "unique_keys": r[2]}
-            for r in source_counts
-        ],
-    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2226,17 +2063,14 @@ def knowledge_mapper_agent(state: AgentState, model: BaseChatModel) -> dict:
         "  [VectorDB]   → \"vector_db\"\n"
         "  [SQL]        → \"sql_db\"\n"
         "  [Web]        → \"web\"\n"
-        "  [Extraction] → use the most recently preceding [VectorDB], [SQL], or [Web] label "
-        "in the context; fall back to \"merged\" only when a concept genuinely spans multiple sources.\n"
+        "  [Extraction] → \"merged\"\n"
         "  no label     → \"merged\"\n\n"
-        "Prefer specific source labels (vector_db, sql_db, web) over \"merged\" wherever traceable. "
-        "\"merged\" should be used sparingly — only for cross-source synthesis nodes.\n\n"
         "Return ONLY valid JSON (no markdown, no extra text):\n"
         '{"nodes": [{"id":"str","label":"str","type":"concept","source":"vector_db"}],'
         '"edges": [{"source":"str","target":"str","relation":"str","weight":0.5}]}\n'
         "\"type\" must be exactly one of: concept, entity, fact, process.\n"
         "\"source\" must be exactly one of: vector_db, sql_db, web, merged.\n"
-        "Include 12–30 nodes."
+        "Include 12–20 nodes."
     ))
     resp = model.invoke([system, HumanMessage(
         content=f"Query: {state['query']}\n\nMerged context:\n{state['merged_context']}"
@@ -2274,15 +2108,9 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 
     # All three criteria are structural facts — compute deterministically in Python
     # rather than asking an LLM, which adds latency/tokens and can misparse output.
-    #
-    # Thresholds are intentionally conservative (nodes ≥ 5, not 8) so that a
-    # healthy first-pass graph doesn't trigger a costly enrichment loop.
-    # The delta-node guard (≥ 4 new nodes) is the primary brake on over-looping:
-    # if retrieval can't meaningfully grow the graph, looping wastes wall-time.
-    n = len(nodes)
     failures = []
-    if n < 5:
-        failures.append(f"only {n} nodes (need ≥ 5)")
+    if len(nodes) < 8:
+        failures.append(f"only {len(nodes)} nodes (need ≥ 8)")
     if len(edges) < 4:
         failures.append(f"only {len(edges)} edges (need ≥ 4)")
     if len(types) < 2:
@@ -2291,23 +2119,14 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
     needs = bool(failures)
     feedback = "Needs enrichment: " + "; ".join(failures) if failures else "Graph meets structural requirements."
 
-    # Delta-node guard: if an enrichment pass already ran and the graph didn't
-    # grow by at least 4 nodes, suppress further looping to avoid wasted passes.
-    # Raised from 2 → 4: marginal growth (1–3 nodes) doesn't justify another
-    # full retrieval round-trip, as the ablation shows no_critic recall ≥ full recall.
-    prev_n = state.get("_prev_node_count", 0)
-    if needs and state.get("loop_count", 0) >= 1 and (n - prev_n) < 4:
-        needs = False
-        feedback = (
-            f"Stopping enrichment: graph grew by only {n - prev_n} node(s) "
-            f"after previous pass (threshold: 4). Original issue: {feedback}"
-        )
+    next_loop_count = state.get("loop_count", 0)
+    if needs:
+        next_loop_count += 1
 
     return {
-        "critique":         feedback,
-        "_needs_more":      needs,
-        "_prev_node_count": n,
-        "loop_count":       state.get("loop_count", 0) + 1,
+        "critique":    feedback,
+        "_needs_more": needs,
+        "loop_count":  next_loop_count,
         "messages":    [AIMessage(content=f"[Critic] needs_more={needs}")],
         "activity_log": [{
             "agent": "critic", "icon": "🧐",
@@ -2320,23 +2139,18 @@ def critic_agent(state: AgentState, model: BaseChatModel) -> dict:
 # ── 8. Summarizer ─────────────────────────────────────────────────────────────
 def summarizer_agent(state: AgentState, model: BaseChatModel) -> dict:
     system = SystemMessage(content=(
-        "You are a Summarizer Agent. Write a concise, thematically-organised answer that directly "
-        "addresses the research query.\n\n"
-        "STRUCTURE RULES — you MUST follow these:\n"
-        "1. Organise your answer by RESEARCH THEME, not by source. Do NOT write 'Source A says… "
-        "Source B says…'. Instead, group findings under 2–4 theme headings that emerge from the "
-        "evidence (e.g. '## Approaches', '## Key Challenges', '## Open Questions').\n"
-        "2. Within each theme, synthesise findings from MULTIPLE sources into unified statements. "
-        "Where sources agree, state the consensus. Where they disagree or tension exists, surface "
-        "the conflict explicitly (e.g. 'While X proposes …, Y argues …').\n"
-        "3. Keep the answer focused and direct. Omit preamble, meta-commentary about the pipeline, "
-        "and source-listing that doesn't add substance.\n\n"
-        "CITATION RULES — for grounding validation:\n"
-        "When stating substantive claims, wrap them in double quotes and append one of these source tags: "
-        "[VectorDB], [SQL], [Web], or [Extraction]. Example: "
-        "\"Diffusion models work by iteratively predicting and removing noise\" [VectorDB].\n"
-        "Include 5–10 quoted key claims spread across themes. Keep each quoted claim between 20 and "
-        "150 characters so it can be validated."
+        "You are given a research query and multi-source findings.\n"
+        "Write a response that:\n"
+        "- Answers ONLY what the query asks -- do not add background the user didn't request\n"
+        "- Is <=400 words unless the query explicitly requires exhaustive coverage\n"
+        "- Uses prose paragraphs, not bullet lists\n"
+        "- Identifies at least one tension or disagreement across sources\n"
+        "- Supports each distinct empirical claim with a verbatim evidence quote from Findings\n"
+        "- Uses citation format exactly: (evidence: \"<exact quote from Findings>\")\n"
+        "- Keeps each evidence quote 8-30 words and copied exactly from Findings\n"
+        "- Never cites channels/agents/labels as evidence\n"
+        "\n"
+        "Forbidden citation styles include: (source: Web), (source: Extraction), (Vector DB), (SQL DB)."
     ))
     # Prefer synthesis_report over raw merged_context when available
     synthesis = state.get("synthesis_report", "")
@@ -2989,6 +2803,7 @@ with tab_web:
                 "sql_findings": "",
                 "web_findings": "",
                 "extraction_findings": "",
+                "tagged_findings": [],
                 "activity_log": [],
                 "merged_context": "",
                 "knowledge_map": {},
@@ -3006,9 +2821,8 @@ with tab_web:
                 "citation_grounding": {},
                 "grounding_score": 0.0,
                 "_needs_more": False,
-                "_prev_node_count": 0,
             }
-
+            
             # Run through agent pipeline
             final_state = None
             for event in app.stream(full_state.copy()):
@@ -3069,9 +2883,9 @@ with tab_research:
                 # ──────────────────────────────────
                 "active_agents":[], "router_reasoning":"",
                 "vector_findings":"", "sql_findings":"", "web_findings":"",
-                "extraction_findings":"",
+                "extraction_findings":"", "tagged_findings":[],
                 "activity_log":[], "merged_context":"",
-                "knowledge_map":{}, "critique":"", "loop_count":0, "_prev_node_count":0,
+                "knowledge_map":{}, "critique":"", "loop_count":0,
                 # ── BLOCK 2: Citation Grounding Fields ──
                 "citation_grounding":{}, "grounding_score":0.0,
                 # ── BLOCK 3: Conflict Detection Fields ──
@@ -3090,7 +2904,6 @@ with tab_research:
                             full_state[key] = val
 
             progress.progress(100, "✅ Done!")
-            sql_log_pipeline_run(full_state)
             if full_state and use_cache:
                 cache_save(query, full_state)
             
@@ -3331,33 +3144,6 @@ with tab_sql:
     test_q = st.text_input("Keyword")
     if test_q:
         st.code(sql_search(test_q), language="text")
-
-    st.divider()
-    st.subheader("Cross-Run Analytics")
-    with st.expander("Open analytics dashboard", expanded=False):
-        analytics = sql_analytics()
-
-        if analytics["recurring_queries"]:
-            st.markdown("**Recurring queries** (most-run topics)")
-            st.dataframe(analytics["recurring_queries"], use_container_width=True)
-        else:
-            st.info("Run at least one pipeline query to populate analytics.")
-
-        if analytics["grounding_trend"]:
-            st.markdown("**Grounding score over last 20 runs**")
-            st.dataframe(analytics["grounding_trend"], use_container_width=True)
-
-        if analytics["loop_frequency"]:
-            st.markdown("**Critic loop frequency**")
-            st.dataframe(analytics["loop_frequency"], use_container_width=True)
-
-        if analytics["common_problems"]:
-            st.markdown("**Most common research problems (across all extractions)**")
-            st.dataframe(analytics["common_problems"], use_container_width=True)
-
-        if analytics["source_stats"]:
-            st.markdown("**Source registry — unique papers per API**")
-            st.dataframe(analytics["source_stats"], use_container_width=True)
 
 
 # ════════════ TAB 3 — SAVED MAPS ══════════════════════════════════════════════

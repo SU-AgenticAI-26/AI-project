@@ -32,7 +32,14 @@ _MODEL: "SentenceTransformer | None" = None
 def _get_model() -> "SentenceTransformer":
     global _MODEL
     if _MODEL is None:
-        from sentence_transformers import SentenceTransformer
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ModuleNotFoundError as exc:
+            raise ModuleNotFoundError(
+                "Missing dependency 'sentence-transformers'. "
+                "Install project deps with 'pip install -r requirements.txt' "
+                "(or 'uv sync' if you use uv)."
+            ) from exc
         _MODEL = SentenceTransformer("all-MiniLM-L6-v2")
     return _MODEL
 
